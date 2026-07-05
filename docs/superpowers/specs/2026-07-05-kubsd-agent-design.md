@@ -99,8 +99,11 @@ spec:
   restartPolicy: Always      # Always | OnFailure | Never
 ```
 
-`kubsd-spec` owns parsing and validation (well-formed resource strings,
-name uniqueness, required fields, valid CIDR for `network.address`).
+`kubsd-spec` owns parsing and validation of a single spec document
+(well-formed resource strings, name format, required fields, valid CIDR
+for `network.address`). Cross-jail name uniqueness cannot be checked by a
+single-document parser — it's `kubsd-agentd`'s state-store concern at
+apply time, not `kubsd-spec`'s.
 
 IP addresses are statically assigned in the spec for v1 (no DHCP, no
 agent-owned IPAM pool) — simplest option for a single-node agent, at the
