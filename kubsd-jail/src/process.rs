@@ -1,13 +1,16 @@
 use crate::JailError;
 use crate::JailRuntime;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output};
+use std::sync::Mutex;
 
-pub struct ProcessJailRuntime;
+pub struct ProcessJailRuntime {
+    children: Mutex<Vec<Child>>,
+}
 
 impl ProcessJailRuntime {
     pub fn new() -> Self {
-        Self
+        Self { children: Mutex::new(Vec::new()) }
     }
 
     fn run(program: &str, args: &[&str]) -> Result<Output, JailError> {
@@ -28,6 +31,11 @@ impl ProcessJailRuntime {
                 String::from_utf8_lossy(&output.stderr).into_owned(),
             ))
         }
+    }
+
+    fn reap_finished_children(&self) {
+        let mut children = self.children.lock().unwrap();
+        children.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
     }
 }
 
@@ -60,8 +68,14 @@ impl JailRuntime for ProcessJailRuntime {
         Ok(!String::from_utf8_lossy(&ps.stdout).trim().is_empty())
     }
 
-    fn start_command(&self, _name: &str, _command: &[String]) -> Result<(), JailError> {
-        unimplemented!("added in Task 4")
+    fn start_command(&self, name: &str, command: &[String]) -> Result<(), JailError> {
+        self.reap_finished_children();
+        let mut cmd = Command::new("jexec");
+        cmd.arg(name);
+        cmd.args(command);
+        let child = cmd.spawn().map_err(|e| JailError::Spawn("jexec".to_string(), e))?;
+        self.children.lock().unwrap().push(child);
+        Ok(())
     }
 
     fn set_resource_limits(&self, _name: &str, _pcpu_percent: u32, _memory_bytes: u64) -> Result<(), JailError> {
