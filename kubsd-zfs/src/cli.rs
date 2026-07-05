@@ -50,6 +50,9 @@ impl ZfsManager for CliZfsManager {
         let snapshot = format!("{base_dataset}@kubsd");
         if !self.dataset_exists(&snapshot)? {
             if let Err(e) = Self::run_checked(&["snapshot", &snapshot]) {
+                // Lost a race with a concurrent caller cloning the same base:
+                // if the snapshot exists now anyway, proceed; otherwise this
+                // was a real failure (e.g. the base dataset doesn't exist).
                 if !self.dataset_exists(&snapshot)? {
                     return Err(e);
                 }
