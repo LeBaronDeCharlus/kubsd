@@ -60,12 +60,12 @@ Rust workspace with the following crates:
   lower risk. Moving to raw syscalls later is an internal change behind
   the trait, invisible to callers.
 
-  Trait surface (Milestone 2 — no VNET/networking yet; see `kubsd-net`
-  below for that):
+  Trait surface (updated in Milestone 3 to add VNET support to `create`;
+  originally shipped in Milestone 2 without it):
 
   ```rust
   pub trait JailRuntime {
-      fn create(&self, name: &str, rootfs: &Path) -> Result<(), JailError>;
+      fn create(&self, name: &str, rootfs: &Path, vnet: bool) -> Result<(), JailError>;
       fn start_command(&self, name: &str, command: &[String]) -> Result<(), JailError>;
       fn destroy(&self, name: &str) -> Result<(), JailError>;
       fn is_running(&self, name: &str) -> Result<bool, JailError>;
@@ -76,13 +76,19 @@ Rust workspace with the following crates:
 
   `kubsd-jail` takes a plain jail name string — it has no knowledge of
   kubsd's `kubsd-<name>` naming/ownership convention; applying that prefix
-  is `kubsd-agentd`'s responsibility. `create` and `start_command` are
-  deliberately separate calls rather than one `jail -c ... command=<command>`:
-  `create` uses `jail -c ... persist` to instantiate an empty, persistent
-  jail from `rootfs` with no command running yet, so `kubsd-agentd` can
-  configure networking (via `kubsd-net`) and apply `rctl` limits *before*
-  the jailed process ever runs, matching the Reconciliation Loop's stated
-  order below. `start_command` then launches the process inside the
+  is `kubsd-agentd`'s responsibility. `create`'s `vnet` parameter controls
+  whether the jail gets `jail -c ... vnet persist` (its own network stack,
+  required before `kubsd-net`'s `attach_jail` can move an interface into
+  it — VNET can only be set at jail-creation time, not added
+  retroactively) or plain `jail -c ... persist` (shares the host's network
+  stack, e.g. for a jail with no `kubsd-net` wiring). `create` and
+  `start_command` are deliberately separate calls rather than one
+  `jail -c ... command=<command>`: `create` instantiates an empty,
+  persistent jail from `rootfs` with no command running yet, so
+  `kubsd-agentd` can configure networking (via `kubsd-net`) and apply
+  `rctl` limits *before* the jailed process ever runs, matching the
+  Reconciliation Loop's stated order below. `start_command` then launches
+  the process inside the
   already-created jail (`jexec <name> <command>`, spawned without waiting
   on it) and is also the primitive `kubsd-agentd` re-invokes on every
   restart under `restartPolicy: Always`/`OnFailure` — no separate restart
@@ -150,12 +156,22 @@ Rust workspace with the following crates:
   the `b` side into the jail's VNET; configure `address` on it from inside
   the jail via `jexec`) exposed as a single call, matching the
   Reconciliation Loop's stated order (networking is configured as one
-  step between jail creation and starting the command). `detach_jail`
+  step between jail creation and starting the command). Because
+  `epair_base` is a stable, persisted name (see Naming and ownership
+  below), `attach_jail` must tolerate the pair already existing from an
+  interrupted prior attempt (a crash between epair creation and the jail
+  actually starting), the same way `kubsd-zfs`'s `clone_from_base`
+  tolerates a snapshot that already exists: treat "already exists" as a
+  signal to proceed with the remaining steps, not as failure. `detach_jail`
   tears down the epair pair and is called before jail destroy, per the
-  Reconciliation Loop's existing stated order. Like `kubsd-jail` and
-  `kubsd-zfs`, this crate takes plain bridge/epair/jail names it's given
-  — it has no knowledge of kubsd's `kubsd0` bridge-naming or per-jail
-  epair-ordinal conventions; that's `kubsd-agentd`'s job.
+  Reconciliation Loop's existing stated order; it must treat an
+  already-absent epair pair (e.g. one FreeBSD already destroyed along with
+  its owning jail, or a retry after a previously crashed detach) as
+  success rather than an error, mirroring `kubsd-jail`'s
+  `remove_resource_limits`. Like `kubsd-jail` and `kubsd-zfs`, this crate
+  takes plain bridge/epair/jail names it's given — it has no knowledge of
+  kubsd's `kubsd0` bridge-naming or per-jail epair-ordinal conventions;
+  that's `kubsd-agentd`'s job.
 - **`kubsd-agentd`** — the daemon binary. Hosts the local HTTP API and owns
   the reconciliation loop; composes the traits above.
 - **`kubsdctl`** — CLI binary that talks to `kubsd-agentd`'s API to
@@ -353,3 +369,12 @@ implementation plan, not a runtime component of the agent itself.
   is the settled Milestone 2 decision, hidden behind each crate's trait
   either way, so a future switch is an internal change invisible to
   callers.
+- Whether the Reconciliation Loop's "existing and desired but the process
+  has exited" branch needs to re-verify (and reapply if missing)
+  networking and `rctl` limits before calling `start_command` again, or
+  whether "existing" already implies those steps completed. As currently
+  written, a crash between jail creation and the network/`rctl` steps
+  would leave the jail existing but unconfigured, and a restart would
+  only retry `start_command` per that branch, never redoing networking or
+  `rctl`. Surfaced while designing `kubsd-net`'s `attach_jail`; needs
+  resolving before Milestone 3 crash-recovery testing on the FreeBSD VM.
