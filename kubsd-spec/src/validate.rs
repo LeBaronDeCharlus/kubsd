@@ -21,9 +21,20 @@ pub fn validate_address(address: &str) -> Result<(), SpecError> {
         .map_err(|e| SpecError::InvalidAddress(address.to_string(), e.to_string()))
 }
 
+pub fn validate_transition(old: &crate::types::JailSpec, new: &crate::types::JailSpec) -> Result<(), SpecError> {
+    if old.spec.image != new.spec.image {
+        return Err(SpecError::ImmutableField("spec.image"));
+    }
+    if old.spec.network.address != new.spec.network.address {
+        return Err(SpecError::ImmutableField("spec.network.address"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::*;
 
     #[test]
     fn accepts_well_formed_names() {
@@ -64,5 +75,55 @@ mod tests {
         assert!(validate_address("not-an-address").is_err());
         assert!(validate_address("10.0.0.5").is_err()); // missing prefix length
         assert!(validate_address("10.0.0.5/33").is_err()); // prefix out of range
+    }
+
+    fn sample_spec() -> JailSpec {
+        JailSpec {
+            api_version: "kubsd/v1".to_string(),
+            kind: "Jail".to_string(),
+            metadata: Metadata { name: "web-1".to_string() },
+            spec: Spec {
+                image: "base/14.2-web".to_string(),
+                command: vec!["/usr/local/bin/myapp".to_string()],
+                network: NetworkSpec {
+                    vnet: true,
+                    bridge: "kubsd0".to_string(),
+                    address: "10.0.0.5/24".to_string(),
+                },
+                resources: ResourcesSpec { cpu: "2".to_string(), memory: "512M".to_string() },
+                restart_policy: RestartPolicy::Always,
+            },
+        }
+    }
+
+    #[test]
+    fn allows_changing_resources_and_restart_policy() {
+        let old = sample_spec();
+        let mut new = sample_spec();
+        new.spec.resources.cpu = "4".to_string();
+        new.spec.restart_policy = RestartPolicy::Never;
+        assert!(validate_transition(&old, &new).is_ok());
+    }
+
+    #[test]
+    fn rejects_changing_image() {
+        let old = sample_spec();
+        let mut new = sample_spec();
+        new.spec.image = "base/14.2-other".to_string();
+        assert_eq!(
+            validate_transition(&old, &new),
+            Err(SpecError::ImmutableField("spec.image"))
+        );
+    }
+
+    #[test]
+    fn rejects_changing_network_address() {
+        let old = sample_spec();
+        let mut new = sample_spec();
+        new.spec.network.address = "10.0.0.6/24".to_string();
+        assert_eq!(
+            validate_transition(&old, &new),
+            Err(SpecError::ImmutableField("spec.network.address"))
+        );
     }
 }
