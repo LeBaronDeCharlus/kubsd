@@ -51,9 +51,14 @@ Rust workspace with the following crates:
 
 - **`kubsd-spec`** — the jail spec schema (YAML), (de)serialization, and
   validation. Pure Rust; compiles and tests on any OS.
-- **`kubsd-jail`** — FFI wrapper around `jail_set(2)`, `jail_get(2)`,
-  `jail_remove(2)`, and the `rctl` syscalls. FreeBSD-only. Exposes a
-  `JailRuntime` trait so callers can be tested against a fake implementation.
+- **`kubsd-jail`** — wraps jail lifecycle and resource-limit management
+  behind a `JailRuntime` trait so callers can be tested against a fake
+  implementation. For v1 it shells out to `jail(8)`/`jls(8)`/`rctl(8)`
+  rather than binding `jail_set(2)`/`jail_get(2)`/`rctl` syscalls directly
+  — the syscalls involve a fiddly `jailparam` array ABI, and shelling out
+  first (same escape hatch as `kubsd-zfs`) gets a working v1 sooner with
+  lower risk. Moving to raw syscalls later is an internal change behind
+  the trait, invisible to callers.
 - **`kubsd-zfs`** — wraps ZFS dataset/snapshot/clone operations used to
   provision a jail's root filesystem from a base image dataset. Exposes a
   `ZfsManager` trait for the same reason.
@@ -83,19 +88,45 @@ spec:
   network:
     vnet: true
     bridge: kubsd0
+    address: 10.0.0.5/24     # static IP assigned to the jail's epair peer
   resources:
-    cpu: "2"                 # rctl pcpu limit
+    cpu: "2"                 # number of cores; translated to rctl's
+                              # pcpu percentage as cores * 100 (so "2" -> 200)
     memory: "512M"           # rctl vmemoryuse limit
   restartPolicy: Always      # Always | OnFailure | Never
 ```
 
 `kubsd-spec` owns parsing and validation (well-formed resource strings,
-name uniqueness, required fields).
+name uniqueness, required fields, valid CIDR for `network.address`).
 
-State is persisted under `/var/db/kubsd/`: last-applied specs as YAML files
-keyed by jail name. No external database dependency for v1 — the file store
-plus a live query of actual jail state on startup is sufficient to rebuild
-in-memory state after a daemon restart.
+IP addresses are statically assigned in the spec for v1 (no DHCP, no
+agent-owned IPAM pool) — simplest option for a single-node agent, at the
+cost of the user picking non-colliding addresses themselves.
+
+**Naming and ownership.** Every resource this agent creates is tagged so
+reconciliation can tell "mine" from "foreign" after a restart, and so
+resources for different jails never collide:
+
+- The FreeBSD jail itself is named `kubsd-<jail-name>` (the actual
+  `jail(8)` name, distinct from arbitrary jails a human or other tool may
+  have created on the same host). On startup, reconciliation only
+  considers jails whose name has the `kubsd-` prefix as agent-managed;
+  everything else is left untouched regardless of jid or IP overlap.
+- Each jail's `epair(4)` pair is named deterministically from a persisted
+  per-jail ordinal (assigned on first creation and stored alongside the
+  spec), e.g. `epair7a`/`epair7b`, so names stay stable across daemon
+  restarts and never collide between jails.
+- Each jail's ZFS clone lives at a fixed path derived from its name:
+  `<pool>/kubsd/jails/<jail-name>`. Base images live at
+  `<pool>/kubsd/base/<image-name>`.
+
+State is persisted under `/var/db/kubsd/`: last-applied specs (plus the
+assigned epair ordinal) as YAML files keyed by jail name, written via
+write-to-temp-then-rename so a crash mid-write can never leave a corrupt
+file that breaks state reconstruction on the next startup. No external
+database dependency for v1 — the file store plus a live query of actual
+jail state on startup is sufficient to rebuild in-memory state after a
+daemon restart.
 
 ## Reconciliation Loop
 
@@ -117,6 +148,15 @@ Level-triggered, similar to a Kubernetes controller:
 3. Additionally react to `SIGCHLD`-style notification when a jailed
    process's init exits, so restart policy is applied promptly rather than
    waiting for the next timer tick.
+4. Restarts under `Always`/`OnFailure` use capped exponential backoff per
+   jail (e.g. 1s, 2s, 4s, ... up to a 5-minute cap), reset once a jail has
+   stayed up longer than a threshold (e.g. 60s). This bounds CPU waste and
+   log spam from a persistently-crashing command, mirroring Kubernetes'
+   `CrashLoopBackOff`.
+5. The reconciler is single-threaded with an inbound work queue: API-
+   triggered apply/delete requests and the periodic timer tick both enqueue
+   work items rather than acting directly, so two triggers for the same
+   jail name can never race each other.
 
 ## Error Handling
 
@@ -130,6 +170,20 @@ Level-triggered, similar to a Kubernetes controller:
 - The daemon is crash-only safe: on startup it always rebuilds desired
   state from the on-disk spec store and observed state from a live system
   query, rather than relying on any in-memory state surviving a restart.
+- **Jails outlive the daemon.** Jails are not children of `kubsd-agentd`
+  and are not stopped when it exits; a crash or upgrade of the daemon must
+  not affect running jails. This is what makes the ownership tagging
+  above (the `kubsd-` name prefix) necessary: on restart the daemon must
+  distinguish jails it manages from any pre-existing/foreign jail on the
+  host, and never touch the latter.
+- **Unix socket trust model (v1):** the API socket is `root:wheel 0600`.
+  Any local process able to reach it is trusted — there is no separate
+  authn/authz layer in v1. This is a deliberate scope decision, not an
+  oversight.
+- **Daemon supervision:** `kubsd-agentd` runs under an `rc.d` script with
+  restart-on-crash (`keep_alive`), and logs to syslog. This is what makes
+  the "survives daemon restarts" goal demonstrable end-to-end, not just a
+  property of the reconciliation logic in isolation.
 
 ## Testing Strategy
 
