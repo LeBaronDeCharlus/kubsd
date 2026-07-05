@@ -77,3 +77,18 @@ fn set_and_remove_resource_limits() {
 
     runtime.destroy(name).expect("destroy should succeed");
 }
+
+#[test]
+fn remove_resource_limits_on_jail_with_no_limits_set_is_a_no_op_success() {
+    let runtime = ProcessJailRuntime::new();
+    let name = "kubsd-test-no-limits-set";
+    let rootfs = Path::new("/tmp/kubsd-test-no-limits-set-rootfs");
+    std::fs::create_dir_all(rootfs).unwrap();
+
+    let _ = runtime.destroy(name);
+    runtime.create(name, rootfs).expect("create should succeed");
+
+    runtime.remove_resource_limits(name).expect("removing limits that were never set should succeed, not error");
+
+    runtime.destroy(name).expect("destroy should succeed");
+}

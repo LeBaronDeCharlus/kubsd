@@ -21,6 +21,16 @@ impl FakeJailRuntime {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Test helper: simulate the jailed command exiting on its own,
+    /// without destroying the jail — the same observable state a real
+    /// crashed process leaves behind (jail still exists, is_running goes
+    /// false).
+    pub fn mark_exited(&self, name: &str) {
+        if let Some(jail) = self.jails.lock().unwrap().get_mut(name) {
+            jail.running = false;
+        }
+    }
 }
 
 impl JailRuntime for FakeJailRuntime {
@@ -107,5 +117,21 @@ mod tests {
         runtime.create("test-1", Path::new("/tmp/rootfs")).unwrap();
         runtime.set_resource_limits("test-1", 200, 512 * 1024 * 1024).unwrap();
         runtime.remove_resource_limits("test-1").unwrap();
+    }
+
+    #[test]
+    fn mark_exited_makes_is_running_false_without_destroying() {
+        let runtime = FakeJailRuntime::new();
+        runtime.create("test-1", Path::new("/tmp/rootfs")).unwrap();
+        runtime.start_command("test-1", &["/bin/sh".to_string()]).unwrap();
+        assert_eq!(runtime.is_running("test-1").unwrap(), true);
+
+        runtime.mark_exited("test-1");
+        assert_eq!(runtime.is_running("test-1").unwrap(), false);
+
+        // The jail itself still exists — start_command should work again
+        // (simulating a restart), not error as NotFound.
+        runtime.start_command("test-1", &["/bin/sh".to_string()]).unwrap();
+        assert_eq!(runtime.is_running("test-1").unwrap(), true);
     }
 }

@@ -39,7 +39,17 @@ impl Default for CliZfsManager {
 impl ZfsManager for CliZfsManager {
     fn dataset_exists(&self, dataset: &str) -> Result<bool, ZfsError> {
         let output = Self::run(&["list", "-H", "-o", "name", dataset])?;
-        Ok(output.status.success())
+        if output.status.success() {
+            return Ok(true);
+        }
+        if output.status.code() == Some(1) {
+            return Ok(false);
+        }
+        Err(ZfsError::CommandFailed(
+            format!("zfs list -H -o name {dataset}"),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ))
     }
 
     fn destroy_dataset(&self, dataset: &str) -> Result<(), ZfsError> {

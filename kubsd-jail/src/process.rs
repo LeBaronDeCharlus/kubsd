@@ -56,6 +56,12 @@ impl JailRuntime for ProcessJailRuntime {
     }
 
     fn is_running(&self, name: &str) -> Result<bool, JailError> {
+        // Unlike `zfs list`, `jls` returns exit code 1 both when the jail
+        // doesn't exist and on a usage error, so we can't distinguish them
+        // by exit code. Since our own arguments here are fixed and known
+        // to be valid, a usage error would indicate a code bug, not a
+        // runtime condition — treating any failure as "doesn't exist" is
+        // an accepted, deliberate trade-off, not an oversight.
         let jls = Self::run("jls", &["-j", name, "jid"])?;
         if !jls.status.success() {
             return Ok(false);
@@ -67,7 +73,10 @@ impl JailRuntime for ProcessJailRuntime {
         let ps = Self::run("ps", &["-J", &jid, "-o", "state="])?;
         let has_live_process = String::from_utf8_lossy(&ps.stdout)
             .lines()
-            .any(|state| !state.trim().starts_with('Z'));
+            .any(|state| {
+                let state = state.trim();
+                !state.is_empty() && !state.starts_with('Z')
+            });
         Ok(has_live_process)
     }
 
