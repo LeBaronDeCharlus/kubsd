@@ -46,7 +46,11 @@ impl ZfsManager for CliZfsManager {
         Self::run_checked(&["destroy", dataset])
     }
 
-    fn clone_from_base(&self, _base_dataset: &str, _target_dataset: &str) -> Result<(), ZfsError> {
-        unimplemented!("added in Task 8")
+    fn clone_from_base(&self, base_dataset: &str, target_dataset: &str) -> Result<(), ZfsError> {
+        let snapshot = format!("{base_dataset}@kubsd");
+        if !self.dataset_exists(&snapshot)? {
+            Self::run_checked(&["snapshot", &snapshot])?;
+        }
+        Self::run_checked(&["clone", &snapshot, target_dataset])
     }
 }

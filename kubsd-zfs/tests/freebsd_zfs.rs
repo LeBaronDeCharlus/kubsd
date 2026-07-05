@@ -26,3 +26,30 @@ fn destroy_dataset_removes_a_dataset_created_for_the_test() {
     zfs.destroy_dataset(scratch).expect("destroy_dataset should succeed");
     assert_eq!(zfs.dataset_exists(scratch).unwrap(), false);
 }
+
+#[test]
+fn clone_from_base_creates_a_usable_clone() {
+    let zfs = CliZfsManager::new();
+    let target = "zroot/kubsd/jails/clone-test-scratch";
+    let _ = zfs.destroy_dataset(target);
+
+    zfs.clone_from_base("zroot/kubsd/base/test", target).expect("clone_from_base should succeed");
+    assert_eq!(zfs.dataset_exists(target).unwrap(), true);
+
+    zfs.destroy_dataset(target).expect("cleanup destroy should succeed");
+}
+
+#[test]
+fn clone_from_base_reuses_existing_snapshot_on_second_call() {
+    let zfs = CliZfsManager::new();
+    let target_a = "zroot/kubsd/jails/clone-test-scratch-a";
+    let target_b = "zroot/kubsd/jails/clone-test-scratch-b";
+    let _ = zfs.destroy_dataset(target_a);
+    let _ = zfs.destroy_dataset(target_b);
+
+    zfs.clone_from_base("zroot/kubsd/base/test", target_a).expect("first clone should succeed");
+    zfs.clone_from_base("zroot/kubsd/base/test", target_b).expect("second clone should succeed and reuse the snapshot");
+
+    zfs.destroy_dataset(target_a).expect("cleanup a should succeed");
+    zfs.destroy_dataset(target_b).expect("cleanup b should succeed");
+}
