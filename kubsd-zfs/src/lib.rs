@@ -1,6 +1,8 @@
+pub mod cli;
 pub mod error;
 pub mod fake;
 
+pub use cli::CliZfsManager;
 pub use error::ZfsError;
 pub use fake::FakeZfsManager;
 
