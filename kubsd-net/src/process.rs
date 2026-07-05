@@ -59,8 +59,46 @@ impl NetManager for ProcessNetManager {
         Self::run_checked("ifconfig", &[bridge, "up"])
     }
 
-    fn attach_jail(&self, _jail_name: &str, _bridge: &str, _epair_base: &str, _address: &str) -> Result<(), NetError> {
-        unimplemented!("added in Task 4")
+    fn attach_jail(&self, jail_name: &str, bridge: &str, epair_base: &str, address: &str) -> Result<(), NetError> {
+        let epair_a = format!("{epair_base}a");
+        let epair_b = format!("{epair_base}b");
+
+        let create = Self::run("ifconfig", &[epair_base, "create"])?;
+        if !create.status.success() && !Self::stderr_contains(&create, "already exists") {
+            return Err(NetError::CommandFailed(
+                format!("ifconfig {epair_base} create"),
+                create.status,
+                String::from_utf8_lossy(&create.stderr).into_owned(),
+            ));
+        }
+
+        let addm = Self::run("ifconfig", &[bridge, "addm", &epair_a])?;
+        if !addm.status.success() && !Self::stderr_contains(&addm, "File exists") {
+            return Err(NetError::CommandFailed(
+                format!("ifconfig {bridge} addm {epair_a}"),
+                addm.status,
+                String::from_utf8_lossy(&addm.stderr).into_owned(),
+            ));
+        }
+
+        Self::run_checked("ifconfig", &[&epair_a, "up"])?;
+
+        let vnet_move = Self::run("ifconfig", &[&epair_b, "vnet", jail_name])?;
+        if !vnet_move.status.success() {
+            // Might already be moved from an interrupted prior attempt —
+            // check whether it's already correctly placed in the target jail.
+            let already_there = Self::run("jexec", &[jail_name, "/sbin/ifconfig", &epair_b])?;
+            if !already_there.status.success() {
+                return Err(NetError::CommandFailed(
+                    format!("ifconfig {epair_b} vnet {jail_name}"),
+                    vnet_move.status,
+                    String::from_utf8_lossy(&vnet_move.stderr).into_owned(),
+                ));
+            }
+        }
+
+        Self::run_checked("jexec", &[jail_name, "/sbin/ifconfig", &epair_b, "inet", address])?;
+        Self::run_checked("jexec", &[jail_name, "/sbin/ifconfig", &epair_b, "up"])
     }
 
     fn detach_jail(&self, _epair_base: &str) -> Result<(), NetError> {
