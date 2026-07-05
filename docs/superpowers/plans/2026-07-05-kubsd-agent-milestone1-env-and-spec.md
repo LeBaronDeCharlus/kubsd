@@ -25,7 +25,8 @@ builds/tests entirely on macOS.
 ## Global Constraints
 
 - Design spec: `docs/superpowers/specs/2026-07-05-kubsd-agent-design.md` (Approved). Every rule below traces back to it.
-- Target FreeBSD VM for all real (non-mocked) work: `root@192.168.64.2`, FreeBSD 15.1-RELEASE-p1, ZFS pool `zroot`.
+- Target FreeBSD VM for all real (non-mocked) work: `root@192.168.64.2`, FreeBSD 15.1-RELEASE-p1 aarch64, ZFS pool `zroot`.
+- Rust toolchain on the VM is installed via `pkg` (rustc/cargo 1.94.0), not `rustup` — rustup has no `aarch64-unknown-freebsd` host installer. Any future milestone that builds on the VM should assume `pkg`-managed Rust, not `rustup`.
 - Jail naming prefix: agent-managed jails are named `kubsd-<jail-name>` (not needed by this milestone, but the name-format validation added here must not conflict with it).
 - `kubsd-spec` has no FreeBSD-specific code and must build and test on any OS.
 - No placeholders: every validation rule implemented here has a passing and a failing test.
@@ -93,21 +94,28 @@ Expected: `kern.racct.enable: 1`, and two `kldstat` lines showing
 
 - [ ] **Step 5: Install git and the Rust toolchain**
 
+`rustup`'s static installer does not ship a host build for
+`aarch64-unknown-freebsd` (confirmed: it 404s with "installer for platform
+'aarch64-unknown-freebsd' not found, this may be unsupported"), so on this
+arm64 FreeBSD VM the toolchain comes from `pkg` instead, which does build
+Rust for aarch64.
+
 Run:
 ```
-! ssh root@192.168.64.2 'pkg install -y git curl && curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
+! ssh root@192.168.64.2 'pkg install -y git rust'
 ```
 
-Expected: `pkg` install succeeds, then the rustup installer runs and prints
-`Rust is installed now. Great!` at the end.
+Expected: `pkg` resolves and installs `git`, `rust`, and their
+dependencies successfully.
 
 - [ ] **Step 6: Verify the toolchain**
 
-Run: `! ssh root@192.168.64.2 'source ~/.cargo/env && rustc --version && cargo --version && git --version'`
+Run: `! ssh root@192.168.64.2 'rustc --version && cargo --version && git --version'`
 
-Expected: version strings print for all three with no errors. This is the
-task's pass/fail check — if any of the three commands error, Task 1 is not
-done.
+Expected: version strings print for all three with no errors (no
+`source ~/.cargo/env` needed — the `pkg`-installed toolchain is on `PATH`
+directly). This is the task's pass/fail check — if any of the three
+commands error, Task 1 is not done.
 
 - [ ] **Step 7: No commit needed**
 
