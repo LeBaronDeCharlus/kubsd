@@ -6,8 +6,8 @@ and VNET networking.
 ## Motivation
 
 FreeBSD has mature, battle-tested primitives for isolation and resource
-control — jails, ZFS snapshots/clones, `rctl(8)` resource limits, VNET
-per-jail networking — but nothing that ties them together the way
+control, jails, ZFS snapshots/clones, `rctl(8)` resource limits, VNET
+per-jail networking, but nothing that ties them together the way
 Kubernetes ties together Linux namespaces, cgroups, and overlay networking.
 
 Existing FreeBSD jail tools (`bastille`, `ezjail`, `cbsd`, plain
@@ -15,7 +15,7 @@ Existing FreeBSD jail tools (`bastille`, `ezjail`, `cbsd`, plain
 *reconciliation-based*: none continuously watch a declarative spec and
 drive the live system to match it, restart what crashed, clean up what was
 removed, or survive their own restarts without losing track of what they
-manage. That gap — declarative, self-healing orchestration for FreeBSD — is
+manage. That gap, declarative, self-healing orchestration for FreeBSD, is
 what kubsd is for.
 
 ## Why FreeBSD
@@ -28,8 +28,8 @@ isolation) is already correct and well-tested at the OS level.
 
 ## How this differs from Kubernetes
 
-kubsd borrows Kubernetes' *shape* — declarative specs, a reconciliation
-loop, a CLI that mirrors `kubectl` — but it is not trying to be a
+kubsd borrows Kubernetes' *shape*, declarative specs, a reconciliation
+loop, a CLI that mirrors `kubectl`, but it is not trying to be a
 drop-in replacement, and today it is far smaller in scope:
 
 | | Kubernetes | kubsd (current) |
@@ -39,17 +39,17 @@ drop-in replacement, and today it is far smaller in scope:
 | Filesystem | overlay/container images | ZFS clones of a base dataset |
 | Networking | CNI, overlay networks, Services | VNET + `epair(4)` + `bridge(4)`, static IPs |
 | Scope | multi-node cluster, scheduler | single node (kubelet-equivalent only) |
-| Control plane | API server + etcd + scheduler | none yet — one local daemon per host |
+| Control plane | API server + etcd + scheduler | none yet, one local daemon per host |
 
 In other words: what exists today is the FreeBSD analog of a **kubelet**,
 not a full cluster. There is no scheduler, no multi-node API server, and no
-cluster networking yet — see Roadmap below.
+cluster networking yet, see Roadmap below.
 
 ## Why you'd use it
 
 - **Declarative jails.** Describe a jail (image, command, resources,
   network, restart policy) as a spec; apply it; the daemon makes reality
-  match it, continuously — not a one-shot script.
+  match it, continuously, not a one-shot script.
 - **Self-healing.** Crashed jails restart automatically per policy, with
   crash-loop backoff so a persistently broken jail doesn't spin forever.
 - **Safe by construction.** The daemon only ever touches jails it created
@@ -60,20 +60,11 @@ cluster networking yet — see Roadmap below.
 - **Fast provisioning.** Jail root filesystems are ZFS clones of a base
   image, so creating a new jail is close to instant and cheap on disk.
 
-## Status
-
-Early days — no working code yet. The design is written and approved; the
-first implementation milestone (FreeBSD dev environment + the jail-spec
-parser/validator crate) is about to start.
-
-- Design spec: [`docs/superpowers/specs/2026-07-05-kubsd-agent-design.md`](docs/superpowers/specs/2026-07-05-kubsd-agent-design.md)
-- Current implementation plan: [`docs/superpowers/plans/2026-07-05-kubsd-agent-milestone1-env-and-spec.md`](docs/superpowers/plans/2026-07-05-kubsd-agent-milestone1-env-and-spec.md)
-
 ## Roadmap
 
-**Sub-project 1: kubsd-agent** (single-node jail reconciliation daemon — in progress)
+**Sub-project 1: kubsd-agent** (single-node jail reconciliation daemon, in progress)
 
-1. FreeBSD dev environment + `kubsd-spec` (jail YAML schema, parsing, validation) — *current milestone*
+1. FreeBSD dev environment + `kubsd-spec` (jail YAML schema, parsing, validation), *current milestone*
 2. `kubsd-jail` (jail lifecycle via `jail(8)`/`jls(8)`/`rctl(8)`) and `kubsd-zfs` (ZFS clone provisioning)
 3. `kubsd-net` (VNET + `epair(4)` + `bridge(4)` wiring)
 4. `kubsd-agentd` reconciliation core (desired vs. observed state, crash-loop backoff, crash-safe persistence) tested against fakes of the above
@@ -90,6 +81,6 @@ parser/validator crate) is about to start.
 
 ## Platform support
 
-FreeBSD only. No plans to support other BSDs (NetBSD, OpenBSD) or Linux —
+FreeBSD only. No plans to support other BSDs (NetBSD, OpenBSD) or Linux,
 the design leans directly on FreeBSD-specific primitives (jails, `rctl`,
 VNET, ZFS) rather than abstracting over multiple OSes.
