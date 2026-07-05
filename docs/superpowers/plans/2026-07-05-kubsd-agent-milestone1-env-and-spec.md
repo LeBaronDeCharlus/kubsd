@@ -327,7 +327,9 @@ verification). Confirm it prints `test types::tests::parses_the_design_spec_exam
 
 Run: `cargo test --workspace`
 
-Expected: PASS, 2 tests total (the Task 2 placeholder test plus this one).
+Expected: PASS, 1 test total. Note: this task's `lib.rs` replaces Task 2's
+placeholder-test version entirely, so the Task 2 placeholder test no longer
+exists — the count here is just this task's own test, not "plus" anything.
 
 - [ ] **Step 5: Commit**
 
@@ -461,7 +463,7 @@ should PASS on first run. Confirm both `accepts_well_formed_names` and
 
 Run: `cargo test --workspace`
 
-Expected: PASS, 4 tests total.
+Expected: PASS, 3 tests total.
 
 - [ ] **Step 5: Commit**
 
@@ -529,7 +531,7 @@ Expected: PASS for both.
 
 Run: `cargo test --workspace`
 
-Expected: PASS, 6 tests total.
+Expected: PASS, 5 tests total.
 
 - [ ] **Step 5: Commit**
 
@@ -662,7 +664,7 @@ Expected: PASS for all 5 tests (`parses_valid_cpu_values`,
 
 Run: `cargo test --workspace`
 
-Expected: PASS, 11 tests total.
+Expected: PASS, 10 tests total.
 
 - [ ] **Step 5: Commit**
 
@@ -771,7 +773,7 @@ Expected: PASS for all three.
 
 Run: `cargo test --workspace`
 
-Expected: PASS, 14 tests total.
+Expected: PASS, 13 tests total.
 
 - [ ] **Step 5: Commit**
 
@@ -890,7 +892,7 @@ Expected: PASS for all 4 tests (`parses_and_validates_the_design_spec_example`,
 
 Run: `cargo test --workspace`
 
-Expected: PASS, 18 tests total (14 unit tests from Tasks 3-7 plus these 4
+Expected: PASS, 17 tests total (13 unit tests from Tasks 3-7 plus these 4
 integration tests).
 
 - [ ] **Step 5: Commit**
@@ -904,7 +906,7 @@ git commit -m "Add parse_and_validate public API with end-to-end tests"
 
 ## Milestone Exit Criteria
 
-- `cargo test --workspace` passes with 18 tests, entirely on macOS, no
+- `cargo test --workspace` passes with 17 tests, entirely on macOS, no
   FreeBSD VM involved.
 - The FreeBSD VM at `root@192.168.64.2` has `if_bridge`/`if_epair` loaded,
   `kern.racct.enable=1`, and a working `rustc`/`cargo`/`git` — ready for the
