@@ -1,8 +1,10 @@
 pub mod error;
 pub mod fake;
+pub mod process;
 
 pub use error::JailError;
 pub use fake::FakeJailRuntime;
+pub use process::ProcessJailRuntime;
 
 use std::path::Path;
 
