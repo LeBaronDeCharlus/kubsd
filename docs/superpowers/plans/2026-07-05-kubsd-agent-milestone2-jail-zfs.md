@@ -47,15 +47,21 @@ prompt.
 **Files:** None (infrastructure only).
 
 **Interfaces:**
-- Produces: a ZFS dataset `zroot/kubsd/base/test` on the VM that Tasks 7
-  and 8's integration tests clone from.
+- Produces: ZFS datasets `zroot/kubsd/base/test` (that Tasks 7 and 8's
+  integration tests clone from) and `zroot/kubsd/jails` (the parent
+  dataset that `zfs create`/`zfs clone` need to already exist before they
+  can create anything underneath it, e.g.
+  `zroot/kubsd/jails/destroy-test-scratch` in Task 7's test — `zfs
+  create`/`clone` fail with "parent does not exist" otherwise, since
+  neither takes `-p` in this milestone's code).
 
-- [ ] **Step 1: Create the test base dataset**
+- [ ] **Step 1: Create the test base dataset and the jails parent dataset**
 
-Run: `! ssh root@192.168.64.2 'zfs create -p zroot/kubsd/base/test && zfs list zroot/kubsd/base/test'`
+Run: `! ssh root@192.168.64.2 'zfs create -p zroot/kubsd/base/test && zfs create zroot/kubsd/jails && zfs list -r zroot/kubsd'`
 
-Expected: the dataset is created and `zfs list` shows it with `zroot` as
-its pool.
+Expected: both datasets are created; `zfs list -r zroot/kubsd` shows
+`zroot/kubsd`, `zroot/kubsd/base`, `zroot/kubsd/base/test`, and
+`zroot/kubsd/jails`.
 
 - [ ] **Step 2: One-time repo clone on the VM**
 
