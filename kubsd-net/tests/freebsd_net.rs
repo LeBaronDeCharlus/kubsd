@@ -118,6 +118,25 @@ fn detach_jail_removes_epair_and_is_idempotent() {
 }
 
 #[test]
+fn attach_jail_returns_not_found_for_missing_bridge() {
+    let net = ProcessNetManager::new();
+    let jail_name = "kubsd-net-test-missing-bridge";
+    let epair_base = "epair60";
+
+    destroy_interface_if_exists(&format!("{epair_base}a"));
+    let jails = make_test_jail(jail_name);
+
+    let result = net.attach_jail(jail_name, "kubsd-nonexistent-bridge", epair_base, "10.99.0.9/24");
+    assert!(matches!(result, Err(kubsd_net::NetError::NotFound(_))), "expected NotFound, got {result:?}");
+
+    // Confirm no epair was created, since the bridge check happens before anything else.
+    let check = Command::new("ifconfig").arg(format!("{epair_base}a")).output().expect("ifconfig should run");
+    assert!(!check.status.success(), "no epair should have been created when the bridge check fails first");
+
+    jails.destroy(jail_name).expect("cleanup destroy should succeed");
+}
+
+#[test]
 fn detach_before_destroy_works_while_jail_is_still_running() {
     let net = ProcessNetManager::new();
     let bridge = "kubsd-test-br4";

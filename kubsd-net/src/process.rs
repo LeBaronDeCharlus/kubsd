@@ -60,6 +60,11 @@ impl NetManager for ProcessNetManager {
     }
 
     fn attach_jail(&self, jail_name: &str, bridge: &str, epair_base: &str, address: &str) -> Result<(), NetError> {
+        let bridge_check = Self::run("ifconfig", &[bridge])?;
+        if !bridge_check.status.success() {
+            return Err(NetError::NotFound(bridge.to_string()));
+        }
+
         let epair_a = format!("{epair_base}a");
         let epair_b = format!("{epair_base}b");
 
