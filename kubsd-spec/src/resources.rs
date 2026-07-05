@@ -29,7 +29,7 @@ pub fn parse_memory_bytes(s: &str) -> Result<u64, SpecError> {
     if value == 0 {
         return Err(invalid());
     }
-    Ok(value * multiplier)
+    value.checked_mul(multiplier).ok_or_else(invalid)
 }
 
 #[cfg(test)]
@@ -69,5 +69,6 @@ mod tests {
         assert!(parse_memory_bytes("").is_err());
         assert!(parse_memory_bytes("abc").is_err());
         assert!(parse_memory_bytes("-5M").is_err());
+        assert!(parse_memory_bytes("999999999999G").is_err());
     }
 }
