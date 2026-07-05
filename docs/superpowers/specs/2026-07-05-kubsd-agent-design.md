@@ -65,7 +65,8 @@ Rust workspace with the following crates:
 
   ```rust
   pub trait JailRuntime {
-      fn create(&self, name: &str, rootfs: &Path, command: &[String]) -> Result<(), JailError>;
+      fn create(&self, name: &str, rootfs: &Path) -> Result<(), JailError>;
+      fn start_command(&self, name: &str, command: &[String]) -> Result<(), JailError>;
       fn destroy(&self, name: &str) -> Result<(), JailError>;
       fn is_running(&self, name: &str) -> Result<bool, JailError>;
       fn set_resource_limits(&self, name: &str, pcpu_percent: u32, memory_bytes: u64) -> Result<(), JailError>;
@@ -75,11 +76,27 @@ Rust workspace with the following crates:
 
   `kubsd-jail` takes a plain jail name string — it has no knowledge of
   kubsd's `kubsd-<name>` naming/ownership convention; applying that prefix
-  is `kubsd-agentd`'s responsibility. `create` uses `jail -c ... persist
-  command=<command>`; `persist` keeps the jail alive independent of the
-  command's exit, since re-running a failed command per `restartPolicy` is
-  `kubsd-agentd`'s reconciliation-loop job (a later milestone), not this
-  crate's. `destroy` uses `jail -r` (also kills jailed processes).
+  is `kubsd-agentd`'s responsibility. `create` and `start_command` are
+  deliberately separate calls rather than one `jail -c ... command=<command>`:
+  `create` uses `jail -c ... persist` to instantiate an empty, persistent
+  jail from `rootfs` with no command running yet, so `kubsd-agentd` can
+  configure networking (via `kubsd-net`) and apply `rctl` limits *before*
+  the jailed process ever runs, matching the Reconciliation Loop's stated
+  order below. `start_command` then launches the process inside the
+  already-created jail (`jexec <name> <command>`, spawned without waiting
+  on it) and is also the primitive `kubsd-agentd` re-invokes on every
+  restart under `restartPolicy: Always`/`OnFailure` — no separate restart
+  API is needed. Neither call may block its caller for the process's
+  lifetime: shelling out to `jail(8)`/`jexec(8)` synchronously and waiting
+  on it would stall the single-threaded reconciler for as long as the
+  command keeps running (e.g. forever, for a healthy `Always`-policy jail).
+  `is_running` cannot rely on a remembered child handle either, since a
+  handle wouldn't survive a `kubsd-agentd` restart and would break
+  crash-only-safety; it always resolves liveness from a live system query
+  (e.g. `jls` for the jail's existence plus a process-table check for
+  whether its command is still running), consistent with rebuilding
+  observed state from disk plus live query on every startup (see Error
+  Handling). `destroy` uses `jail -r` (also kills jailed processes).
   `set_resource_limits`/`remove_resource_limits` wrap `rctl -a
   jail:<name>:pcpu:deny=<percent>` / `...vmemoryuse:deny=<bytes>` and
   `rctl -r jail:<name>`, matching the explicit-removal rule under Error
@@ -207,14 +224,15 @@ Level-triggered, similar to a Kubernetes controller:
 2. On a timer (e.g. every 5s) and immediately after any API-triggered
    apply/delete, diff desired vs. observed per named jail:
    - Desired but not existing → provision rootfs (ZFS clone from base
-     image), create the jail (`jail_set`), configure networking
-     (epair/bridge/VNET), apply `rctl` limits, start the command.
+     image), create the jail (`kubsd-jail`'s `create`), configure
+     networking (epair/bridge/VNET), apply `rctl` limits, then start the
+     command (`kubsd-jail`'s `start_command`).
    - Existing but not desired → stop the jailed process (`SIGTERM`, wait up
      to a per-jail grace period, default 10s, then `SIGKILL` and force
      `jail -R` removal if it hasn't exited), remove network interfaces and
      `rctl` rules, destroy the jail, destroy the ZFS clone.
    - Existing and desired but the process has exited → apply
-     `restartPolicy`.
+     `restartPolicy` by calling `start_command` again (see backoff below).
    - Existing and matches desired → no-op.
 3. Additionally react to `SIGCHLD`-style notification when a jailed
    process's init exits, so restart policy is applied promptly rather than
@@ -235,9 +253,9 @@ Level-triggered, similar to a Kubernetes controller:
   Failures do not crash the daemon; the reconciler retries with backoff on
   the next loop iteration.
 - Partial failure during jail creation (e.g. ZFS clone succeeds but
-  `jail_set` fails) triggers automatic cleanup of the partially-created
-  resources, so failed creations don't leak ZFS clones or network
-  interfaces.
+  `kubsd-jail`'s `create` fails) triggers automatic cleanup of the
+  partially-created resources, so failed creations don't leak ZFS clones or
+  network interfaces.
 - `rctl` rules are removed explicitly on jail destroy, not left to expire
   on their own — FreeBSD recycles `jid`s, so a stale `jail:<name>` rule
   left behind could otherwise misapply its limits to an unrelated jail
@@ -290,6 +308,10 @@ implementation plan, not a runtime component of the agent itself.
 
 ## Open Questions / Deferred Decisions
 
+- Whether `kubsd-spec` should validate the `apiVersion`/`kind` discriminant
+  fields (e.g. reject a document with `kind: Pod` or an unrecognized
+  `apiVersion`) — currently unchecked; flagged as a non-blocking gap in the
+  Milestone 1 final review and still open.
 - Exact on-disk state store format (flat YAML files vs. embedded DB like
   `sled`) — flat files chosen for v1 simplicity; revisit if performance or
   concurrency needs arise.
