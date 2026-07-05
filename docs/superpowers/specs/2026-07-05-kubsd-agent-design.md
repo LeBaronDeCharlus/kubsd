@@ -1,6 +1,6 @@
 # kubsd-agent: Single-Node FreeBSD Jail Reconciliation Daemon
 
-Status: Draft, pending user review
+Status: Approved
 Date: 2026-07-05
 
 ## Context
@@ -63,7 +63,10 @@ Rust workspace with the following crates:
   provision a jail's root filesystem from a base image dataset. Exposes a
   `ZfsManager` trait for the same reason.
 - **`kubsd-net`** — sets up `epair(4)` + `bridge(4)` + VNET wiring per jail.
-  Exposes a `NetManager` trait.
+  Exposes a `NetManager` trait. It creates the jail's configured bridge
+  (e.g. `kubsd0`) on first use if it doesn't already exist, so bridge setup
+  isn't a separate manual prerequisite; it never destroys a bridge, since
+  other jails or host config may depend on it.
 - **`kubsd-agentd`** — the daemon binary. Hosts the local HTTP API and owns
   the reconciliation loop; composes the traits above.
 - **`kubsdctl`** — CLI binary that talks to `kubsd-agentd`'s API to
@@ -103,6 +106,24 @@ IP addresses are statically assigned in the spec for v1 (no DHCP, no
 agent-owned IPAM pool) — simplest option for a single-node agent, at the
 cost of the user picking non-colliding addresses themselves.
 
+**Base images.** Populating `<pool>/kubsd/base/<image-name>` (e.g. via
+`bsdinstall` into a dataset, or `zfs recv` of a prepared image) is out of
+scope for kubsd-agent v1 — base datasets are prepared out-of-band by the
+operator. Before cloning, the reconciler checks that the base dataset
+exists and fails that jail's reconciliation with a clear "base image not
+found" error (retried with backoff like any other failure) rather than
+attempting a clone that ZFS would reject anyway.
+
+**Mutating an applied spec.** Re-`apply`ing a spec for a jail that already
+exists is only supported for fields that don't require rebuilding the
+jail's identity: `resources` and `restartPolicy` are reconciled in place
+(new `rctl` limits take effect on the next reconciliation pass; a
+`restartPolicy` change affects only future exits). `image` and
+`network.address` are immutable after first creation — a spec that changes
+either is rejected by `kubsd-spec` validation with an error telling the
+user to `delete` and re-`apply` instead. This avoids having to define
+in-place rootfs-swap or re-addressing semantics for v1.
+
 **Naming and ownership.** Every resource this agent creates is tagged so
 reconciliation can tell "mine" from "foreign" after a restart, and so
 resources for different jails never collide:
@@ -140,8 +161,10 @@ Level-triggered, similar to a Kubernetes controller:
    - Desired but not existing → provision rootfs (ZFS clone from base
      image), create the jail (`jail_set`), configure networking
      (epair/bridge/VNET), apply `rctl` limits, start the command.
-   - Existing but not desired → stop the jailed process, remove network
-     interfaces, destroy the jail, destroy the ZFS clone.
+   - Existing but not desired → stop the jailed process (`SIGTERM`, wait up
+     to a per-jail grace period, default 10s, then `SIGKILL` and force
+     `jail -R` removal if it hasn't exited), remove network interfaces and
+     `rctl` rules, destroy the jail, destroy the ZFS clone.
    - Existing and desired but the process has exited → apply
      `restartPolicy`.
    - Existing and matches desired → no-op.
@@ -167,6 +190,10 @@ Level-triggered, similar to a Kubernetes controller:
   `jail_set` fails) triggers automatic cleanup of the partially-created
   resources, so failed creations don't leak ZFS clones or network
   interfaces.
+- `rctl` rules are removed explicitly on jail destroy, not left to expire
+  on their own — FreeBSD recycles `jid`s, so a stale `jail:<name>` rule
+  left behind could otherwise misapply its limits to an unrelated jail
+  that later reuses the same jid.
 - The daemon is crash-only safe: on startup it always rebuilds desired
   state from the on-disk spec store and observed state from a live system
   query, rather than relying on any in-memory state surviving a restart.
