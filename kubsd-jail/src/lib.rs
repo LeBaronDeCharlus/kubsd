@@ -11,7 +11,7 @@ use std::path::Path;
 pub trait JailRuntime {
     /// Creates a persistent, empty jail with no command running yet
     /// (uses `jail -c ... persist`).
-    fn create(&self, name: &str, rootfs: &Path) -> Result<(), JailError>;
+    fn create(&self, name: &str, rootfs: &Path, vnet: bool) -> Result<(), JailError>;
 
     /// Non-blocking: spawns the command and returns immediately. A launch
     /// failure *inside* the jail (bad command, missing binary) is NOT

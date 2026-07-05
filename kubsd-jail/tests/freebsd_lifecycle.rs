@@ -16,7 +16,7 @@ fn create_destroy_and_is_running_lifecycle() {
 
     let _ = runtime.destroy(name);
 
-    runtime.create(name, rootfs).expect("create should succeed");
+    runtime.create(name, rootfs, false).expect("create should succeed");
     assert_eq!(runtime.is_running(name).unwrap(), false, "no command started yet");
 
     runtime.destroy(name).expect("destroy should succeed");
@@ -34,7 +34,7 @@ fn start_command_makes_is_running_true() {
     std::fs::copy("/rescue/sleep", bin_dir.join("sleep")).expect("copy /rescue/sleep into test rootfs");
 
     let _ = runtime.destroy(name);
-    runtime.create(name, rootfs).expect("create should succeed");
+    runtime.create(name, rootfs, false).expect("create should succeed");
 
     runtime
         .start_command(name, &["/bin/sh".to_string(), "-c".to_string(), "sleep 30".to_string()])
@@ -56,7 +56,7 @@ fn set_and_remove_resource_limits() {
 
     let _ = runtime.remove_resource_limits(name);
     let _ = runtime.destroy(name);
-    runtime.create(name, rootfs).expect("create should succeed");
+    runtime.create(name, rootfs, false).expect("create should succeed");
 
     runtime.set_resource_limits(name, 200, 512 * 1024 * 1024).expect("set_resource_limits should succeed");
 
@@ -86,7 +86,7 @@ fn remove_resource_limits_on_jail_with_no_limits_set_is_a_no_op_success() {
     std::fs::create_dir_all(rootfs).unwrap();
 
     let _ = runtime.destroy(name);
-    runtime.create(name, rootfs).expect("create should succeed");
+    runtime.create(name, rootfs, false).expect("create should succeed");
 
     runtime.remove_resource_limits(name).expect("removing limits that were never set should succeed, not error");
 

@@ -46,9 +46,15 @@ impl Default for ProcessJailRuntime {
 }
 
 impl JailRuntime for ProcessJailRuntime {
-    fn create(&self, name: &str, rootfs: &Path) -> Result<(), JailError> {
+    fn create(&self, name: &str, rootfs: &Path, vnet: bool) -> Result<(), JailError> {
         let path_arg = format!("path={}", rootfs.display());
-        Self::run_checked("jail", &["-c", &format!("name={name}"), &path_arg, "persist"])
+        let name_arg = format!("name={name}");
+        let mut args: Vec<&str> = vec!["-c", &name_arg, &path_arg];
+        if vnet {
+            args.push("vnet");
+        }
+        args.push("persist");
+        Self::run_checked("jail", &args)
     }
 
     fn destroy(&self, name: &str) -> Result<(), JailError> {

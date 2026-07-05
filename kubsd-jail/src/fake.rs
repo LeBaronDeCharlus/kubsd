@@ -7,6 +7,8 @@ use std::sync::Mutex;
 struct FakeJail {
     #[allow(dead_code)]
     rootfs: PathBuf,
+    #[allow(dead_code)]
+    vnet: bool,
     running: bool,
     pcpu_percent: Option<u32>,
     memory_bytes: Option<u64>,
@@ -34,10 +36,10 @@ impl FakeJailRuntime {
 }
 
 impl JailRuntime for FakeJailRuntime {
-    fn create(&self, name: &str, rootfs: &Path) -> Result<(), JailError> {
+    fn create(&self, name: &str, rootfs: &Path, vnet: bool) -> Result<(), JailError> {
         self.jails.lock().unwrap().insert(
             name.to_string(),
-            FakeJail { rootfs: rootfs.to_path_buf(), running: false, pcpu_percent: None, memory_bytes: None },
+            FakeJail { rootfs: rootfs.to_path_buf(), vnet, running: false, pcpu_percent: None, memory_bytes: None },
         );
         Ok(())
     }
@@ -82,14 +84,14 @@ mod tests {
     #[test]
     fn create_then_is_running_is_false_until_start_command() {
         let runtime = FakeJailRuntime::new();
-        runtime.create("test-1", Path::new("/tmp/rootfs")).unwrap();
+        runtime.create("test-1", Path::new("/tmp/rootfs"), false).unwrap();
         assert_eq!(runtime.is_running("test-1").unwrap(), false);
     }
 
     #[test]
     fn start_command_makes_is_running_true() {
         let runtime = FakeJailRuntime::new();
-        runtime.create("test-1", Path::new("/tmp/rootfs")).unwrap();
+        runtime.create("test-1", Path::new("/tmp/rootfs"), false).unwrap();
         runtime.start_command("test-1", &["/bin/sh".to_string()]).unwrap();
         assert_eq!(runtime.is_running("test-1").unwrap(), true);
     }
@@ -97,7 +99,7 @@ mod tests {
     #[test]
     fn destroy_removes_the_jail() {
         let runtime = FakeJailRuntime::new();
-        runtime.create("test-1", Path::new("/tmp/rootfs")).unwrap();
+        runtime.create("test-1", Path::new("/tmp/rootfs"), false).unwrap();
         runtime.destroy("test-1").unwrap();
         assert_eq!(runtime.is_running("test-1").unwrap(), false);
     }
@@ -114,7 +116,7 @@ mod tests {
     #[test]
     fn set_and_remove_resource_limits_do_not_error_on_known_jail() {
         let runtime = FakeJailRuntime::new();
-        runtime.create("test-1", Path::new("/tmp/rootfs")).unwrap();
+        runtime.create("test-1", Path::new("/tmp/rootfs"), false).unwrap();
         runtime.set_resource_limits("test-1", 200, 512 * 1024 * 1024).unwrap();
         runtime.remove_resource_limits("test-1").unwrap();
     }
@@ -122,7 +124,7 @@ mod tests {
     #[test]
     fn mark_exited_makes_is_running_false_without_destroying() {
         let runtime = FakeJailRuntime::new();
-        runtime.create("test-1", Path::new("/tmp/rootfs")).unwrap();
+        runtime.create("test-1", Path::new("/tmp/rootfs"), false).unwrap();
         runtime.start_command("test-1", &["/bin/sh".to_string()]).unwrap();
         assert_eq!(runtime.is_running("test-1").unwrap(), true);
 
