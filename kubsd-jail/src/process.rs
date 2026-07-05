@@ -64,8 +64,12 @@ impl JailRuntime for ProcessJailRuntime {
         if jid.is_empty() {
             return Ok(false);
         }
-        let ps = Self::run("ps", &["-J", &jid, "-o", "pid="])?;
-        Ok(!String::from_utf8_lossy(&ps.stdout).trim().is_empty())
+        let ps = Self::run("ps", &["-J", &jid, "-o", "state=,pid="])?;
+        let has_live_process = String::from_utf8_lossy(&ps.stdout)
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .any(|state| !state.starts_with('Z'));
+        Ok(has_live_process)
     }
 
     fn start_command(&self, name: &str, command: &[String]) -> Result<(), JailError> {

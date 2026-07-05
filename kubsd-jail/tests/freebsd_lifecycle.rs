@@ -31,6 +31,7 @@ fn start_command_makes_is_running_true() {
     let bin_dir = rootfs.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
     std::fs::copy("/rescue/sh", bin_dir.join("sh")).expect("copy /rescue/sh into test rootfs");
+    std::fs::copy("/rescue/sleep", bin_dir.join("sleep")).expect("copy /rescue/sleep into test rootfs");
 
     let _ = runtime.destroy(name);
     runtime.create(name, rootfs).expect("create should succeed");
