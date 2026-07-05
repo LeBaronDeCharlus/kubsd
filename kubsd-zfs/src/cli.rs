@@ -49,7 +49,11 @@ impl ZfsManager for CliZfsManager {
     fn clone_from_base(&self, base_dataset: &str, target_dataset: &str) -> Result<(), ZfsError> {
         let snapshot = format!("{base_dataset}@kubsd");
         if !self.dataset_exists(&snapshot)? {
-            Self::run_checked(&["snapshot", &snapshot])?;
+            if let Err(e) = Self::run_checked(&["snapshot", &snapshot]) {
+                if !self.dataset_exists(&snapshot)? {
+                    return Err(e);
+                }
+            }
         }
         Self::run_checked(&["clone", &snapshot, target_dataset])
     }
