@@ -81,11 +81,12 @@ impl JailRuntime for ProcessJailRuntime {
         Ok(())
     }
 
-    fn set_resource_limits(&self, _name: &str, _pcpu_percent: u32, _memory_bytes: u64) -> Result<(), JailError> {
-        unimplemented!("added in Task 5")
+    fn set_resource_limits(&self, name: &str, pcpu_percent: u32, memory_bytes: u64) -> Result<(), JailError> {
+        Self::run_checked("rctl", &["-a", &format!("jail:{name}:pcpu:deny={pcpu_percent}")])?;
+        Self::run_checked("rctl", &["-a", &format!("jail:{name}:vmemoryuse:deny={memory_bytes}")])
     }
 
-    fn remove_resource_limits(&self, _name: &str) -> Result<(), JailError> {
-        unimplemented!("added in Task 5")
+    fn remove_resource_limits(&self, name: &str) -> Result<(), JailError> {
+        Self::run_checked("rctl", &["-r", &format!("jail:{name}")])
     }
 }

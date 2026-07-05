@@ -46,3 +46,34 @@ fn start_command_makes_is_running_true() {
 
     runtime.destroy(name).expect("destroy should succeed");
 }
+
+#[test]
+fn set_and_remove_resource_limits() {
+    let runtime = ProcessJailRuntime::new();
+    let name = "kubsd-test-resource-limits";
+    let rootfs = Path::new("/tmp/kubsd-test-resource-limits-rootfs");
+    std::fs::create_dir_all(rootfs).unwrap();
+
+    let _ = runtime.remove_resource_limits(name);
+    let _ = runtime.destroy(name);
+    runtime.create(name, rootfs).expect("create should succeed");
+
+    runtime.set_resource_limits(name, 200, 512 * 1024 * 1024).expect("set_resource_limits should succeed");
+
+    let output = std::process::Command::new("rctl")
+        .arg(format!("jail:{name}"))
+        .output()
+        .expect("rctl should run");
+    let rules = String::from_utf8_lossy(&output.stdout);
+    assert!(rules.contains("pcpu:deny=200"), "expected pcpu rule in: {rules}");
+    assert!(rules.contains("vmemoryuse:deny=536870912"), "expected vmemoryuse rule in: {rules}");
+
+    runtime.remove_resource_limits(name).expect("remove_resource_limits should succeed");
+    let output = std::process::Command::new("rctl")
+        .arg(format!("jail:{name}"))
+        .output()
+        .expect("rctl should run");
+    assert!(String::from_utf8_lossy(&output.stdout).trim().is_empty(), "rules should be gone after removal");
+
+    runtime.destroy(name).expect("destroy should succeed");
+}
