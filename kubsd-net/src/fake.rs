@@ -79,4 +79,12 @@ mod tests {
         net.detach_jail("epair7").unwrap();
         net.attach_jail("web-1", "kubsd0", "epair7", "10.0.0.5/24").unwrap();
     }
+
+    #[test]
+    fn attach_jail_is_idempotent_when_called_twice_without_detaching() {
+        let net = FakeNetManager::new();
+        net.ensure_bridge_exists("kubsd0").unwrap();
+        net.attach_jail("web-1", "kubsd0", "epair7", "10.0.0.5/24").unwrap();
+        net.attach_jail("web-1", "kubsd0", "epair7", "10.0.0.5/24").unwrap();
+    }
 }
