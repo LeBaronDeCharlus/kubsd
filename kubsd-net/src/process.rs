@@ -101,7 +101,17 @@ impl NetManager for ProcessNetManager {
         Self::run_checked("jexec", &[jail_name, "/sbin/ifconfig", &epair_b, "up"])
     }
 
-    fn detach_jail(&self, _epair_base: &str) -> Result<(), NetError> {
-        unimplemented!("added in Task 5")
+    fn detach_jail(&self, epair_base: &str) -> Result<(), NetError> {
+        let epair_a = format!("{epair_base}a");
+        let output = Self::run("ifconfig", &[&epair_a, "destroy"])?;
+        if output.status.success() || Self::stderr_contains(&output, "does not exist") {
+            Ok(())
+        } else {
+            Err(NetError::CommandFailed(
+                format!("ifconfig {epair_a} destroy"),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ))
+        }
     }
 }

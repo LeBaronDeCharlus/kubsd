@@ -89,3 +89,54 @@ fn attach_jail_tolerates_retry_after_epair_already_created() {
     destroy_interface_if_exists(&format!("{epair_base}a"));
     destroy_interface_if_exists(bridge);
 }
+
+#[test]
+fn detach_jail_removes_epair_and_is_idempotent() {
+    let net = ProcessNetManager::new();
+    let bridge = "kubsd-test-br3";
+    let jail_name = "kubsd-net-test-detach";
+    let epair_base = "epair52";
+
+    destroy_interface_if_exists(&format!("{epair_base}a"));
+    destroy_interface_if_exists(bridge);
+    let jails = make_test_jail(jail_name);
+
+    net.ensure_bridge_exists(bridge).expect("bridge should be created");
+    net.attach_jail(jail_name, bridge, epair_base, "10.99.0.7/24")
+        .expect("attach_jail should succeed");
+
+    net.detach_jail(epair_base).expect("detach_jail should succeed");
+
+    let check = Command::new("ifconfig").arg(format!("{epair_base}a")).output().expect("ifconfig should run");
+    assert!(!check.status.success(), "epair should no longer exist on the host after detach");
+
+    // Idempotent: detaching an already-detached epair must not error.
+    net.detach_jail(epair_base).expect("second detach_jail call should be a no-op success");
+
+    jails.destroy(jail_name).expect("cleanup destroy should succeed");
+    destroy_interface_if_exists(bridge);
+}
+
+#[test]
+fn detach_before_destroy_works_while_jail_is_still_running() {
+    let net = ProcessNetManager::new();
+    let bridge = "kubsd-test-br4";
+    let jail_name = "kubsd-net-test-detach-order";
+    let epair_base = "epair53";
+
+    destroy_interface_if_exists(&format!("{epair_base}a"));
+    destroy_interface_if_exists(bridge);
+    let jails = make_test_jail(jail_name);
+
+    net.ensure_bridge_exists(bridge).expect("bridge should be created");
+    net.attach_jail(jail_name, bridge, epair_base, "10.99.0.8/24")
+        .expect("attach_jail should succeed");
+
+    // Detach while the jail is still running, matching the Reconciliation
+    // Loop's stated order (detach network, then destroy the jail).
+    net.detach_jail(epair_base).expect("detach_jail should succeed on a running jail");
+    assert_eq!(jails.is_running(jail_name).unwrap(), false, "no command was ever started in this jail");
+
+    jails.destroy(jail_name).expect("destroy after detach should still succeed");
+    destroy_interface_if_exists(bridge);
+}
