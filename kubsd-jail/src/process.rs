@@ -96,6 +96,18 @@ impl JailRuntime for ProcessJailRuntime {
     }
 
     fn remove_resource_limits(&self, name: &str) -> Result<(), JailError> {
-        Self::run_checked("rctl", &["-r", &format!("jail:{name}")])
+        let output = Self::run("rctl", &["-r", &format!("jail:{name}")])?;
+        if output.status.success() {
+            return Ok(());
+        }
+        if String::from_utf8_lossy(&output.stderr).contains("No such process") {
+            // Nothing to remove — already in the desired state, not an error.
+            return Ok(());
+        }
+        Err(JailError::CommandFailed(
+            format!("rctl -r jail:{name}"),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ))
     }
 }
