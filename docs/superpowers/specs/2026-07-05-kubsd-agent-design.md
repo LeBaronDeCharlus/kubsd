@@ -59,9 +59,54 @@ Rust workspace with the following crates:
   first (same escape hatch as `kubsd-zfs`) gets a working v1 sooner with
   lower risk. Moving to raw syscalls later is an internal change behind
   the trait, invisible to callers.
+
+  Trait surface (Milestone 2 — no VNET/networking yet; see `kubsd-net`
+  below for that):
+
+  ```rust
+  pub trait JailRuntime {
+      fn create(&self, name: &str, rootfs: &Path, command: &[String]) -> Result<(), JailError>;
+      fn destroy(&self, name: &str) -> Result<(), JailError>;
+      fn is_running(&self, name: &str) -> Result<bool, JailError>;
+      fn set_resource_limits(&self, name: &str, pcpu_percent: u32, memory_bytes: u64) -> Result<(), JailError>;
+      fn remove_resource_limits(&self, name: &str) -> Result<(), JailError>;
+  }
+  ```
+
+  `kubsd-jail` takes a plain jail name string — it has no knowledge of
+  kubsd's `kubsd-<name>` naming/ownership convention; applying that prefix
+  is `kubsd-agentd`'s responsibility. `create` uses `jail -c ... persist
+  command=<command>`; `persist` keeps the jail alive independent of the
+  command's exit, since re-running a failed command per `restartPolicy` is
+  `kubsd-agentd`'s reconciliation-loop job (a later milestone), not this
+  crate's. `destroy` uses `jail -r` (also kills jailed processes).
+  `set_resource_limits`/`remove_resource_limits` wrap `rctl -a
+  jail:<name>:pcpu:deny=<percent>` / `...vmemoryuse:deny=<bytes>` and
+  `rctl -r jail:<name>`, matching the explicit-removal rule under Error
+  Handling below.
+
 - **`kubsd-zfs`** — wraps ZFS dataset/snapshot/clone operations used to
   provision a jail's root filesystem from a base image dataset. Exposes a
-  `ZfsManager` trait for the same reason.
+  `ZfsManager` trait for the same reason, shelling out to `zfs(8)`.
+
+  Trait surface (Milestone 2):
+
+  ```rust
+  pub trait ZfsManager {
+      fn dataset_exists(&self, dataset: &str) -> Result<bool, ZfsError>;
+      fn clone_from_base(&self, base_dataset: &str, target_dataset: &str) -> Result<(), ZfsError>;
+      fn destroy_dataset(&self, dataset: &str) -> Result<(), ZfsError>;
+  }
+  ```
+
+  Like `kubsd-jail`, this crate takes full dataset path strings and has no
+  knowledge of kubsd's path convention (`<pool>/kubsd/base/<image>`,
+  `<pool>/kubsd/jails/<name>`) — that's `kubsd-agentd`'s job. `clone_from_base`
+  can't clone a live dataset directly, so it ensures a canonical snapshot
+  `<base_dataset>@kubsd` exists (creating it on demand if missing — the
+  operator only needs to prepare the base dataset itself, not a snapshot),
+  then clones from that snapshot. `destroy_dataset` only ever removes the
+  target clone, never the base dataset or its snapshot.
 - **`kubsd-net`** — sets up `epair(4)` + `bridge(4)` + VNET wiring per jail.
   Exposes a `NetManager` trait. It creates the jail's configured bridge
   (e.g. `kubsd0`) on first use if it doesn't already exist, so bridge setup
@@ -222,7 +267,15 @@ Level-triggered, similar to a Kubernetes controller:
   `JailRuntime`/`ZfsManager`/`NetManager` implementations — runs on any OS,
   no real FreeBSD system required.
 - `kubsd-jail`, `kubsd-zfs`, `kubsd-net`: integration tests that exercise
-  real syscalls/CLI tools; these only run on a FreeBSD host.
+  real syscalls/CLI tools; these only run on a FreeBSD host. In practice
+  (from Milestone 2 onward): the repo is `git clone`d once on the FreeBSD
+  VM (`git@github.com:LeBaronDeCharlus/kubsd.git`), then `git pull` +
+  `cargo test` there before each round of integration testing, relayed
+  through the human operator's terminal since the coordinating assistant's
+  shell cannot reach the VM directly. A `zroot/kubsd/base/test` dataset
+  (a minimal FreeBSD userland) must exist on the VM for `kubsd-zfs`'s
+  clone tests to clone from — a one-time VM setup step, same category as
+  Milestone 1's environment prep.
 - End-to-end tests (apply a spec via `kubsdctl`, assert the jail is actually
   running with correct resource limits and network config) also require a
   real FreeBSD host.
@@ -237,9 +290,12 @@ implementation plan, not a runtime component of the agent itself.
 
 ## Open Questions / Deferred Decisions
 
-- Whether `kubsd-zfs` uses `libzfs_core` FFI bindings or shells out to
-  `zfs(8)` — deferred to implementation time, hidden behind the
-  `ZfsManager` trait either way.
 - Exact on-disk state store format (flat YAML files vs. embedded DB like
   `sled`) — flat files chosen for v1 simplicity; revisit if performance or
   concurrency needs arise.
+- Whether `kubsd-jail` moves from shelling out to `jail(8)`/`rctl(8)` to
+  raw `jail_set(2)`/`rctl` syscalls, and whether `kubsd-zfs` moves from
+  `zfs(8)` to `libzfs_core` FFI — both deferred indefinitely; shelling out
+  is the settled Milestone 2 decision, hidden behind each crate's trait
+  either way, so a future switch is an internal change invisible to
+  callers.
