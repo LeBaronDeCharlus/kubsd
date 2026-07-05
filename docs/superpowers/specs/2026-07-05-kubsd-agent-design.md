@@ -125,10 +125,37 @@ Rust workspace with the following crates:
   then clones from that snapshot. `destroy_dataset` only ever removes the
   target clone, never the base dataset or its snapshot.
 - **`kubsd-net`** — sets up `epair(4)` + `bridge(4)` + VNET wiring per jail.
-  Exposes a `NetManager` trait. It creates the jail's configured bridge
-  (e.g. `kubsd0`) on first use if it doesn't already exist, so bridge setup
-  isn't a separate manual prerequisite; it never destroys a bridge, since
-  other jails or host config may depend on it.
+  Exposes a `NetManager` trait, shelling out to `ifconfig(8)`/`jexec(8)`.
+  Milestone 3 scope is bridge-only L2 connectivity between jails and the
+  host — no NAT/outbound internet access, which would need host-level
+  `pf` rules and IP-forwarding setup and is deliberately deferred as a
+  separate, larger concern.
+
+  Trait surface (Milestone 3):
+
+  ```rust
+  pub trait NetManager {
+      fn ensure_bridge_exists(&self, bridge: &str) -> Result<(), NetError>;
+      fn attach_jail(&self, jail_name: &str, bridge: &str, epair_base: &str, address: &str) -> Result<(), NetError>;
+      fn detach_jail(&self, epair_base: &str) -> Result<(), NetError>;
+  }
+  ```
+
+  `ensure_bridge_exists` is idempotent: creates the bridge if it doesn't
+  already exist and brings it up. It never destroys a bridge, since other
+  jails or host config may depend on it — there is no corresponding
+  `destroy_bridge`. `attach_jail` is one coherent operation covering the
+  whole wiring sequence (create the epair pair from `epair_base`, e.g.
+  `"epair7"` → `epair7a`/`epair7b`; add the `a` side to the bridge; move
+  the `b` side into the jail's VNET; configure `address` on it from inside
+  the jail via `jexec`) exposed as a single call, matching the
+  Reconciliation Loop's stated order (networking is configured as one
+  step between jail creation and starting the command). `detach_jail`
+  tears down the epair pair and is called before jail destroy, per the
+  Reconciliation Loop's existing stated order. Like `kubsd-jail` and
+  `kubsd-zfs`, this crate takes plain bridge/epair/jail names it's given
+  — it has no knowledge of kubsd's `kubsd0` bridge-naming or per-jail
+  epair-ordinal conventions; that's `kubsd-agentd`'s job.
 - **`kubsd-agentd`** — the daemon binary. Hosts the local HTTP API and owns
   the reconciliation loop; composes the traits above.
 - **`kubsdctl`** — CLI binary that talks to `kubsd-agentd`'s API to
@@ -288,12 +315,17 @@ Level-triggered, similar to a Kubernetes controller:
   real syscalls/CLI tools; these only run on a FreeBSD host. In practice
   (from Milestone 2 onward): the repo is `git clone`d once on the FreeBSD
   VM (`git@github.com:LeBaronDeCharlus/kubsd.git`), then `git pull` +
-  `cargo test` there before each round of integration testing, relayed
-  through the human operator's terminal since the coordinating assistant's
-  shell cannot reach the VM directly. A `zroot/kubsd/base/test` dataset
-  (a minimal FreeBSD userland) must exist on the VM for `kubsd-zfs`'s
-  clone tests to clone from — a one-time VM setup step, same category as
-  Milestone 1's environment prep.
+  `cargo test` there before each round of integration testing (direct SSH
+  from the coordinating assistant to the VM became available partway
+  through Milestone 2; relayed-through-the-human-operator is a fallback if
+  that access is ever unavailable again). A `zroot/kubsd/base/test`
+  dataset (a minimal FreeBSD userland) and a `zroot/kubsd/jails` parent
+  dataset must exist on the VM for `kubsd-zfs`'s clone tests — a one-time
+  VM setup step, same category as Milestone 1's environment prep.
+  `kubsd-net`'s integration tests additionally need a real jail to attach
+  to (created via `kubsd-jail`) and must explicitly tear down any
+  leftover bridge/epair interfaces from a failed prior run, since
+  `ensure_bridge_exists` never removes bridges.
 - End-to-end tests (apply a spec via `kubsdctl`, assert the jail is actually
   running with correct resource limits and network config) also require a
   real FreeBSD host.
