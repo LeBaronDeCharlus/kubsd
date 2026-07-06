@@ -833,9 +833,23 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager> Reconciler<J, Z, N> {
         let jail_dataset = record::jail_dataset_path(&self.pool, name);
 
         self.net.detach_jail(&epair_base)?;
-        self.jails.destroy(&jail_name)?;
-        self.zfs.destroy_dataset(&jail_dataset)?;
-        self.jails.remove_resource_limits(&jail_name)?;
+        // A record can reach `delete` having only gone through `apply`
+        // (never `provision`, e.g. the daemon restarted before its first
+        // reconcile pass): `destroy`, `destroy_dataset`, and
+        // `remove_resource_limits` are not intrinsically idempotent, so
+        // treat their `NotFound` as "already torn down" here.
+        match self.jails.destroy(&jail_name) {
+            Ok(()) | Err(kubsd_jail::JailError::NotFound(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        match self.zfs.destroy_dataset(&jail_dataset) {
+            Ok(()) | Err(kubsd_zfs::ZfsError::NotFound(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        match self.jails.remove_resource_limits(&jail_name) {
+            Ok(()) | Err(kubsd_jail::JailError::NotFound(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
 
         store::remove(&self.state_dir, name)?;
         self.records.remove(name);
@@ -1303,13 +1317,18 @@ Add these tests to the existing `#[cfg(test)] mod tests` block in
         let mut reconciler = new_reconciler(dir);
         reconciler.zfs.seed_dataset("zroot/kubsd/base/14.2-web");
         reconciler.apply(sample_spec("web-1")).unwrap();
-        reconciler.reconcile(Instant::now());
+        let t0 = Instant::now();
+        reconciler.reconcile(t0);
 
         let jail_name = record::jail_name("web-1");
         reconciler.jails.mark_exited(&jail_name);
         assert_eq!(reconciler.jails.is_running(&jail_name).unwrap(), false);
 
-        reconciler.reconcile(Instant::now());
+        // The initial provisioning call above already armed a 1s backoff
+        // cooldown (record_attempt runs unconditionally after provisioning,
+        // per BackoffState's contract) — advance past it so this restart
+        // attempt isn't itself suppressed by that cooldown.
+        reconciler.reconcile(t0 + Duration::from_secs(1));
         assert_eq!(reconciler.jails.is_running(&jail_name).unwrap(), true);
     }
 
@@ -1324,7 +1343,9 @@ Add these tests to the existing `#[cfg(test)] mod tests` block in
 
         let jail_name = record::jail_name("web-1");
         reconciler.jails.mark_exited(&jail_name);
-        reconciler.reconcile(t0); // first restart, arms the 1s cooldown
+        // Still within the 1s cooldown armed by the initial provisioning
+        // call above — this reconcile is a no-op, same as the next one.
+        reconciler.reconcile(t0);
 
         reconciler.jails.mark_exited(&jail_name);
         reconciler.reconcile(t0); // still within cooldown — should NOT restart yet

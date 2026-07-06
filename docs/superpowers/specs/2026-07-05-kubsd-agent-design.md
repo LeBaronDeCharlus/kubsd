@@ -451,16 +451,26 @@ so the cooldown must still be armed.
 (e.g. dataset clone succeeds but jail creation fails), `reconcile` unwinds
 whatever succeeded so far, in reverse order, before recording the
 failure against that jail's backoff state — so a failed creation never
-leaks a ZFS clone or a half-attached network interface. This is safe
-because `detach_jail`/`destroy`/`destroy_dataset`/`remove_resource_limits`
-all already tolerate "already gone"/"nothing to remove" as success (built
-into `kubsd-jail`/`kubsd-zfs`/`kubsd-net` since Milestones 2-3), so
-rollback can call them unconditionally even for steps that never fully
-completed. If a rollback step itself fails (e.g. `destroy_dataset` errors
-with "dataset busy" rather than "already gone"), that failure is recorded
-against the jail's normal backoff state like any other failure — there is
-no separate escalation path, so a failed rollback risks a silent resource
-leak until the next reconciliation pass retries it.
+leaks a ZFS clone or a half-attached network interface. Only `detach_jail`
+is intrinsically idempotent on all implementations (built into `kubsd-net`
+since Milestone 3); `destroy`, `destroy_dataset`, and
+`remove_resource_limits` return `NotFound` for a resource that was never
+created against the `Fake*` implementations used in tests (the real
+`ProcessJailRuntime::remove_resource_limits` is idempotent since `rctl -r`
+operates on a rule tag with no jail-existence check, but `FakeJailRuntime`
+requires the jail to exist in its own map). `rollback_provision` calls all
+four unconditionally and discards their results, so this asymmetry is
+harmless there. `delete`, by contrast, must distinguish real failures from
+"already torn down": it matches `NotFound` from `destroy`,
+`destroy_dataset`, and `remove_resource_limits` as success and propagates
+any other error — this is how `delete` on a jail that was `apply`'d but
+never reached `provision` (e.g. the daemon restarted before its first
+reconcile pass) still succeeds. If a rollback step fails for a reason
+other than "already gone" (e.g. `destroy_dataset` errors with "dataset
+busy"), that failure is recorded against the jail's normal
+backoff state like any other failure — there is no separate escalation
+path, so a failed rollback risks a silent resource leak until the next
+reconciliation pass retries it.
 
 ## Error Handling
 
