@@ -12,6 +12,7 @@ struct FakeJail {
     running: bool,
     pcpu_percent: Option<u32>,
     memory_bytes: Option<u64>,
+    fail_start: bool,
 }
 
 #[derive(Default)]
@@ -33,13 +34,31 @@ impl FakeJailRuntime {
             jail.running = false;
         }
     }
+
+    /// Test helper: forces `start_command` for `name` to fail with
+    /// `JailError::NotFound` until called again with `fail: false`.
+    /// Exercises restart-failure handling that this in-memory fake can't
+    /// otherwise produce (e.g. a transient `jexec` failure against a
+    /// real, already-existing jail).
+    pub fn fail_start_command(&self, name: &str, fail: bool) {
+        if let Some(jail) = self.jails.lock().unwrap().get_mut(name) {
+            jail.fail_start = fail;
+        }
+    }
 }
 
 impl JailRuntime for FakeJailRuntime {
     fn create(&self, name: &str, rootfs: &Path, vnet: bool) -> Result<(), JailError> {
         self.jails.lock().unwrap().insert(
             name.to_string(),
-            FakeJail { rootfs: rootfs.to_path_buf(), vnet, running: false, pcpu_percent: None, memory_bytes: None },
+            FakeJail {
+                rootfs: rootfs.to_path_buf(),
+                vnet,
+                running: false,
+                pcpu_percent: None,
+                memory_bytes: None,
+                fail_start: false,
+            },
         );
         Ok(())
     }
@@ -51,6 +70,9 @@ impl JailRuntime for FakeJailRuntime {
     fn start_command(&self, name: &str, _command: &[String]) -> Result<(), JailError> {
         let mut jails = self.jails.lock().unwrap();
         let jail = jails.get_mut(name).ok_or_else(|| JailError::NotFound(name.to_string()))?;
+        if jail.fail_start {
+            return Err(JailError::NotFound(format!("{name} (start_command failure injected for testing)")));
+        }
         jail.running = true;
         Ok(())
     }

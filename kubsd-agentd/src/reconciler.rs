@@ -140,6 +140,13 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager> Reconciler<J, Z, N> {
         Ok(())
     }
 
+    fn restart(&mut self, name: &str, record: &JailRecord) -> Result<(), ReconcileError> {
+        let jail_name = record::jail_name(name);
+        self.configure_networking_and_limits(name, record)?;
+        self.jails.start_command(&jail_name, &record.spec.spec.command)?;
+        Ok(())
+    }
+
     /// Best-effort cleanup after a failed `provision`. Every call here
     /// discards its `Result` (`let _ =`): `detach_jail` is intrinsically
     /// idempotent, and `destroy`/`destroy_dataset`/`remove_resource_limits`
@@ -199,10 +206,9 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager> Reconciler<J, Z, N> {
             } else if record.spec.spec.restart_policy == kubsd_spec::RestartPolicy::Never {
                 Ok(())
             } else {
-                self.configure_networking_and_limits(name, &record)?;
-                self.jails.start_command(&jail_name, &record.spec.spec.command)?;
+                let result = self.restart(name, &record);
                 self.backoff.get_mut(name).unwrap().record_attempt(now);
-                Ok(())
+                result
             }
         }
     }
@@ -501,6 +507,37 @@ mod tests {
         reconciler.reconcile(Instant::now());
 
         assert_eq!(reconciler.jails.is_running(&jail_name).unwrap(), false);
+    }
+
+    #[test]
+    fn reconcile_arms_backoff_even_when_restart_attempt_fails() {
+        let dir = test_state_dir("reconcile_arms_backoff_even_when_restart_attempt_fails");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/kubsd/base/14.2-web");
+        reconciler.apply(sample_spec("web-1")).unwrap();
+        let t0 = Instant::now();
+        reconciler.reconcile(t0); // provisions web-1
+
+        let jail_name = record::jail_name("web-1");
+        reconciler.jails.mark_exited(&jail_name);
+        reconciler.jails.fail_start_command(&jail_name, true);
+
+        // Past the 1s cooldown armed by the initial provisioning.
+        let failures = reconciler.reconcile(t0 + Duration::from_secs(1));
+        assert_eq!(failures.len(), 1, "expected the failed restart attempt to be reported: {failures:?}");
+
+        // If backoff was correctly armed by the failed restart attempt,
+        // an immediate retry at the same instant must be suppressed —
+        // proven by the fault (still armed) NOT firing again.
+        let retried = reconciler.reconcile(t0 + Duration::from_secs(1));
+        assert!(retried.is_empty(), "expected the retry to be suppressed by backoff, got: {retried:?}");
+        assert_eq!(reconciler.jails.is_running(&jail_name).unwrap(), false);
+
+        // Once the cooldown clears and the fault is removed, it should recover.
+        reconciler.jails.fail_start_command(&jail_name, false);
+        let recovered = reconciler.reconcile(t0 + Duration::from_secs(10));
+        assert!(recovered.is_empty(), "expected recovery, got: {recovered:?}");
+        assert_eq!(reconciler.jails.is_running(&jail_name).unwrap(), true);
     }
 
     #[test]
