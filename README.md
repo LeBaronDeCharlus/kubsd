@@ -14,10 +14,9 @@
 
 ---
 
-Keel (formerly named kubsd during its early milestones, the code still
-carries that prefix internally, a rename pass is pending) is a
-Kubernetes-style orchestration platform for FreeBSD, built on jails, ZFS,
-and VNET networking.
+Keel (named kubsd during its first four milestones) is a Kubernetes-style
+orchestration platform for FreeBSD, built on jails, ZFS, and VNET
+networking.
 
 ## Motivation
 
@@ -85,7 +84,7 @@ task, then a whole-branch review before moving on. Every FreeBSD-specific
 behavior is verified on a real FreeBSD 15.1 VM, not assumed, before it's
 locked into a plan.
 
-### Milestone 1: `kubsd-spec`, the jail spec language
+### Milestone 1: `keel-spec`, the jail spec language
 
 The foundation: a YAML schema for describing a jail (image, command,
 network, resources, restart policy) plus the parsing and validation that
@@ -96,7 +95,7 @@ allowed to change on a re-apply and which are immutable for the life of
 the jail, and how CIDR addresses are validated. Thirteen unit tests plus
 four end-to-end tests, all running on any OS, no FreeBSD required.
 
-### Milestone 2: `kubsd-jail` and `kubsd-zfs`, talking to the OS
+### Milestone 2: `keel-jail` and `keel-zfs`, talking to the OS
 
 The first milestone that actually touches FreeBSD. Two crates, each
 built around the same pattern that carries through the rest of the
@@ -111,18 +110,18 @@ actual jail; `ps` invocation syntax that looked right on paper didn't
 parse the way FreeBSD expected; a `zfs snapshot` race under parallel
 tests had to be made tolerant of losing that race rather than erroring.
 
-### Milestone 3: `kubsd-net`, VNET networking
+### Milestone 3: `keel-net`, VNET networking
 
-Adds `kubsd-net` and its `NetManager` trait: creating bridges, attaching
+Adds `keel-net` and its `NetManager` trait: creating bridges, attaching
 a jail to one over an `epair(4)` pair with a static address, and tearing
-that down again. This milestone is also where `kubsd-jail::create`
+that down again. This milestone is also where `keel-jail::create`
 gained a `vnet` parameter, since VNET-enabled jails need to be created
 differently from the start, an early breaking change caught before it
 could compound. By this point the "verify on the real VM before writing
 the plan" discipline was fully in place, and Milestone 3 shipped with
 zero fix rounds across all five of its tasks.
 
-### Milestone 4: `kubsd-agentd`, the reconciliation core
+### Milestone 4: `keel-agentd`, the reconciliation core
 
 The milestone that ties everything together. `Reconciler<J, Z, N>` is
 generic over the three runtime traits from Milestones 1 through 3, so it

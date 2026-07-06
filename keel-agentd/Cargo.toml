@@ -1,0 +1,13 @@
+[package]
+name = "keel-agentd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+keel-spec = { path = "../keel-spec" }
+keel-jail = { path = "../keel-jail" }
+keel-zfs = { path = "../keel-zfs" }
+keel-net = { path = "../keel-net" }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "1"
