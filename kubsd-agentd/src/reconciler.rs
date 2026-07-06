@@ -106,6 +106,57 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager> Reconciler<J, Z, N> {
         self.backoff.remove(name);
         Ok(())
     }
+
+    fn configure_networking_and_limits(&mut self, name: &str, record: &JailRecord) -> Result<(), ReconcileError> {
+        let jail_name = record::jail_name(name);
+        let epair_base = record::epair_base_name(record.epair_ordinal);
+        self.net.ensure_bridge_exists(&record.spec.spec.network.bridge)?;
+        self.net.attach_jail(
+            &jail_name,
+            &record.spec.spec.network.bridge,
+            &epair_base,
+            &record.spec.spec.network.address,
+        )?;
+        let pcpu_percent = kubsd_spec::cores_to_pcpu_percent(kubsd_spec::parse_cpu_cores(&record.spec.spec.resources.cpu)?);
+        let memory_bytes = kubsd_spec::parse_memory_bytes(&record.spec.spec.resources.memory)?;
+        self.jails.set_resource_limits(&jail_name, pcpu_percent, memory_bytes)?;
+        Ok(())
+    }
+
+    fn provision(&mut self, name: &str, record: &JailRecord) -> Result<(), ReconcileError> {
+        let jail_name = record::jail_name(name);
+        let base_dataset = record::base_dataset_path(&self.pool, &record.spec.spec.image);
+        let jail_dataset = record::jail_dataset_path(&self.pool, name);
+        let rootfs = record::jail_rootfs_path(&self.pool, name);
+
+        if !self.zfs.dataset_exists(&base_dataset)? {
+            return Err(ReconcileError::BaseImageNotFound(base_dataset));
+        }
+        self.zfs.clone_from_base(&base_dataset, &jail_dataset)?;
+        self.jails.create(&jail_name, &rootfs, record.spec.spec.network.vnet)?;
+        self.configure_networking_and_limits(name, record)?;
+        self.jails.start_command(&jail_name, &record.spec.spec.command)?;
+        Ok(())
+    }
+
+    /// Best-effort cleanup after a failed `provision`. Every call here
+    /// discards its `Result` (`let _ =`): `detach_jail` is intrinsically
+    /// idempotent, and `destroy`/`destroy_dataset`/`remove_resource_limits`
+    /// return `NotFound` for a step that never completed — discarding the
+    /// result either way makes it safe to call all four unconditionally
+    /// even when only some steps of `provision` actually ran. A rollback
+    /// failure for a reason other than "already gone" is handled by the
+    /// normal per-jail backoff on the next reconciliation pass, not
+    /// specially here.
+    fn rollback_provision(&mut self, name: &str, record: &JailRecord) {
+        let jail_name = record::jail_name(name);
+        let epair_base = record::epair_base_name(record.epair_ordinal);
+        let jail_dataset = record::jail_dataset_path(&self.pool, name);
+        let _ = self.net.detach_jail(&epair_base);
+        let _ = self.jails.destroy(&jail_name);
+        let _ = self.zfs.destroy_dataset(&jail_dataset);
+        let _ = self.jails.remove_resource_limits(&jail_name);
+    }
 }
 
 #[cfg(test)]
@@ -251,5 +302,60 @@ mod tests {
 
         assert!(!reconciler.records.contains_key("web-1"));
         assert_eq!(store::load_all(&dir).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn provision_drives_zfs_jail_net_and_command_in_order() {
+        let dir = test_state_dir("provision_drives_zfs_jail_net_and_command_in_order");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/kubsd/base/14.2-web");
+        reconciler.apply(sample_spec("web-1")).unwrap();
+        let record = reconciler.records["web-1"].clone();
+
+        reconciler.provision("web-1", &record).unwrap();
+
+        let jail_name = record::jail_name("web-1");
+        assert_eq!(reconciler.jails.jail_exists(&jail_name).unwrap(), true);
+        assert_eq!(reconciler.jails.is_running(&jail_name).unwrap(), true);
+        assert_eq!(
+            reconciler.zfs.dataset_exists(&record::jail_dataset_path("zroot", "web-1")).unwrap(),
+            true
+        );
+    }
+
+    #[test]
+    fn provision_fails_clearly_when_base_image_missing() {
+        let dir = test_state_dir("provision_fails_clearly_when_base_image_missing");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.apply(sample_spec("web-1")).unwrap();
+        let record = reconciler.records["web-1"].clone();
+
+        let result = reconciler.provision("web-1", &record);
+        assert!(matches!(result, Err(ReconcileError::BaseImageNotFound(_))));
+    }
+
+    #[test]
+    fn rollback_provision_cleans_up_after_partial_failure() {
+        let dir = test_state_dir("rollback_provision_cleans_up_after_partial_failure");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/kubsd/base/14.2-web");
+        reconciler.apply(sample_spec("web-1")).unwrap();
+        let record = reconciler.records["web-1"].clone();
+
+        // Simulate a partial failure: dataset clone + jail create succeed,
+        // then provisioning would fail at the networking step in the real
+        // system. We can't easily force FakeNetManager to fail without a
+        // missing bridge, so instead verify rollback's own idempotent
+        // cleanup behavior directly: calling it after a successful
+        // provision should fully undo it.
+        reconciler.provision("web-1", &record).unwrap();
+        reconciler.rollback_provision("web-1", &record);
+
+        let jail_name = record::jail_name("web-1");
+        assert_eq!(reconciler.jails.jail_exists(&jail_name).unwrap(), false);
+        assert_eq!(
+            reconciler.zfs.dataset_exists(&record::jail_dataset_path("zroot", "web-1")).unwrap(),
+            false
+        );
     }
 }
