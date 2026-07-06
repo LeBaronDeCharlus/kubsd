@@ -378,7 +378,7 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager> Reconciler<J, Z, N> {
     pub fn new(jails: J, zfs: Z, net: N, pool: String, state_dir: PathBuf) -> Result<Self, ReconcileError>;
     pub fn apply(&mut self, spec: JailSpec) -> Result<(), ReconcileError>;
     pub fn delete(&mut self, name: &str) -> Result<(), ReconcileError>;
-    pub fn reconcile(&mut self, now: Instant) -> Result<(), ReconcileError>;
+    pub fn reconcile(&mut self, now: Instant) -> Vec<(String, ReconcileError)>;
 }
 ```
 
