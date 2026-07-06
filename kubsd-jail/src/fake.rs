@@ -44,6 +44,10 @@ impl JailRuntime for FakeJailRuntime {
         Ok(())
     }
 
+    fn jail_exists(&self, name: &str) -> Result<bool, JailError> {
+        Ok(self.jails.lock().unwrap().contains_key(name))
+    }
+
     fn start_command(&self, name: &str, _command: &[String]) -> Result<(), JailError> {
         let mut jails = self.jails.lock().unwrap();
         let jail = jails.get_mut(name).ok_or_else(|| JailError::NotFound(name.to_string()))?;
@@ -135,5 +139,21 @@ mod tests {
         // (simulating a restart), not error as NotFound.
         runtime.start_command("test-1", &["/bin/sh".to_string()]).unwrap();
         assert_eq!(runtime.is_running("test-1").unwrap(), true);
+    }
+
+    #[test]
+    fn jail_exists_is_false_before_create_and_true_after() {
+        let runtime = FakeJailRuntime::new();
+        assert_eq!(runtime.jail_exists("test-1").unwrap(), false);
+        runtime.create("test-1", Path::new("/tmp/rootfs"), false).unwrap();
+        assert_eq!(runtime.jail_exists("test-1").unwrap(), true);
+    }
+
+    #[test]
+    fn jail_exists_is_false_after_destroy() {
+        let runtime = FakeJailRuntime::new();
+        runtime.create("test-1", Path::new("/tmp/rootfs"), false).unwrap();
+        runtime.destroy("test-1").unwrap();
+        assert_eq!(runtime.jail_exists("test-1").unwrap(), false);
     }
 }

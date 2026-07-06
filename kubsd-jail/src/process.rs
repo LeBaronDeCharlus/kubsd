@@ -37,6 +37,24 @@ impl ProcessJailRuntime {
         let mut children = self.children.lock().unwrap();
         children.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
     }
+
+    // Unlike `zfs list`, `jls` returns exit code 1 both when the jail
+    // doesn't exist and on a usage error, so we can't distinguish them
+    // by exit code. Since our own arguments here are fixed and known
+    // to be valid, a usage error would indicate a code bug, not a
+    // runtime condition — treating any failure as "doesn't exist" is
+    // an accepted, deliberate trade-off, not an oversight.
+    fn jid_of(&self, name: &str) -> Result<Option<String>, JailError> {
+        let jls = Self::run("jls", &["-j", name, "jid"])?;
+        if !jls.status.success() {
+            return Ok(None);
+        }
+        let jid = String::from_utf8_lossy(&jls.stdout).trim().to_string();
+        if jid.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(jid))
+    }
 }
 
 impl Default for ProcessJailRuntime {
@@ -61,21 +79,15 @@ impl JailRuntime for ProcessJailRuntime {
         Self::run_checked("jail", &["-r", name])
     }
 
+    fn jail_exists(&self, name: &str) -> Result<bool, JailError> {
+        Ok(self.jid_of(name)?.is_some())
+    }
+
     fn is_running(&self, name: &str) -> Result<bool, JailError> {
-        // Unlike `zfs list`, `jls` returns exit code 1 both when the jail
-        // doesn't exist and on a usage error, so we can't distinguish them
-        // by exit code. Since our own arguments here are fixed and known
-        // to be valid, a usage error would indicate a code bug, not a
-        // runtime condition — treating any failure as "doesn't exist" is
-        // an accepted, deliberate trade-off, not an oversight.
-        let jls = Self::run("jls", &["-j", name, "jid"])?;
-        if !jls.status.success() {
-            return Ok(false);
-        }
-        let jid = String::from_utf8_lossy(&jls.stdout).trim().to_string();
-        if jid.is_empty() {
-            return Ok(false);
-        }
+        let jid = match self.jid_of(name)? {
+            Some(jid) => jid,
+            None => return Ok(false),
+        };
         let ps = Self::run("ps", &["-J", &jid, "-o", "state="])?;
         let has_live_process = String::from_utf8_lossy(&ps.stdout)
             .lines()

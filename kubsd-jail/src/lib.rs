@@ -13,6 +13,13 @@ pub trait JailRuntime {
     /// (uses `jail -c ... persist`).
     fn create(&self, name: &str, rootfs: &Path, vnet: bool) -> Result<(), JailError>;
 
+    /// Checks only whether the jail itself exists — not whether a command
+    /// is running inside it. Needed because `is_running` collapses "jail
+    /// doesn't exist" and "jail exists but its process exited" into the
+    /// same `false`; callers that need to distinguish "provision from
+    /// scratch" from "just restart the command" need this method instead.
+    fn jail_exists(&self, name: &str) -> Result<bool, JailError>;
+
     /// Non-blocking: spawns the command and returns immediately. A launch
     /// failure *inside* the jail (bad command, missing binary) is NOT
     /// reported by this method's `Ok` return — callers must re-check

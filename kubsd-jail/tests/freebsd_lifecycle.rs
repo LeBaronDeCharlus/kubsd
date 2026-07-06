@@ -92,3 +92,20 @@ fn remove_resource_limits_on_jail_with_no_limits_set_is_a_no_op_success() {
 
     runtime.destroy(name).expect("destroy should succeed");
 }
+
+#[test]
+fn jail_exists_distinguishes_created_from_never_existed() {
+    let runtime = ProcessJailRuntime::new();
+    let name = "kubsd-test-jail-exists";
+    let rootfs = Path::new("/tmp/kubsd-test-jail-exists-rootfs");
+    std::fs::create_dir_all(rootfs).unwrap();
+
+    let _ = runtime.destroy(name);
+    assert_eq!(runtime.jail_exists(name).unwrap(), false, "should not exist before create");
+
+    runtime.create(name, rootfs, false).expect("create should succeed");
+    assert_eq!(runtime.jail_exists(name).unwrap(), true, "should exist after create");
+
+    runtime.destroy(name).expect("destroy should succeed");
+    assert_eq!(runtime.jail_exists(name).unwrap(), false, "should not exist after destroy");
+}
