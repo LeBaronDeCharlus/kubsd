@@ -288,18 +288,24 @@ Level-triggered, similar to a Kubernetes controller:
      command (`kubsd-jail`'s `start_command`).
    - Existing but not desired → remove network interfaces (`kubsd-net`'s
      `detach_jail`), destroy the jail (`kubsd-jail`'s `destroy`, which
-     itself does `jail -r` — this already terminates jailed processes), and
+     itself does `jail -r` — this already terminates jailed processes),
      destroy the ZFS clone, then remove `rctl` rules. **Milestone 4
      simplification:** a graceful SIGTERM-then-grace-period-then-SIGKILL
      shutdown (as originally described here) is deferred — `destroy`'s
      existing `jail -r` behavior is used as-is for v1. Adding a gentler
      `stop_gracefully` primitive to `kubsd-jail` is a future enhancement,
-     not required for this milestone.
+     not required for this milestone. **Milestone 4 also implements this
+     branch via the synchronous `delete` API method (invoked directly by
+     name), not as part of `reconcile`'s per-jail loop** — see
+     `kubsd-agentd` Implementation below, and the corresponding Open
+     Questions entry on partial-delete-failure.
    - Existing and desired but the process has exited → apply
-     `restartPolicy` by calling `start_command` again (see backoff below).
-     **Milestone 4 simplification:** `OnFailure` and `Always` behave
-     identically (both restart on any exit) — `kubsd-jail` has no way to
-     distinguish a clean exit from a crash yet (no exit-code tracking).
+     `restartPolicy` by calling `start_command` again (see backoff below;
+     skipped entirely for `restartPolicy: Never`, which leaves a crashed
+     jail alone). **Milestone 4 simplification:** `OnFailure` and `Always`
+     behave identically (both restart on any exit) — `kubsd-jail` has no
+     way to distinguish a clean exit from a crash yet (no exit-code
+     tracking).
    - Existing and matches desired → no-op.
 3. Milestone 4 implements this loop as a synchronous `reconcile(now)` call
    with no timer or event loop of its own yet — a future milestone (the
@@ -357,11 +363,13 @@ Naming/path derivation (pure functions):
 - epair base name: `epair<epair_ordinal>`
 
 **State store:** one YAML file per jail at `<state_dir>/<spec-name>.yaml`
-(a serialized `JailRecord`), written via write-to-temp-then-rename. On
-`Reconciler::new`, every file in `state_dir` is loaded into memory as the
-starting desired state; the next `epair_ordinal` to assign is `1 +
-max(existing ordinals)` — no separate counter file needed, since the
-ordinal is always recoverable by scanning already-persisted records.
+(a serialized `JailRecord`), written via write-to-temp-then-rename.
+`Reconciler::new` creates `state_dir` (and any missing parent directories)
+if it doesn't already exist. On `Reconciler::new`, every file in
+`state_dir` is loaded into memory as the starting desired state; the next
+`epair_ordinal` to assign is `1 + max(existing ordinals)`, or `1` if no
+records exist yet — no separate counter file needed, since the ordinal is
+always recoverable by scanning already-persisted records.
 
 **API surface:**
 
@@ -380,23 +388,38 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager> Reconciler<J, Z, N> {
   `JailRecord`, updates in-memory desired state. Does not touch the
   jail/network/filesystem itself — `reconcile`'s job on its next call.
 - `delete`: synchronously tears down (network detach, jail destroy,
-  dataset destroy — in that order, matching the Reconciliation Loop's
-  stated order above) then removes the record from disk and memory.
+  dataset destroy, `rctl` rule removal — in that order, matching the
+  Reconciliation Loop's stated order above) then removes the record from
+  disk and memory. **Milestone 4 simplification:** `delete` is a single
+  synchronous call outside the backoff-protected `reconcile` loop — if
+  teardown fails partway, the failure is returned to the caller and no
+  retry is scheduled; see the corresponding Open Questions entry below.
 - `reconcile(now)`: one synchronous pass over every desired jail,
-  implementing the Reconciliation Loop's per-jail diff logic above
-  (provision if missing, restart if crashed and backoff allows it,
-  idempotently re-apply resource limits if running, no-op otherwise).
+  implementing the "desired but not existing", "existing and desired but
+  the process has exited", and "existing and matches desired" branches of
+  the Reconciliation Loop's per-jail diff logic above (provision if
+  missing, restart if crashed and backoff allows it — skipped for
+  `restartPolicy: Never` — idempotently re-apply resource limits if
+  running, no-op otherwise). The "existing but not desired" branch is
+  handled only by `delete` above, not by `reconcile`.
   `now` is passed in by the caller (rather than read internally via
   `Instant::now()`) so tests can simulate time passing without real
   sleeps. **Resolves a previously-open question:** the "exists, not
   running" branch always reapplies `ensure_bridge_exists` → `attach_jail`
-  → `set_resource_limits` (all already idempotent) *before* calling
-  `start_command` — not just in the "doesn't exist yet" branch. This
-  covers the daemon-crashed-mid-provisioning case (jail created but
-  networking/`rctl` never got configured before the daemon itself died)
-  without needing any new persisted state: a restart naturally re-runs the
-  idempotent configuration steps rather than trusting that "jail exists"
-  implies "jail is fully configured."
+  → `set_resource_limits` *before* calling `start_command` — not just in
+  the "doesn't exist yet" branch. This covers the daemon-crashed-mid-
+  provisioning case (jail created but networking/`rctl` never got
+  configured before the daemon itself died) without needing any new
+  persisted state: a restart naturally re-runs the idempotent
+  configuration steps rather than trusting that "jail exists" implies
+  "jail is fully configured." `ensure_bridge_exists`/`attach_jail`'s
+  idempotency under repeated identical calls is already documented and
+  VM-verified (Milestone 3); `set_resource_limits`'s idempotency under a
+  repeated identical `rctl -a` call has not yet been VM-verified and is a
+  Milestone 4 implementation task (see Open Questions) — if `rctl -a`
+  stacks rather than replaces an identical rule, `set_resource_limits`
+  itself needs to call `remove_resource_limits` first (ignoring
+  "nothing to remove") to stay idempotent.
 
 **Backoff** (`kubsd-agentd/src/backoff.rs`):
 
@@ -411,21 +434,33 @@ struct BackoffState {
 Tracked per jail name, covering any failing action for that jail (not
 just command restarts — see Reconciliation Loop item 4 above). Before
 acting: if `next_retry_at` is `Some` and hasn't passed, skip this jail
-this pass. After acting: if the jail had been running ≥60s before this
-attempt, reset `current_delay` to 1s first (a jail that ran fine for a
-while before failing once shouldn't inherit an escalated backoff from an
-unrelated earlier crash-loop); set `next_retry_at = now + current_delay`;
-double `current_delay` (capped at 5 minutes) for next time.
+this pass. `last_started_at` is set to `now` every time `start_command` is
+(re)invoked for a jail, including its very first start after
+provisioning. After acting: if the jail had been running ≥60s before this
+attempt (per `last_started_at`), reset `current_delay` to 1s first (a jail
+that ran fine for a while before failing once shouldn't inherit an
+escalated backoff from an unrelated earlier crash-loop); set
+`next_retry_at = now + current_delay`; double `current_delay` (capped at
+5 minutes) for next time. This "after acting" bookkeeping runs
+unconditionally after every restart/provisioning attempt for a jail,
+regardless of that attempt's own `Result` — a successful `start_command`
+call carries no information about whether the process will keep running,
+so the cooldown must still be armed.
 
 **Partial-failure rollback:** if provisioning a new jail fails partway
 (e.g. dataset clone succeeds but jail creation fails), `reconcile` unwinds
 whatever succeeded so far, in reverse order, before recording the
 failure against that jail's backoff state — so a failed creation never
 leaks a ZFS clone or a half-attached network interface. This is safe
-because `detach_jail`/`destroy`/`destroy_dataset` all already tolerate
-"already gone" as success (built into `kubsd-jail`/`kubsd-zfs`/`kubsd-net`
-since Milestones 2-3), so rollback can call them unconditionally even for
-steps that never fully completed.
+because `detach_jail`/`destroy`/`destroy_dataset`/`remove_resource_limits`
+all already tolerate "already gone"/"nothing to remove" as success (built
+into `kubsd-jail`/`kubsd-zfs`/`kubsd-net` since Milestones 2-3), so
+rollback can call them unconditionally even for steps that never fully
+completed. If a rollback step itself fails (e.g. `destroy_dataset` errors
+with "dataset busy" rather than "already gone"), that failure is recorded
+against the jail's normal backoff state like any other failure — there is
+no separate escalation path, so a failed rollback risks a silent resource
+leak until the next reconciliation pass retries it.
 
 ## Error Handling
 
@@ -465,11 +500,13 @@ steps that never fully completed.
   `JailRuntime`/`ZfsManager`/`NetManager` implementations — runs on any OS,
   no real FreeBSD system required. Key scenarios: naming/path derivation
   (pure functions), state store round-trip through disk, full provisioning
-  happy path (all four fakes driven in the correct order), restart-on-crash
-  via `FakeJailRuntime::mark_exited` with injected `Instant`s to exercise
-  backoff timing without real sleeps, partial-failure rollback (a fake
-  configured to fail at a specific step), `restartPolicy: Never` leaving a
-  crashed jail alone, and immutable-field rejection on re-`apply`.
+  happy path (all three fakes driven in the correct order), `delete`'s
+  teardown order (including `rctl` removal via `remove_resource_limits`),
+  restart-on-crash via `FakeJailRuntime::mark_exited` with injected
+  `Instant`s to exercise backoff timing without real sleeps,
+  partial-failure rollback (a fake configured to fail at a specific step),
+  `restartPolicy: Never` leaving a crashed jail alone, and immutable-field
+  rejection on re-`apply`.
 - `kubsd-jail`, `kubsd-zfs`, `kubsd-net`: integration tests that exercise
   real syscalls/CLI tools; these only run on a FreeBSD host. In practice
   (from Milestone 2 onward): the repo is `git clone`d once on the FreeBSD
@@ -532,3 +569,22 @@ implementation plan, not a runtime component of the agent itself.
   way to retrieve a jailed command's exit code. Would need
   `ProcessJailRuntime`'s child-tracking restructured from an unordered
   `Vec<Child>` to name-keyed, capturing exit status on reap.
+- **Milestone 4 gap:** `delete` runs outside the backoff-protected
+  `reconcile` loop, as a single synchronous call. If its teardown fails
+  partway (e.g. `jail -r` fails on a stuck process, or `destroy_dataset`
+  fails with "dataset busy") after the jail itself is gone but before the
+  on-disk record is removed, the record is still "desired" — the next
+  `reconcile` pass would observe "jail doesn't exist" and reprovision it,
+  resurrecting a jail the operator asked to delete. There is also no
+  automatic retry for a failed `delete`. Deferred for v1 (the operator can
+  retry the `delete` call by hand); a future milestone should consider
+  having `delete` mark the record pending-deletion instead of leaving it
+  as a plain desired record on partial failure, and having `reconcile`
+  process pending-deletions through the same backoff-protected loop.
+- ~~Whether `rctl -a jail:<name>:...:deny=<value>` is idempotent under a
+  repeated identical call~~ — **Resolved, VM-verified:** `rctl -a` replaces
+  rather than stacks — applying an identical rule twice leaves exactly one
+  rule, and applying a changed value correctly replaces the old one (`rctl
+  jail:<name>` never shows more than one rule per subject+resource+action
+  combo). `set_resource_limits` is safely re-callable every restart as
+  designed, with no need to call `remove_resource_limits` first.
