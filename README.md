@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/keel-logo.png" alt="Keel logo" width="500">
+  <img src="docs/assets/keel-logo.png" alt="Keel logo">
 </p>
 
 <h1 align="center">Keel</h1>
