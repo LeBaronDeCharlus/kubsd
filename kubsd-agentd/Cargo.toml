@@ -1,0 +1,13 @@
+[package]
+name = "kubsd-agentd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kubsd-spec = { path = "../kubsd-spec" }
+kubsd-jail = { path = "../kubsd-jail" }
+kubsd-zfs = { path = "../kubsd-zfs" }
+kubsd-net = { path = "../kubsd-net" }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "1"
