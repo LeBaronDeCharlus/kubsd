@@ -7,6 +7,7 @@ use kubsd_spec::JailSpec;
 use kubsd_zfs::ZfsManager;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -157,6 +158,54 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager> Reconciler<J, Z, N> {
         let _ = self.zfs.destroy_dataset(&jail_dataset);
         let _ = self.jails.remove_resource_limits(&jail_name);
     }
+
+    pub fn reconcile(&mut self, now: Instant) -> Vec<(String, ReconcileError)> {
+        let names: Vec<String> = self.records.keys().cloned().collect();
+        let mut failures = Vec::new();
+        for name in names {
+            if let Err(e) = self.reconcile_one(&name, now) {
+                failures.push((name, e));
+            }
+        }
+        failures
+    }
+
+    fn reconcile_one(&mut self, name: &str, now: Instant) -> Result<(), ReconcileError> {
+        let record = self.records[name].clone();
+        let jail_name = record::jail_name(name);
+
+        let can_retry = self.backoff.entry(name.to_string()).or_insert_with(BackoffState::new).can_retry(now);
+        if !can_retry {
+            return Ok(());
+        }
+
+        let exists = self.jails.jail_exists(&jail_name)?;
+
+        if !exists {
+            let result = self.provision(name, &record);
+            self.backoff.get_mut(name).unwrap().record_attempt(now);
+            if result.is_err() {
+                self.rollback_provision(name, &record);
+            }
+            result
+        } else {
+            let running = self.jails.is_running(&jail_name)?;
+            if running {
+                let pcpu_percent =
+                    kubsd_spec::cores_to_pcpu_percent(kubsd_spec::parse_cpu_cores(&record.spec.spec.resources.cpu)?);
+                let memory_bytes = kubsd_spec::parse_memory_bytes(&record.spec.spec.resources.memory)?;
+                self.jails.set_resource_limits(&jail_name, pcpu_percent, memory_bytes)?;
+                Ok(())
+            } else if record.spec.spec.restart_policy == kubsd_spec::RestartPolicy::Never {
+                Ok(())
+            } else {
+                self.configure_networking_and_limits(name, &record)?;
+                self.jails.start_command(&jail_name, &record.spec.spec.command)?;
+                self.backoff.get_mut(name).unwrap().record_attempt(now);
+                Ok(())
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -167,6 +216,7 @@ mod tests {
     use kubsd_spec::{Metadata, NetworkSpec, RestartPolicy, ResourcesSpec, Spec};
     use kubsd_zfs::FakeZfsManager;
     use std::fs;
+    use std::time::Duration;
 
     fn sample_spec(name: &str) -> JailSpec {
         JailSpec {
@@ -357,5 +407,112 @@ mod tests {
             reconciler.zfs.dataset_exists(&record::jail_dataset_path("zroot", "web-1")).unwrap(),
             false
         );
+    }
+
+    #[test]
+    fn reconcile_provisions_a_missing_jail() {
+        let dir = test_state_dir("reconcile_provisions_a_missing_jail");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/kubsd/base/14.2-web");
+        reconciler.apply(sample_spec("web-1")).unwrap();
+
+        let failures = reconciler.reconcile(Instant::now());
+
+        assert!(failures.is_empty(), "expected no failures, got: {failures:?}");
+        let jail_name = record::jail_name("web-1");
+        assert_eq!(reconciler.jails.is_running(&jail_name).unwrap(), true);
+    }
+
+    #[test]
+    fn reconcile_reports_base_image_not_found_without_stopping_other_jails() {
+        let dir = test_state_dir("reconcile_reports_base_image_not_found_without_stopping_other_jails");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/kubsd/base/14.2-web");
+        reconciler.apply(sample_spec("web-1")).unwrap(); // has a seeded base image
+        let mut broken = sample_spec("web-2");
+        broken.spec.image = "base/does-not-exist".to_string();
+        reconciler.apply(broken).unwrap(); // base image never seeded
+
+        let failures = reconciler.reconcile(Instant::now());
+
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, "web-2");
+        assert!(matches!(failures[0].1, ReconcileError::BaseImageNotFound(_)));
+        // web-1 should still have been provisioned successfully.
+        assert_eq!(reconciler.jails.is_running(&record::jail_name("web-1")).unwrap(), true);
+    }
+
+    #[test]
+    fn reconcile_restarts_a_crashed_jail() {
+        let dir = test_state_dir("reconcile_restarts_a_crashed_jail");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/kubsd/base/14.2-web");
+        reconciler.apply(sample_spec("web-1")).unwrap();
+        let t0 = Instant::now();
+        reconciler.reconcile(t0);
+
+        let jail_name = record::jail_name("web-1");
+        reconciler.jails.mark_exited(&jail_name);
+        assert_eq!(reconciler.jails.is_running(&jail_name).unwrap(), false);
+
+        // The initial provisioning call above already armed a 1s backoff
+        // cooldown (record_attempt runs unconditionally after provisioning,
+        // per BackoffState's contract) — advance past it so this restart
+        // attempt isn't itself suppressed by that cooldown.
+        reconciler.reconcile(t0 + Duration::from_secs(1));
+        assert_eq!(reconciler.jails.is_running(&jail_name).unwrap(), true);
+    }
+
+    #[test]
+    fn reconcile_respects_backoff_cooldown_between_restarts() {
+        let dir = test_state_dir("reconcile_respects_backoff_cooldown_between_restarts");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/kubsd/base/14.2-web");
+        reconciler.apply(sample_spec("web-1")).unwrap();
+        let t0 = Instant::now();
+        reconciler.reconcile(t0);
+
+        let jail_name = record::jail_name("web-1");
+        reconciler.jails.mark_exited(&jail_name);
+        // Still within the 1s cooldown armed by the initial provisioning
+        // call above — this reconcile is a no-op, same as the next one.
+        reconciler.reconcile(t0);
+
+        reconciler.jails.mark_exited(&jail_name);
+        reconciler.reconcile(t0); // still within cooldown — should NOT restart yet
+        assert_eq!(reconciler.jails.is_running(&jail_name).unwrap(), false);
+
+        reconciler.reconcile(t0 + Duration::from_secs(1)); // cooldown passed
+        assert_eq!(reconciler.jails.is_running(&jail_name).unwrap(), true);
+    }
+
+    #[test]
+    fn reconcile_never_policy_leaves_a_crashed_jail_alone() {
+        let dir = test_state_dir("reconcile_never_policy_leaves_a_crashed_jail_alone");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/kubsd/base/14.2-web");
+        let mut spec = sample_spec("web-1");
+        spec.spec.restart_policy = RestartPolicy::Never;
+        reconciler.apply(spec).unwrap();
+        reconciler.reconcile(Instant::now());
+
+        let jail_name = record::jail_name("web-1");
+        reconciler.jails.mark_exited(&jail_name);
+        reconciler.reconcile(Instant::now());
+
+        assert_eq!(reconciler.jails.is_running(&jail_name).unwrap(), false);
+    }
+
+    #[test]
+    fn reconcile_is_a_no_op_when_jail_already_matches_desired_state() {
+        let dir = test_state_dir("reconcile_is_a_no_op_when_jail_already_matches_desired_state");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/kubsd/base/14.2-web");
+        reconciler.apply(sample_spec("web-1")).unwrap();
+        reconciler.reconcile(Instant::now());
+
+        let failures = reconciler.reconcile(Instant::now());
+        assert!(failures.is_empty(), "expected no failures, got: {failures:?}");
+        assert_eq!(reconciler.jails.is_running(&record::jail_name("web-1")).unwrap(), true);
     }
 }
