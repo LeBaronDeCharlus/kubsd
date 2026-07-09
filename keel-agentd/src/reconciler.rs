@@ -1,6 +1,7 @@
 use crate::backoff::BackoffState;
 use crate::record::{self, JailRecord};
 use crate::store::{self, StoreError};
+use crate::wire::JailStatus;
 use keel_jail::JailRuntime;
 use keel_net::NetManager;
 use keel_spec::JailSpec;
@@ -211,6 +212,23 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager> Reconciler<J, Z, N> {
                 result
             }
         }
+    }
+
+    pub fn get(&self, name: &str, now: Instant) -> Option<JailStatus> {
+        let record = self.records.get(name)?.clone();
+        let jail_name = record::jail_name(name);
+        // A transient runtime query error is treated as "not confirmed
+        // running" rather than failing the whole status read - the spec
+        // and backoff info below are still valid and useful on their own.
+        let running = self.jails.is_running(&jail_name).unwrap_or(false);
+        let backoff = self.backoff.get(name).map(|b| b.status(now)).unwrap_or_default();
+        Some(JailStatus { record, running, backoff })
+    }
+
+    pub fn list(&self, now: Instant) -> Vec<JailStatus> {
+        let mut names: Vec<&String> = self.records.keys().collect();
+        names.sort();
+        names.iter().filter_map(|name| self.get(name, now)).collect()
     }
 }
 
@@ -551,5 +569,46 @@ mod tests {
         let failures = reconciler.reconcile(Instant::now());
         assert!(failures.is_empty(), "expected no failures, got: {failures:?}");
         assert_eq!(reconciler.jails.is_running(&record::jail_name("web-1")).unwrap(), true);
+    }
+
+    #[test]
+    fn get_returns_none_for_an_unknown_name() {
+        let dir = test_state_dir("get_returns_none_for_an_unknown_name");
+        let reconciler = new_reconciler(dir);
+        assert!(reconciler.get("missing", Instant::now()).is_none());
+    }
+
+    #[test]
+    fn get_reports_spec_running_state_and_backoff_after_provisioning() {
+        let dir = test_state_dir("get_reports_spec_running_state_and_backoff_after_provisioning");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/keel/base/14.2-web");
+        reconciler.apply(sample_spec("web-1")).unwrap();
+        let t0 = Instant::now();
+        reconciler.reconcile(t0);
+
+        let status = reconciler.get("web-1", t0).unwrap();
+        assert_eq!(status.record.spec.metadata.name, "web-1");
+        assert!(status.running);
+        assert_eq!(status.backoff.retry_in_secs, Some(1));
+    }
+
+    #[test]
+    fn list_returns_all_records_sorted_by_name() {
+        let dir = test_state_dir("list_returns_all_records_sorted_by_name");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.apply(sample_spec("web-2")).unwrap();
+        reconciler.apply(sample_spec("web-1")).unwrap();
+
+        let statuses = reconciler.list(Instant::now());
+        let names: Vec<&str> = statuses.iter().map(|s| s.record.spec.metadata.name.as_str()).collect();
+        assert_eq!(names, vec!["web-1", "web-2"]);
+    }
+
+    #[test]
+    fn list_is_empty_when_no_specs_have_been_applied() {
+        let dir = test_state_dir("list_is_empty_when_no_specs_have_been_applied");
+        let reconciler = new_reconciler(dir);
+        assert!(reconciler.list(Instant::now()).is_empty());
     }
 }
