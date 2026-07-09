@@ -75,6 +75,27 @@ Two new pieces, both added to the existing workspace:
   HTTP/1.1 request by hand, writes it to a `UnixStream`, and parses the
   response with `httparse`.
 
+Milestone 4's `Reconciler<J, Z, N>` only exposes `new`/`apply`/`delete`/
+`reconcile` — no way to read back current records, live running state, or
+backoff state, which `GET /jails` and `GET /jails/{name}` need. This
+milestone adds a small read-only accessor surface to `keel-agentd`'s
+existing `reconciler.rs` and `backoff.rs` to support that, without touching
+reconciliation logic itself:
+
+```rust
+impl<J: JailRuntime, Z: ZfsManager, N: NetManager> Reconciler<J, Z, N> {
+    pub fn get(&self, name: &str) -> Option<JailStatus>;
+    pub fn list(&self) -> Vec<JailStatus>;
+}
+```
+
+`get`/`list` build `JailStatus` from `self.records`, a fresh
+`self.jails.is_running(&jail_name)` call, and `self.backoff.get(name)`.
+`BackoffState` (currently fully private, with `record_attempt`/`can_retry`
+as its only methods) gains a `status(&self, now: Instant) -> BackoffStatus`
+method that reads its own `current_delay`/`next_retry_at` fields to build
+the wire type below — plain accessors, not new backoff behavior.
+
 New dependency: `httparse` (a small, dependency-free HTTP/1.1 parser), used
 by both `keel-agentd` (parsing requests) and `keelctl` (parsing responses).
 No async runtime is introduced — both binaries stay synchronous, consistent
@@ -140,10 +161,21 @@ struct JailStatus {
 }
 
 struct BackoffStatus {
-    next_retry_at: Option<String>,   // RFC3339, absent if no cooldown armed
+    retry_in_secs: Option<u64>,      // seconds until next retry; absent if no cooldown armed
     current_delay_secs: Option<u64>,
 }
 ```
+
+`retry_in_secs` is relative, not an absolute timestamp: `BackoffState`
+tracks `next_retry_at` as `Option<Instant>`, a monotonic clock reading with
+no wall-clock/epoch meaning, computed via
+`next_retry_at.saturating_duration_since(Instant::now()).as_secs()`.
+Reporting it as an absolute RFC3339 time (the original design here) would
+need `Instant` correlated back to `SystemTime` to be meaningful at all, plus
+a date-formatting dependency to render it — neither of which is otherwise
+needed by this milestone, so the wire type reports the relative duration
+instead, which is both simpler and what an operator glancing at `keelctl
+get` actually wants to know ("retry in 12s").
 
 Non-2xx responses carry a YAML body `{ error: <string> }`, built from
 `Display` on `ReconcileError`. Status code mapping from `ReconcileError`
@@ -215,9 +247,12 @@ hand (three flags, each with a default — not enough surface to justify a
   routing for all three verbs, YAML (de)serialization, status/error code
   mapping (including the `InvalidSpec`-vs-`409` immutable-field-change split
   and `404` for unknown names), the `Tick`/`Apply`/`Delete` serialization
-  through the worker channel, and the "apply reconciles immediately" behavior
+  through the worker channel, the "apply reconciles immediately" behavior
   (a `GET` right after a `PUT` observes `running: true` without waiting for
-  the timer).
+  the timer), and the new `Reconciler::get`/`list` and `BackoffState::status`
+  accessors (e.g. a jail failing `provision` shows a non-empty
+  `retry_in_secs` in its `GET` response, and one shows up empty/absent once
+  the cooldown clears).
 - `main.rs`'s wiring to the real implementations, the real 5-second timer
   cadence under real jail/ZFS/net operations, and socket permissions are
   verified manually on the FreeBSD VM: build the binary, run it in the
