@@ -1,4 +1,5 @@
 pub mod backoff;
+pub mod http;
 pub mod record;
 pub mod reconciler;
 pub mod store;
