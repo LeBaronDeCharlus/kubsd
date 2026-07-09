@@ -85,9 +85,9 @@ synchronously.
 
 ```rust
 enum Command {
-    Apply(JailSpec, oneshot::Sender<Result<(), ReconcileError>>),
-    Get(Option<String>, oneshot::Sender<Vec<JailStatus>>),
-    Delete(String, oneshot::Sender<Result<(), ReconcileError>>),
+    Apply(JailSpec, mpsc::Sender<Result<(), ReconcileError>>),
+    Get(Option<String>, mpsc::Sender<Vec<JailStatus>>),
+    Delete(String, mpsc::Sender<Result<(), ReconcileError>>),
     Tick,
 }
 ```
@@ -95,12 +95,16 @@ enum Command {
 One worker thread owns the `Reconciler<J, Z, N>` and processes `Command`s
 from an `mpsc::Receiver<Command>` one at a time, so the `Reconciler` (which
 Milestone 4 built as an explicitly single-threaded type) is never accessed
-concurrently. Two other threads send into that channel:
+concurrently. The reply channel on each variant is a plain
+`std::sync::mpsc::channel()` used for exactly one send — a "oneshot" by
+usage convention, not a new dependency; `std`'s `mpsc` already supports this
+directly, so no extra crate is needed for it. Two other threads send into
+the command channel:
 
 - A **timer thread** sends `Command::Tick` every 5 seconds.
 - **HTTP handler threads** (one spawned per accepted connection on the
-  `UnixListener`) send `Apply`/`Get`/`Delete` and block on the paired
-  `oneshot` receiver for the reply.
+  `UnixListener`) send `Apply`/`Get`/`Delete` with a fresh reply channel and
+  block on `recv()` for the reply.
 
 Handling `Apply` or `Delete` in the worker calls the corresponding
 `Reconciler` method and then immediately calls `reconcile(Instant::now())`
@@ -143,10 +147,9 @@ struct BackoffStatus {
 
 Non-2xx responses carry a YAML body `{ error: <string> }`, built from
 `Display` on `ReconcileError`. Status code mapping from `ReconcileError`
-variants: `InvalidSpec` → `400` (except when the underlying validation
-failure is specifically an immutable-field-change rejection, which maps to
-`409` since that's a more precise code for "conflicts with existing
-server-side state" than a generic bad request); `NotFound` → `404`;
+variants: `InvalidSpec(SpecError::ImmutableField(_))` → `409` (a more precise
+code for "conflicts with existing server-side state" than a generic bad
+request); any other `InvalidSpec(_)` → `400`; `NotFound` → `404`;
 `Store`/`Jail`/`Zfs`/`Net` → `500`. `BaseImageNotFound` is never returned
 synchronously from `apply`/`delete` (it only occurs inside `reconcile`,
 which this API only calls indirectly) — it surfaces to an operator via
