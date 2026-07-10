@@ -5,7 +5,7 @@ use std::process::{Child, Command, Output};
 use std::sync::Mutex;
 
 pub struct ProcessJailRuntime {
-    children: Mutex<Vec<Child>>,
+    children: Mutex<Vec<(String, Child)>>,
 }
 
 impl ProcessJailRuntime {
@@ -35,7 +35,7 @@ impl ProcessJailRuntime {
 
     fn reap_finished_children(&self) {
         let mut children = self.children.lock().unwrap();
-        children.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
+        children.retain_mut(|(_, child)| !matches!(child.try_wait(), Ok(Some(_))));
     }
 
     // Unlike `zfs list`, `jls` returns exit code 1 both when the jail
@@ -84,8 +84,25 @@ impl JailRuntime for ProcessJailRuntime {
         // a reference into the jail's rootfs mount, which then fails a
         // caller's immediately-following `zfs destroy` of that dataset with
         // "device busy" — reproduced end-to-end against a real ZFS-backed
-        // jail during Milestone 5 VM verification.
-        self.reap_finished_children();
+        // jail during Milestone 5 VM verification. A non-blocking
+        // `try_wait` right after `jail -r` returns isn't reliable enough
+        // under load (observed intermittently in the full workspace test
+        // run), so this does a blocking `wait` instead — bounded and safe
+        // because `jail -r` already guarantees these specific processes
+        // are dead. Only this jail's own children are touched; any other
+        // jail's children are left for `start_command`'s ordinary
+        // non-blocking sweep, so destroying one jail never blocks on an
+        // unrelated jail's still-running process.
+        let mine = {
+            let mut children = self.children.lock().unwrap();
+            let all = std::mem::take(&mut *children);
+            let (mine, others): (Vec<_>, Vec<_>) = all.into_iter().partition(|(child_name, _)| child_name == name);
+            *children = others;
+            mine
+        };
+        for (_, mut child) in mine {
+            let _ = child.wait();
+        }
         Ok(())
     }
 
@@ -114,7 +131,7 @@ impl JailRuntime for ProcessJailRuntime {
         cmd.arg(name);
         cmd.args(command);
         let child = cmd.spawn().map_err(|e| JailError::Spawn("jexec".to_string(), e))?;
-        self.children.lock().unwrap().push(child);
+        self.children.lock().unwrap().push((name.to_string(), child));
         Ok(())
     }
 
