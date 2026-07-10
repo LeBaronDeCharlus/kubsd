@@ -1365,7 +1365,7 @@ git commit -m "Add keelctl CLI: apply/get/delete over the keel-agentd HTTP API"
 - [ ] **Step 1: Sync the repo on the VM**
 
 ```bash
-ssh root@192.168.64.2 "cd keel && git pull && cargo build --workspace"
+ssh root@192.168.64.2 "cd kubsd && git pull && cargo build --workspace"
 ```
 
 Expected: builds successfully, producing `target/debug/keel-agentd` and `target/debug/keelctl`.
@@ -1376,7 +1376,17 @@ Expected: builds successfully, producing `target/debug/keel-agentd` and `target/
 ssh root@192.168.64.2 "zfs list zroot/keel/base/test 2>/dev/null || echo missing"
 ```
 
-If missing, reuse whatever base-image setup earlier milestones' VM verification already established (Milestones 2-4 required `zroot/keel/base/test` and `zroot/keel/jails` to exist) — do not recreate it if it's already there.
+If missing, reuse whatever base-image setup earlier milestones' VM verification already established (Milestones 2-4 required `zroot/keel/base/test` and `zroot/keel/jails` to exist under that exact `zroot/keel/...` path — if they only exist under a stale pre-rename `zroot/kubsd/...` path from before the project was renamed, `zfs rename zroot/kubsd zroot/keel` rather than recreating).
+
+Milestones 2-4 only needed this dataset to exist for ZFS-level plumbing tests (clone/snapshot mechanics) — it was never populated with real content. This milestone's end-to-end verification is the first to actually run a command inside a real jail cloned from it, so it also needs a minimal *runnable* userland: a real `/bin/sh` plus its shared library dependencies and the dynamic linker, copied directly from the VM's own host filesystem (same kernel, so no version mismatch risk):
+
+```bash
+ssh root@192.168.64.2 "cd /zroot/keel/base/test && mkdir -p bin libexec lib && \
+  cp /bin/sh bin/ && cp /libexec/ld-elf.so.1 libexec/ && \
+  for lib in \$(ldd /bin/sh | awk '{print \$1}'); do cp /lib/\$lib lib/; done"
+```
+
+Use a spec `command` that avoids forking external binaries in a tight loop (e.g. `[\"/bin/sh\", \"-c\", \"while true; do :; done\"]`, using the shell builtin `:`, not `sleep`) — a missing binary in a `while true` loop fork-bombs failed exec attempts, which is a self-inflicted test artifact, not a realistic workload, and made an unrelated timing issue (Step 5's note below) far more likely to reproduce.
 
 - [ ] **Step 3: Run `keel-agentd` in the foreground**
 
