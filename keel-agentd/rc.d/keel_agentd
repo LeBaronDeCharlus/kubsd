@@ -1,0 +1,26 @@
+#!/bin/sh
+#
+# PROVIDE: keel_agentd
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="keel_agentd"
+rcvar="keel_agentd_enable"
+
+load_rc_config "$name"
+
+: ${keel_agentd_enable:="NO"}
+: ${keel_agentd_bin:="/usr/local/bin/keel-agentd"}
+: ${keel_agentd_pool:="zroot"}
+: ${keel_agentd_state_dir:="/var/db/keel"}
+: ${keel_agentd_socket:="/var/run/keel-agentd.sock"}
+
+pidfile="/var/run/${name}.pid"
+command="/usr/sbin/daemon"
+command_args="-r -P ${pidfile} -S -T ${name} -- \
+  ${keel_agentd_bin} --pool ${keel_agentd_pool} \
+  --state-dir ${keel_agentd_state_dir} --socket ${keel_agentd_socket}"
+
+run_rc_command "$1"
