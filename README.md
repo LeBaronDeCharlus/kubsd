@@ -205,16 +205,66 @@ Milestone 5 finished at 96 tests on macOS, plus a clean 5-for-5 real
 `apply → running → delete` cycle against actual jails, ZFS clones, VNET
 networking, and `rctl` limits on the FreeBSD VM.
 
+### Milestone 6: `rc.d` service integration + end-to-end smoke test
+
+The milestone that turns `keel-agentd` from "a binary you run in a
+terminal" into a real FreeBSD system service, closing out sub-project 1.
+No new code was needed for daemonization itself: an `rc.d` script wraps
+the unchanged Milestone 5 binary with the base system's `daemon(8)`
+utility, using `-r` for restart-on-crash and `-S` to route its output to
+syslog. The only Rust changes were two `eprintln!` call sites (daemon
+startup, per-jail reconciliation failures) — no logging framework, no
+`daemonize`/`signal-hook` dependency, no custom `SIGTERM` handler, since
+the existing "jails outlive the daemon" design already makes the default
+terminate-on-signal behavior correct. A committed smoke test script
+(`scripts/smoke-test.sh`) proves the whole lifecycle end-to-end: install,
+start, apply a real spec, kill `keel-agentd` directly to simulate a crash,
+confirm both the automatic restart and correct state recovery with no
+duplicate jail, stop the service and confirm the jail keeps running, clean
+teardown.
+
+One design subtlety mattered before any code was written: `daemon(8)`
+takes two different pidfile flags, and combining `-r` with the wrong one
+(`-p`, the child's pid) means `service ... stop` kills the child directly
+while `daemon(8)` is still watching and immediately restarts it — the stop
+command would silently do nothing. Verified directly on the VM before
+committing to the design; the rc.d script uses `-P` (the supervisor's own
+pid) throughout.
+
+Full VM verification surfaced two more real bugs, neither reachable by
+any fakes-backed test, since both are genuine OS/supervisor-interaction
+characteristics that only exist under a real `daemon(8)`-supervised run:
+
+- `keel-jail`'s `start_command` spawned the jailed process with Rust's
+  default stdio inheritance, so a long-running jail held `keel-agentd`'s
+  own stdout/stderr open. Under `daemon(8) -S`, those are the write end of
+  a pipe `daemon(8)` reads to detect (via EOF) that `keel-agentd` itself
+  died and needs restarting — an inherited pipe held open by the jailed
+  workload meant `daemon(8)` silently never restarted a killed
+  `keel-agentd` whenever any jail with a running command was active.
+  Root-caused on the VM with `procstat -f`, showing the jailed process's
+  fd 0/1/2 as a pipe shared with `daemon(8)`'s own relay pipe; fixed by
+  giving the jailed process its own `/dev/null` stdio.
+- The smoke test's own "jails outlive the daemon" check was a permanent
+  false negative: `jls`'s default columns never include the jail's name,
+  only its dataset path, so `grep`-ing for the name-prefixed string could
+  never match regardless of whether the jail was actually still running.
+  Fixed with a direct `jls -j <name>` lookup instead.
+
+Milestone 6 finished at 97 tests on macOS (96 plus one new regression test
+pinned to the exact stdio-leak mechanism via `procstat`), plus two
+consecutive clean end-to-end smoke test runs on the FreeBSD VM.
+
 ## Roadmap
 
-**Sub-project 1: single-node jail reconciliation daemon**
+**Sub-project 1: single-node jail reconciliation daemon — complete**
 
 1. ~~FreeBSD dev environment + jail spec language (parsing, validation)~~ done
 2. ~~Jail lifecycle (`jail(8)`/`jls(8)`/`rctl(8)`) and ZFS clone provisioning~~ done
 3. ~~VNET networking (`epair(4)` + `bridge(4)` wiring)~~ done
 4. ~~Reconciliation core (desired vs. observed state, crash-loop backoff, crash-safe persistence), tested against fakes~~ done
 5. ~~Local HTTP API + CLI, wired to the real jail/ZFS/net implementations~~ done
-6. `rc.d` service integration and an end-to-end smoke test on the FreeBSD VM, *next up*
+6. ~~`rc.d` service integration and an end-to-end smoke test on the FreeBSD VM~~ done
 
 **Not yet designed** (future sub-projects, each will get its own spec):
 
