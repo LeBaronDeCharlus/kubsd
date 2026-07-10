@@ -202,6 +202,25 @@ The script exits non-zero on any step's failure (`set -e` plus explicit
 checks for the polling loops, which must not hang forever — bounded
 retry counts with a clear failure message on timeout).
 
+**Readiness race, and why every post-start `keelctl` call must be
+retried, not just the `running: true` checks:** `service ... status`'s
+notion of "running" is `rc.subr`'s pidfile check — it only confirms the
+PID recorded in the pidfile is alive, not that `keel-agentd` has reached
+the point of binding its Unix socket. Per `main.rs`'s actual startup
+order (reconciler init, then worker-thread spawn, then timer-thread
+spawn, and only *after* that the stale-socket cleanup and `bind`), there
+is a real window where `daemon(8)` reports the child alive but
+`keelctl` still gets a hard connection failure (`failed to connect to
+/var/run/keel-agentd.sock: ...`, `keelctl`'s own error path on a missing
+or unbound socket). A single unguarded `keelctl` call right after
+`onestart` (step 5) or right after the new post-crash PID appears
+(step 6) can therefore fail the whole script under `set -e` even though
+nothing is actually broken. Steps 5 and 6 must wrap their first
+`keelctl` call in the same bounded-retry loop used for the `running:
+true` polling — retrying on connection failure, not only on
+`running: false` — so the script tolerates this startup window instead
+of racing it.
+
 ## Error Handling
 
 - If `keel-agentd` crashes repeatedly in a tight loop, `daemon -r`
