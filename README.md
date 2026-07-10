@@ -167,6 +167,44 @@ pass on top) as a genuine adversarial check rather than a formality:
 Milestone 4 finished at 71 tests, all passing, all still running without
 touching FreeBSD.
 
+### Milestone 5: local HTTP API + `keelctl`, wired to the real system
+
+The first milestone where `keel-agentd` actually runs: a binary that wires
+the real `ProcessJailRuntime`/`CliZfsManager`/`ProcessNetManager`
+implementations into a `Reconciler`, drives it on a 5-second timer, and
+serves `apply`/`get`/`delete` over a local HTTP API on a `0600` Unix
+socket, plus `keelctl`, the companion CLI. A single worker thread owns the
+`Reconciler` exclusively; the HTTP server and timer only ever reach it
+through a command channel, so apply/delete take effect immediately
+(reconciled before the caller's response) without introducing a second
+concurrent owner. Everything is still hand-rolled and dependency-light,
+in keeping with the rest of the project: a small HTTP/1.1 parser
+(`httparse`) over a blocking `UnixListener`, YAML wire bodies reusing the
+spec's existing `serde_yaml`, no async runtime.
+
+Milestones 1-4 were tested entirely against fakes; Milestone 5's FreeBSD
+VM verification was the first time the whole stack ran against the real
+system end-to-end, and it promptly found two real bugs that no
+fake-backed test could have caught, both in code shipped since
+Milestone 2:
+
+- `keel-jail`'s `destroy` only ran `jail -r`, never reaping the process
+  `start_command` had spawned into the jail. The kill left a zombie
+  holding a reference into the jail's rootfs mount, so an immediately
+  following dataset teardown failed with "device busy" — exactly the
+  sequence `Reconciler::delete` runs on every deletion of a jail with a
+  running command. Fixed by tracking spawned children per jail name and
+  blocking-waiting on only the destroyed jail's own children.
+- Independently, even with that fixed, `zfs destroy` could still fail
+  with "dataset is busy" for a brief window after `jail -r` returns — a
+  real kernel-level mount-release timing gap, reproducible from a plain
+  shell with no Rust involved. Fixed with a short bounded retry, the same
+  pattern already used for `clone_from_base`'s snapshot race.
+
+Milestone 5 finished at 96 tests on macOS, plus a clean 5-for-5 real
+`apply → running → delete` cycle against actual jails, ZFS clones, VNET
+networking, and `rctl` limits on the FreeBSD VM.
+
 ## Roadmap
 
 **Sub-project 1: single-node jail reconciliation daemon**
@@ -175,8 +213,8 @@ touching FreeBSD.
 2. ~~Jail lifecycle (`jail(8)`/`jls(8)`/`rctl(8)`) and ZFS clone provisioning~~ done
 3. ~~VNET networking (`epair(4)` + `bridge(4)` wiring)~~ done
 4. ~~Reconciliation core (desired vs. observed state, crash-loop backoff, crash-safe persistence), tested against fakes~~ done
-5. Local HTTP API + CLI, wired to the real jail/ZFS/net implementations, *next up*
-6. `rc.d` service integration and an end-to-end smoke test on the FreeBSD VM
+5. ~~Local HTTP API + CLI, wired to the real jail/ZFS/net implementations~~ done
+6. `rc.d` service integration and an end-to-end smoke test on the FreeBSD VM, *next up*
 
 **Not yet designed** (future sub-projects, each will get its own spec):
 
