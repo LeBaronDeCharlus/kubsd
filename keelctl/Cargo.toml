@@ -1,0 +1,15 @@
+[package]
+name = "keelctl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+keel-agentd = { path = "../keel-agentd" }
+keel-spec = { path = "../keel-spec" }
+serde_yaml = "0.9"
+httparse = "1"
+
+[dev-dependencies]
+keel-jail = { path = "../keel-jail" }
+keel-zfs = { path = "../keel-zfs" }
+keel-net = { path = "../keel-net" }
