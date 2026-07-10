@@ -1240,11 +1240,21 @@ fn start_test_server(name: &str) -> PathBuf {
             .unwrap();
     let (_worker_handle, commands) = worker::spawn(reconciler);
 
-    let socket_path = std::env::temp_dir().join(format!("keelctl-test-{name}.sock"));
+    // A short, non-descriptive filename (not the full test name) — macOS/BSD
+    // cap Unix socket paths at ~104 bytes (SUN_LEN), and the default macOS
+    // TMPDIR (/var/folders/.../T/) already uses ~50 of them.
+    let socket_path = short_unique_socket_path();
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path).unwrap();
     thread::spawn(move || keel_agentd::http::run(listener, commands));
     socket_path
+}
+
+fn short_unique_socket_path() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("ka-{}-{}.sock", std::process::id(), id))
 }
 
 fn write_spec_file(test_name: &str, jail_name: &str) -> PathBuf {
