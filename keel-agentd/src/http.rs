@@ -237,7 +237,16 @@ mod tests {
         let request =
             format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}", body.len());
         stream.write_all(request.as_bytes()).unwrap();
-        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        // Under heavy scheduling contention (observed intermittently during
+        // Milestone 5 VM verification, running the full workspace suite
+        // concurrently), the server can finish reading the request,
+        // respond, and close its end before we get here — the socket is
+        // then already fully disconnected, a harmless race since our goal
+        // (signal EOF so the server stops expecting more body) is already
+        // moot if the server's done reading.
+        if let Err(e) = stream.shutdown(std::net::Shutdown::Write) {
+            assert_eq!(e.kind(), std::io::ErrorKind::NotConnected, "unexpected shutdown error: {e}");
+        }
 
         let mut response = Vec::new();
         stream.read_to_end(&mut response).unwrap();
