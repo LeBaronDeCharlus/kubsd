@@ -1,11 +1,18 @@
 #![cfg(target_os = "freebsd")]
 
 use keel_jail::{JailRuntime, ProcessJailRuntime};
+use keel_zfs::{CliZfsManager, ZfsManager};
 use std::path::Path;
 use std::{thread, time::Duration};
 
 // Run as root on the FreeBSD VM: `sudo cargo test -p keel-jail --test freebsd_lifecycle`
 // (jail(8)/jls(8)/jexec(8) require root privileges).
+//
+// Requires a `zroot/keel/base/test` dataset to exist (same prerequisite as
+// keel-zfs's own freebsd_zfs test), and, for the reap-on-destroy test below
+// specifically, that dataset must contain a real, runnable `/bin/sh` (a
+// dynamically linked binary needs its shared libs and `/libexec/ld-elf.so.1`
+// alongside it too) — a minimal userland, not just an empty dataset.
 
 #[test]
 fn create_destroy_and_is_running_lifecycle() {
@@ -108,4 +115,40 @@ fn jail_exists_distinguishes_created_from_never_existed() {
 
     runtime.destroy(name).expect("destroy should succeed");
     assert_eq!(runtime.jail_exists(name).unwrap(), false, "should not exist after destroy");
+}
+
+#[test]
+fn destroy_reaps_the_spawned_command_so_its_dataset_can_be_destroyed_immediately() {
+    // Reproduces a real bug found during Milestone 5 VM verification:
+    // `destroy` used to only run `jail -r` without reaping the process
+    // `start_command` had spawned into it, leaving a zombie that held a
+    // reference into the jail's rootfs mount — a caller's immediately
+    // following `zfs destroy` of that dataset then failed with "device
+    // busy" (this is exactly the sequence `keel-agentd`'s `Reconciler::
+    // delete` runs: detach network, destroy jail, destroy dataset).
+    let jails = ProcessJailRuntime::new();
+    let zfs = CliZfsManager::new();
+    let name = "keel-test-destroy-reaps-child";
+    let dataset = "zroot/keel/jails/keel-test-destroy-reaps-child";
+
+    let _ = jails.destroy(name);
+    let _ = zfs.destroy_dataset(dataset);
+
+    zfs.clone_from_base("zroot/keel/base/test", dataset).expect("clone_from_base should succeed");
+    let rootfs = Path::new("/").join(dataset);
+    jails.create(name, &rootfs, false).expect("create should succeed");
+    // `:` is a shell builtin (no-op) so this only needs `/bin/sh` inside
+    // the test base image, not any other binary.
+    jails
+        .start_command(name, &["/bin/sh".to_string(), "-c".to_string(), "while true; do :; done".to_string()])
+        .expect("start_command should succeed");
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(jails.is_running(name).unwrap(), true, "the spawned command should be running");
+
+    jails.destroy(name).expect("destroy should succeed");
+
+    // No sleep/retry here: this must work on the very next call, since
+    // that's exactly how `Reconciler::delete` chains `jails.destroy` then
+    // `zfs.destroy_dataset` with nothing in between.
+    zfs.destroy_dataset(dataset).expect("dataset should be destroyable immediately after destroy reaps its child");
 }

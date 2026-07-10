@@ -76,7 +76,17 @@ impl JailRuntime for ProcessJailRuntime {
     }
 
     fn destroy(&self, name: &str) -> Result<(), JailError> {
-        Self::run_checked("jail", &["-r", name])
+        Self::run_checked("jail", &["-r", name])?;
+        // `jail -r` kills every process in the jail and blocks until
+        // removal completes, but the kernel doesn't fully release a killed
+        // child until its parent (us, since `start_command` spawned it via
+        // `Command::spawn`) reaps it. Left unreaped, the zombie still holds
+        // a reference into the jail's rootfs mount, which then fails a
+        // caller's immediately-following `zfs destroy` of that dataset with
+        // "device busy" — reproduced end-to-end against a real ZFS-backed
+        // jail during Milestone 5 VM verification.
+        self.reap_finished_children();
+        Ok(())
     }
 
     fn jail_exists(&self, name: &str) -> Result<bool, JailError> {
