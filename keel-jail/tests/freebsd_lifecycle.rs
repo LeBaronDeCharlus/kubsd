@@ -152,3 +152,55 @@ fn destroy_reaps_the_spawned_command_so_its_dataset_can_be_destroyed_immediately
     // `zfs.destroy_dataset` with nothing in between.
     zfs.destroy_dataset(dataset).expect("dataset should be destroyable immediately after destroy reaps its child");
 }
+
+#[test]
+fn start_command_does_not_leak_stdio_into_the_jailed_process() {
+    // Reproduces a real bug found during Milestone 6 VM verification: a
+    // long-running jailed process that inherited keel-agentd's own
+    // stdout/stderr held a supervisor's (daemon(8) -S's) relay pipe open
+    // indefinitely, so the supervisor never saw EOF and never noticed
+    // keel-agentd itself had died, silently breaking restart-on-crash for
+    // any jail with an active command. `start_command` must give the
+    // jailed process its own, disconnected stdio (here, /dev/null) rather
+    // than inheriting the caller's.
+    let runtime = ProcessJailRuntime::new();
+    let name = "keel-test-stdio-isolation";
+    let rootfs = Path::new("/tmp/keel-test-stdio-isolation-rootfs");
+    let bin_dir = rootfs.join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::copy("/rescue/sh", bin_dir.join("sh")).expect("copy /rescue/sh into test rootfs");
+
+    let _ = runtime.destroy(name);
+    runtime.create(name, rootfs, false).expect("create should succeed");
+
+    runtime
+        .start_command(name, &["/bin/sh".to_string(), "-c".to_string(), "sleep 5".to_string()])
+        .expect("start_command should succeed");
+    thread::sleep(Duration::from_millis(200));
+
+    let jid_output = std::process::Command::new("jls").args(["-j", name, "jid"]).output().expect("jls should run");
+    let jid = String::from_utf8_lossy(&jid_output.stdout).trim().to_string();
+    assert!(!jid.is_empty(), "expected the jail to have a jid");
+
+    let pid_output =
+        std::process::Command::new("ps").args(["-J", &jid, "-o", "pid="]).output().expect("ps should run");
+    let pid = String::from_utf8_lossy(&pid_output.stdout).trim().to_string();
+    assert!(!pid.is_empty(), "expected to find a process running inside the jail");
+
+    let procstat_output =
+        std::process::Command::new("procstat").args(["-f", &pid]).output().expect("procstat should run");
+    let procstat_text = String::from_utf8_lossy(&procstat_output.stdout);
+    for line in procstat_text.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (Some(fd), Some(kind)) = (fields.get(2), fields.get(3)) else { continue };
+        if matches!(*fd, "0" | "1" | "2") {
+            assert_ne!(
+                *kind, "p",
+                "fd {fd} of the jailed process must not be a pipe (would mean it inherited \
+                 keel-agentd's own stdio): {line}\nfull procstat output:\n{procstat_text}"
+            );
+        }
+    }
+
+    runtime.destroy(name).expect("destroy should succeed");
+}

@@ -1,7 +1,7 @@
 use crate::JailError;
 use crate::JailRuntime;
 use std::path::Path;
-use std::process::{Child, Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::Mutex;
 
 pub struct ProcessJailRuntime {
@@ -130,6 +130,21 @@ impl JailRuntime for ProcessJailRuntime {
         let mut cmd = Command::new("jexec");
         cmd.arg(name);
         cmd.args(command);
+        // The jailed process must never inherit this process's own stdio.
+        // Under a supervisor like `daemon(8) -S`, keel-agentd's own
+        // stdout/stderr are the write end of a pipe daemon(8) reads to
+        // relay output to syslog — and relies on reaching EOF on to detect
+        // that keel-agentd itself has exited and needs restarting. A
+        // long-running jailed process that inherited those fds (Rust's
+        // `Command` inherits stdio by default) holds that pipe open
+        // indefinitely even after keel-agentd dies, so the supervisor never
+        // sees EOF and never restarts it. Reproduced directly on the real
+        // VM during Milestone 6 verification: daemon(8) -r silently never
+        // restarted a killed keel-agentd whenever a jail with a
+        // long-running command was active.
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
         let child = cmd.spawn().map_err(|e| JailError::Spawn("jexec".to_string(), e))?;
         self.children.lock().unwrap().push((name.to_string(), child));
         Ok(())
