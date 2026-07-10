@@ -203,6 +203,13 @@ mod tests {
         )
     }
 
+    fn short_unique_socket_path() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("ka-{}-{}.sock", std::process::id(), id))
+    }
+
     fn start_test_server(name: &str) -> PathBuf {
         let state_dir = std::env::temp_dir().join(format!("keel-agentd-http-test-state-{name}"));
         let _ = std::fs::remove_dir_all(&state_dir);
@@ -218,7 +225,7 @@ mod tests {
         .unwrap();
         let (_worker_handle, commands) = worker::spawn(reconciler);
 
-        let socket_path = std::env::temp_dir().join(format!("keel-agentd-http-test-{name}.sock"));
+        let socket_path = short_unique_socket_path();
         let _ = std::fs::remove_file(&socket_path);
         let listener = UnixListener::bind(&socket_path).unwrap();
         thread::spawn(move || run(listener, commands));
