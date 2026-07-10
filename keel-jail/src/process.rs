@@ -133,7 +133,7 @@ impl JailRuntime for ProcessJailRuntime {
         // The jailed process must never inherit this process's own stdio.
         // Under a supervisor like `daemon(8) -S`, keel-agentd's own
         // stdout/stderr are the write end of a pipe daemon(8) reads to
-        // relay output to syslog — and relies on reaching EOF on to detect
+        // relay output to syslog — and relies on reaching EOF to detect
         // that keel-agentd itself has exited and needs restarting. A
         // long-running jailed process that inherited those fds (Rust's
         // `Command` inherits stdio by default) holds that pipe open

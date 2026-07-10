@@ -259,3 +259,13 @@ of racing it.
 - Whether a future milestone should add supervisor-level backoff (e.g.
   `daemon -R <delay>` instead of `-r`) if a real crash-loop is ever
   observed in production; not needed to close this milestone.
+- **Found during VM verification, not anticipated by this spec:**
+  `keel-jail`'s `start_command` must give each jailed process its own
+  isolated stdio (`/dev/null`) rather than inheriting `keel-agentd`'s own —
+  otherwise a long-running jailed process holds open the pipe `daemon(8)
+  -S` relies on seeing EOF from to detect `keel-agentd`'s own exit,
+  silently breaking crash-restart for any jail with an active command.
+  `/dev/null` is the right scope for this milestone (log aggregation is an
+  explicit non-goal), but a future log-aggregation milestone will want
+  per-jail log files instead — noted here so that isn't silently
+  forgotten.

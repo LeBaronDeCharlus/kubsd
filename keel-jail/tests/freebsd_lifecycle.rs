@@ -173,8 +173,12 @@ fn start_command_does_not_leak_stdio_into_the_jailed_process() {
     let _ = runtime.destroy(name);
     runtime.create(name, rootfs, false).expect("create should succeed");
 
+    // `:` is a shell builtin (no-op), needing no binary beyond `/bin/sh`
+    // itself — same pattern as `destroy_reaps_the_spawned_command...`
+    // above, avoiding any dependence on which other utilities happen to be
+    // reachable inside the jail's minimal rootfs.
     runtime
-        .start_command(name, &["/bin/sh".to_string(), "-c".to_string(), "sleep 5".to_string()])
+        .start_command(name, &["/bin/sh".to_string(), "-c".to_string(), "while true; do :; done".to_string()])
         .expect("start_command should succeed");
     thread::sleep(Duration::from_millis(200));
 
