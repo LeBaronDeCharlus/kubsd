@@ -47,10 +47,17 @@ fn main() {
         ProcessJailRuntime::new(),
         CliZfsManager::new(),
         ProcessNetManager::new(),
-        config.pool,
-        config.state_dir,
+        config.pool.clone(),
+        config.state_dir.clone(),
     )
     .expect("failed to initialize reconciler from on-disk state");
+
+    eprintln!(
+        "keel-agentd: starting (pool={}, state_dir={}, socket={})",
+        config.pool,
+        config.state_dir.display(),
+        config.socket.display()
+    );
 
     let (_worker_handle, commands) = worker::spawn(reconciler);
 

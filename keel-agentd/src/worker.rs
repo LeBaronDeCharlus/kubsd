@@ -60,7 +60,9 @@ fn handle_command<J: JailRuntime, Z: ZfsManager, N: NetManager>(
             let _ = reply.send(statuses);
         }
         Command::Tick => {
-            let _ = reconciler.reconcile(Instant::now());
+            for (name, error) in reconciler.reconcile(Instant::now()) {
+                eprintln!("keel-agentd: reconcile error for jail '{name}': {error}");
+            }
         }
     }
 }
