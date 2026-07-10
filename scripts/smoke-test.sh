@@ -70,7 +70,7 @@ wait_for_running() {
 }
 
 find_keel_agentd_pid() {
-    pgrep -f "/usr/local/bin/keel-agentd" | head -1
+    pgrep keel-agentd | head -1
 }
 
 log "building release binaries..."
