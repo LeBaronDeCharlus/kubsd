@@ -137,7 +137,7 @@ log "reconciler correctly recovered state after crash restart, no duplicate jail
 log "stopping keel_agentd..."
 service keel_agentd onestop
 sleep 1
-if ! jls | grep -q "keel-${JAIL_NAME}"; then
+if ! jls -j "keel-${JAIL_NAME}" jid >/dev/null 2>&1; then
     fail "jail was torn down when the daemon stopped (jails must outlive the daemon)"
 fi
 log "jail is still running after daemon stop (jails outlive the daemon, confirmed)"
