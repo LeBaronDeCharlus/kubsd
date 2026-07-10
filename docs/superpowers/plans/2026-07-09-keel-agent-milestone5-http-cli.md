@@ -1391,7 +1391,7 @@ Use a spec `command` that avoids forking external binaries in a tight loop (e.g.
 - [ ] **Step 3: Run `keel-agentd` in the foreground**
 
 ```bash
-ssh root@192.168.64.2 "cd keel && ./target/debug/keel-agentd --pool zroot --state-dir /var/db/keel-test --socket /var/run/keel-agentd-test.sock" &
+ssh root@192.168.64.2 "cd kubsd && ./target/debug/keel-agentd --pool zroot --state-dir /var/db/keel-test --socket /var/run/keel-agentd-test.sock" &
 ```
 
 Expected: process starts and blocks (no output means it's running the accept loop). Leave it running for the remaining steps.
@@ -1409,8 +1409,8 @@ Expected: `100600 root:wheel` (or the FreeBSD `stat` equivalent showing mode `06
 Write a spec pointing at the test base image (e.g. `image: base/test`), then:
 
 ```bash
-ssh root@192.168.64.2 "cd keel && ./target/debug/keelctl --socket /var/run/keel-agentd-test.sock apply -f /tmp/vm-test-spec.yaml"
-ssh root@192.168.64.2 "cd keel && ./target/debug/keelctl --socket /var/run/keel-agentd-test.sock get vm-test"
+ssh root@192.168.64.2 "cd kubsd && ./target/debug/keelctl --socket /var/run/keel-agentd-test.sock apply -f /tmp/vm-test-spec.yaml"
+ssh root@192.168.64.2 "cd kubsd && ./target/debug/keelctl --socket /var/run/keel-agentd-test.sock get vm-test"
 ```
 
 Expected: `apply` exits 0; `get` shows `running: true` within the next reconcile cycle (poll `get` a few times up to 5s apart if it shows `running: false` immediately after `apply`, since VM real jail startup isn't instant like the fakes).
@@ -1426,7 +1426,7 @@ Expected: the jail is listed and running.
 - [ ] **Step 7: Delete it and confirm teardown**
 
 ```bash
-ssh root@192.168.64.2 "cd keel && ./target/debug/keelctl --socket /var/run/keel-agentd-test.sock delete vm-test"
+ssh root@192.168.64.2 "cd kubsd && ./target/debug/keelctl --socket /var/run/keel-agentd-test.sock delete vm-test"
 ssh root@192.168.64.2 "jls | grep keel-vm-test || echo gone"
 ```
 

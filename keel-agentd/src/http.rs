@@ -69,6 +69,9 @@ fn read_request(stream: &mut UnixStream) -> io::Result<Option<ParsedRequest>> {
     };
 
     let total_len = header_len + content_length;
+    if total_len > MAX_MESSAGE_BYTES {
+        return Ok(None);
+    }
     while buf.len() < total_len {
         let n = stream.read(&mut chunk)?;
         if n == 0 {
@@ -326,5 +329,25 @@ mod tests {
         assert_eq!(status, 200);
         assert!(body.contains("web-1"));
         assert!(body.contains("web-2"));
+    }
+
+    #[test]
+    fn oversized_content_length_closes_the_connection_without_reading_the_body() {
+        let socket_path =
+            start_test_server("oversized_content_length_closes_the_connection_without_reading_the_body");
+        let mut stream = UnixStream::connect(&socket_path).unwrap();
+        let request = format!(
+            "PUT /jails/web-1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            MAX_MESSAGE_BYTES + 1
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).ok();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        assert!(
+            response.is_empty(),
+            "server should close the connection without responding to an oversized request, got: {response:?}"
+        );
     }
 }

@@ -68,7 +68,8 @@ impl ZfsManager for CliZfsManager {
             match Self::run_checked(&["destroy", dataset]) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    let is_busy = matches!(&e, ZfsError::CommandFailed(_, _, stderr) if stderr.contains("busy"));
+                    let is_busy =
+                        matches!(&e, ZfsError::CommandFailed(_, _, stderr) if stderr.contains("dataset is busy"));
                     last_err = Some(e);
                     if !is_busy {
                         break;
