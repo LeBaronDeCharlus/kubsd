@@ -318,8 +318,21 @@ mod tests {
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
+                // Drain the whole request (forward() sends it as two
+                // separate write_all calls, headers then body, followed by
+                // shutdown(Write)) before responding. Reading only once can
+                // catch just the first TCP segment under load, leaving the
+                // rest unread when this stream is dropped at the end of the
+                // loop body — on a BSD-derived TCP stack that can turn the
+                // close into an RST instead of a clean FIN, which the real
+                // client then sees as a spurious connection reset.
                 let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => continue,
+                    }
+                }
                 let response = format!(
                     "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nContent-Type: application/yaml\r\nConnection: close\r\n\r\n{body}",
                     body.len()
