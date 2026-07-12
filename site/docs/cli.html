@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>keelctl CLI Reference · Keel Docs</title>
+<link rel="icon" href="../assets/keel-logo.png">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container nav">
+    <a class="brand" href="../index.html"><img src="../assets/keel-logo.png" alt="Keel logo" class="brand-logo">Keel</a>
+    <nav class="nav-links">
+      <a href="../why.html">Why</a>
+      <div class="nav-dropdown">
+        <a href="index.html">Docs</a>
+        <div class="nav-dropdown-menu">
+          <a href="architecture.html">Architecture</a>
+          <a href="jailspec.html">JailSpec Reference</a>
+          <a href="cli.html">CLI Reference</a>
+          <a href="api.html">HTTP API Reference</a>
+        </div>
+      </div>
+      <a href="../quickstart.html">Quickstart</a>
+      <a href="../journey.html">Journey</a>
+      <a class="nav-github" href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+  <section class="page-header">
+    <div class="container">
+      <h1>keelctl CLI reference</h1>
+      <p class="lead">keelctl talks to keel-agentd's local HTTP API over its Unix socket.</p>
+    </div>
+  </section>
+
+  <section id="socket-flag">
+    <div class="container">
+      <h2>Global flag</h2>
+      <table>
+        <thead><tr><th>Flag</th><th>Default</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>--socket PATH</code></td><td><code>/var/run/keel-agentd.sock</code></td><td>Path to the keel-agentd Unix socket to talk to.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="apply">
+    <div class="container">
+      <h2>keelctl apply -f FILE</h2>
+      <p>Reads a <code>JailSpec</code> YAML file, validates it locally, and sends it as a <code>PUT /jails/&lt;name&gt;</code> request (the name comes from the spec's own <code>metadata.name</code>).</p>
+      <pre>keelctl apply -f jail.yaml</pre>
+    </div>
+  </section>
+
+  <section id="get">
+    <div class="container">
+      <h2>keelctl get [name]</h2>
+      <p>With no argument, lists every jail keel-agentd is tracking (<code>GET /jails</code>). With a name, fetches just that one (<code>GET /jails/&lt;name&gt;</code>).</p>
+      <pre>keelctl get
+keelctl get web-1</pre>
+    </div>
+  </section>
+
+  <section id="delete">
+    <div class="container">
+      <h2>keelctl delete NAME</h2>
+      <p>Tears down the named jail, its ZFS dataset, its network attachment, and its resource limits (<code>DELETE /jails/&lt;name&gt;</code>).</p>
+      <pre>keelctl delete web-1</pre>
+    </div>
+  </section>
+
+  <section id="errors">
+    <div class="container">
+      <h2>Errors</h2>
+      <p>On any non-2xx response, keelctl prints the server's error message to stderr and exits non-zero. See the <a href="api.html">HTTP API reference</a> for the specific error cases each endpoint can return.</p>
+    </div>
+  </section>
+</main>
+<footer class="site-footer">
+  <div class="container">
+    <p>Keel is open source on <a href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub</a>.</p>
+  </div>
+</footer>
+</body>
+</html>
