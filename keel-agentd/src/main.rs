@@ -3,6 +3,7 @@ use keel_agentd::Reconciler;
 use keel_jail::ProcessJailRuntime;
 use keel_net::ProcessNetManager;
 use keel_zfs::CliZfsManager;
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
@@ -75,16 +76,27 @@ fn main() {
         config.socket.display()
     );
 
+    let (_worker_handle, commands) = worker::spawn(reconciler);
+
     if let (Some(node_id), Some(control_plane_addr), Some(advertise_addr)) =
         (config.node_id.clone(), config.control_plane_addr.clone(), config.advertise_addr.clone())
     {
         eprintln!(
             "keel-agentd: registering with control plane at {control_plane_addr} as node '{node_id}' ({advertise_addr})"
         );
-        keel_agentd::registration::spawn(node_id, advertise_addr, control_plane_addr, Duration::from_secs(5));
-    }
+        keel_agentd::registration::spawn(
+            node_id,
+            advertise_addr.clone(),
+            control_plane_addr,
+            Duration::from_secs(5),
+        );
 
-    let (_worker_handle, commands) = worker::spawn(reconciler);
+        eprintln!("keel-agentd: serving jails API over TCP on {advertise_addr}");
+        let tcp_listener = TcpListener::bind(&advertise_addr)
+            .unwrap_or_else(|e| panic!("failed to bind jails-API TCP listener on {advertise_addr}: {e}"));
+        let tcp_commands = commands.clone();
+        thread::spawn(move || keel_agentd::http::run_tcp(tcp_listener, tcp_commands));
+    }
 
     let timer_commands = commands.clone();
     thread::spawn(move || loop {
