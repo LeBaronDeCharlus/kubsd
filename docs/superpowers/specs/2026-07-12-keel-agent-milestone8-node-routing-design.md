@@ -52,7 +52,7 @@ Test environment: the same three real FreeBSD VMs used for Milestone 7
 - **Cluster-wide aggregation.** There is no route that fans out to every
   node and merges results (e.g. "list every jail in the cluster").
   Every request in this milestone targets exactly one node. This is a
-  deliberate scope cut, not an oversight — partial-failure handling
+  deliberate scope cut, not an oversight: partial-failure handling
   across N concurrent node calls is real complexity this milestone does
   not need in order to satisfy "route to a specific node."
 - **The `JailSpec` schema, or any of `keel-spec`/`keel-jail`/`keel-zfs`/
@@ -62,9 +62,9 @@ Test environment: the same three real FreeBSD VMs used for Milestone 7
 - **`keel-controlplane` learning anything about jails.** It forwards
   bytes; it never deserializes a `JailSpec`/`JailStatus` and gains no new
   dependency on `keel-spec` or `keel-agentd`'s wire types. Its own state
-  (`Registry`) is completely unchanged from Milestone 7 — this milestone
+  (`Registry`) is completely unchanged from Milestone 7; this milestone
   adds HTTP surface, not state.
-- **Authentication/authorization**, same-network trust continues to be
+- **Authentication/authorization.** Same-network trust continues to be
   assumed end to end (client → control plane → node), matching every
   prior milestone's trust model. Not revisited here.
 - **NAT / multi-homed node addressing.** `--advertise-addr` is used
@@ -81,7 +81,7 @@ Test environment: the same three real FreeBSD VMs used for Milestone 7
 
 `http.rs`'s existing `route()`/`handle_apply`/`handle_get`/
 `handle_delete` already operate on a transport-agnostic
-`ParsedRequest { method, path, body }` — nothing about them is
+`ParsedRequest { method, path, body }`, and nothing about them is
 Unix-socket-specific. This milestone adds a sibling entry point:
 
 ```rust
@@ -99,12 +99,12 @@ new `handle_connection_tcp` duplicating `handle_connection`'s body
 against a `TcpStream` instead of a `UnixStream`. This duplicates rather
 than generalizes over a `Read + Write` trait bound, matching the
 project's established preference for small parallel implementations over
-premature generics — the same choice already made when
+premature generics, the same choice already made when
 `keel-controlplane`'s `http.rs` was written as a near-exact structural
 copy of `keel-agentd`'s rather than sharing code with it.
 
 `main.rs` binds this listener only when the existing opt-in trio
-(`--node-id`, `--control-plane-addr`, `--advertise-addr`) is present —
+(`--node-id`, `--control-plane-addr`, `--advertise-addr`) is present:
 the same gate Milestone 7 already uses for registration, now also
 controlling this second listener. `--advertise-addr`'s contract changes
 from Milestone 7's undialed display string to a real bind address
@@ -112,7 +112,7 @@ from Milestone 7's undialed display string to a real bind address
 also the exact string sent to the control plane at registration, so the
 control plane's `Registry` already has the correct dialable address with
 no new field. The existing Unix socket, its `0600` permissions, and
-every route on it are completely unchanged — this is a second door onto
+every route on it are completely unchanged; this is a second door onto
 the same `Reconciler`/`worker::Command` dispatch, not a replacement.
 
 ### `keel-controlplane`: forwarding routes
@@ -151,13 +151,13 @@ ResolveError>>)`, handled the same one-thread-owns-`Registry` way as
 2. On `Ok(addr)`, opens a `TcpStream` to `addr` with a short connect
    timeout (`TcpStream::connect_timeout`, a few seconds) and an equally
    short read timeout (`set_read_timeout`), writes a hand-rolled
-   HTTP/1.1 request (method + forwarded path + `Content-Length` + body
-   — the same request-building shape `keel-agentd::registration` and
+   HTTP/1.1 request (method + forwarded path + `Content-Length` + body,
+   the same request-building shape `keel-agentd::registration` and
    `keelctl::send_request` already use over their own `TcpStream`/
    `UnixStream`), and parses the raw response with `httparse` (already a
    dependency of this crate).
 3. On success, relays the node's exact status code and body back to the
-   original caller, byte for byte — `keel-controlplane` never interprets
+   original caller, byte for byte; `keel-controlplane` never interprets
    the body.
 4. Any failure before step 3 completes (connect error, timeout,
    malformed response) becomes a `keel-controlplane`-originated
@@ -187,27 +187,27 @@ present, behavior is byte-for-byte identical to today.
 ## Error Handling
 
 - A forwarding failure at the control plane (unknown node, dead node,
-  unreachable node) never touches `Registry` state — `Resolve` is a pure
+  unreachable node) never touches `Registry` state: `Resolve` is a pure
   read, same as `List`, so a bad forward attempt can't corrupt or affect
   any other node's entry, continuing the "one bad actor doesn't block
   the others" principle already established by `Reconciler::reconcile`
   and Milestone 7's `Register`/`Heartbeat`/`List`.
 - The connect/read timeout on the forwarding hop exists specifically for
   the gap between "a node goes unreachable" and "the registry's
-  `DEAD_THRESHOLD` (15s) notices" — without it, a request to a node that
+  `DEAD_THRESHOLD` (15s) notices": without it, a request to a node that
   died moments ago would hang for the OS's default TCP timeout instead
   of failing fast with a clear error.
 - `keel-agentd`'s existing `handle_apply` path-name-consistency check
   (`spec.metadata.name` must match the path segment) fires exactly as it
   does today, unmodified, on whichever listener (Unix socket or new TCP
-  listener) received the request — `keel-controlplane` forwards the body
+  listener) received the request; `keel-controlplane` forwards the body
   opaquely, so this validation still happens exactly once, at the node.
 
 ## Testing Strategy
 
 - `Registry::resolve`: unit tests for the fresh-Unknown, Alive, and Dead
   cases, injecting `Instant`s the same way `list`'s existing
-  `DEAD_THRESHOLD`-boundary tests already do — no networking involved.
+  `DEAD_THRESHOLD`-boundary tests already do, no networking involved.
 - `keel-controlplane`'s `handle_forward`: in-process tests that bind a
   real local `TcpListener` as a stand-in "fake remote `keel-agentd`"
   returning a canned response, register it in the `Registry` at that
@@ -235,13 +235,13 @@ present, behavior is byte-for-byte identical to today.
 ## Open Questions / Deferred Decisions
 
 - Cluster-wide listing (aggregating `GET` across every `Alive` node) was
-  considered and explicitly deferred — a natural fit for a later
+  considered and explicitly deferred, a natural fit for a later
   milestone, likely alongside whatever surfaces cluster state to a human
   (a dashboard, or the scheduler's own view of the world), once there's
   a real need to reason about placement across nodes rather than just
   reach one.
 - Authentication between client, control plane, and node remains
-  unaddressed, same as Milestone 7's deferral — worth revisiting once
+  unaddressed, same as Milestone 7's deferral, worth revisiting once
   the control plane is doing something more consequential than
   forwarding to a single named node.
 - Whether `keel-controlplane` needs its own `rc.d` script is still
