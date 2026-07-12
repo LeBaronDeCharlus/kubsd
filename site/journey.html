@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Journey So Far · Keel</title>
+<link rel="icon" href="assets/keel-logo.png">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container nav">
+    <a class="brand" href="index.html"><img src="assets/keel-logo.png" alt="Keel logo" class="brand-logo">Keel</a>
+    <nav class="nav-links">
+      <a href="why.html">Why</a>
+      <div class="nav-dropdown">
+        <a href="docs/index.html">Docs</a>
+        <div class="nav-dropdown-menu">
+          <a href="docs/architecture.html">Architecture</a>
+          <a href="docs/jailspec.html">JailSpec Reference</a>
+          <a href="docs/cli.html">CLI Reference</a>
+          <a href="docs/api.html">HTTP API Reference</a>
+        </div>
+      </div>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="journey.html">Journey</a>
+      <a class="nav-github" href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+  <section class="page-header">
+    <div class="container">
+      <h1>The Journey So Far</h1>
+      <p class="lead">Keel is being built one milestone at a time: design a spec, write an implementation plan, execute it task by task with a review after every task, then a whole-branch review before moving on. Every FreeBSD-specific behavior is verified on a real FreeBSD 15.1 VM, not assumed, before it's locked into a plan.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="container">
+
+      <div class="milestone">
+        <h3>Milestone 1 <span class="badge">keel-spec</span></h3>
+        <p>The foundation: a YAML schema for describing a jail (image, command, network, resources, restart policy) plus the parsing and validation that turns YAML into a typed <code>JailSpec</code>. This is where the core invariants of the whole system were decided: what counts as a valid jail name, how <code>cpu</code>/<code>memory</code> strings get parsed into concrete limits, which fields are allowed to change on a re-apply and which are immutable for the life of the jail, and how CIDR addresses are validated. Thirteen unit tests plus four end-to-end tests, all running on any OS, no FreeBSD required.</p>
+      </div>
+
+      <div class="milestone">
+        <h3>Milestone 2 <span class="badge">keel-jail, keel-zfs</span></h3>
+        <p>The first milestone that actually touches FreeBSD. Two crates, each built around the same pattern that carries through the rest of the project: a trait describing what the crate does (<code>JailRuntime</code>, <code>ZfsManager</code>), an in-memory <code>Fake</code> implementation for fast tests on any machine, and a real implementation that shells out to <code>jail(8)</code>, <code>jexec(8)</code>, <code>rctl(8)</code>, and <code>zfs(8)</code> on FreeBSD.</p>
+        <p>Getting the real implementations right took real hardware: <code>is_running</code> first miscounted zombie processes as "running" until tested against an actual jail; <code>ps</code> invocation syntax that looked right on paper didn't parse the way FreeBSD expected; a <code>zfs snapshot</code> race under parallel tests had to be made tolerant of losing that race rather than erroring.</p>
+      </div>
+
+      <div class="milestone">
+        <h3>Milestone 3 <span class="badge">keel-net</span></h3>
+        <p>Adds <code>keel-net</code> and its <code>NetManager</code> trait: creating bridges, attaching a jail to one over an <code>epair(4)</code> pair with a static address, and tearing that down again. This milestone is also where <code>keel-jail::create</code> gained a <code>vnet</code> parameter, since VNET-enabled jails need to be created differently from the start, an early breaking change caught before it could compound. By this point the "verify on the real VM before writing the plan" discipline was fully in place, and Milestone 3 shipped with zero fix rounds across all five of its tasks.</p>
+      </div>
+
+      <div class="milestone">
+        <h3>Milestone 4 <span class="badge">keel-agentd, the reconciliation core</span></h3>
+        <p>The milestone that ties everything together. <code>Reconciler&lt;J, Z, N&gt;</code> is generic over the three runtime traits from Milestones 1 through 3, so it can be instantiated against the <code>Fake*</code> implementations for fast, FreeBSD-free testing today, and against the real <code>Process*</code>/<code>Cli*</code> implementations once a later milestone wires it up to an actual daemon.</p>
+        <p>Its public API is small on purpose: <code>new</code>, <code>apply</code>, <code>delete</code>, <code>reconcile</code>. Underneath, seven tasks built it up in layers: a <code>JailRecord</code> with the naming and path derivation rules (jail names, dataset paths, epair names), a crash-safe state store that writes to a temp file and renames rather than risking a torn write, a per-jail <code>BackoffState</code> (starts at one second, doubles up to a five-minute cap, resets after sixty seconds of stable uptime), the provisioning path with automatic rollback on partial failure, and finally the public <code>reconcile()</code> that runs the whole desired-versus-observed diff for every jail in one pass, returning a list of per-jail failures so one broken jail never blocks the others from being reconciled.</p>
+        <p>This was also the milestone where the review discipline paid for itself most visibly. Three real bugs were caught, not by the first pass of tests, but by treating every review (per-task, then a final whole-branch pass on top) as a genuine adversarial check rather than a formality:</p>
+        <ul>
+          <li><code>delete()</code> assumed that tearing down a jail, its dataset, and its resource limits were all safe to call on something that was never actually created, matching how network detach already behaved. Only the network side turned out to be built that way; the others needed the same tolerance added explicitly, for the real case of deleting a jail that was applied but never got as far as being provisioned.</li>
+          <li>A test for crash-loop restart asserted that a jail would restart with zero elapsed time, but the backoff cooldown from the initial provisioning was, correctly, still armed at that instant. The bug was in the test's timing, not the reconciler.</li>
+          <li>The final whole-branch review caught a real one: a failed restart attempt never armed the backoff cooldown at all, because the code returned early on error before reaching the line that would have armed it. Successful restarts were protected; failing ones, exactly the crash-loop case backoff exists for, were not. Fixed with a regression test that injects a restart failure and proves the cooldown now engages.</li>
+        </ul>
+        <p>Milestone 4 finished at 71 tests, all passing, all still running without touching FreeBSD.</p>
+      </div>
+
+      <div class="milestone">
+        <h3>Milestone 5 <span class="badge">local HTTP API + keelctl</span></h3>
+        <p>The first milestone where <code>keel-agentd</code> actually runs: a binary that wires the real <code>ProcessJailRuntime</code>/<code>CliZfsManager</code>/<code>ProcessNetManager</code> implementations into a <code>Reconciler</code>, drives it on a 5-second timer, and serves <code>apply</code>/<code>get</code>/<code>delete</code> over a local HTTP API on a <code>0600</code> Unix socket, plus <code>keelctl</code>, the companion CLI. A single worker thread owns the <code>Reconciler</code> exclusively; the HTTP server and timer only ever reach it through a command channel, so apply/delete take effect immediately (reconciled before the caller's response) without introducing a second concurrent owner. Everything is still hand-rolled and dependency-light, in keeping with the rest of the project: a small HTTP/1.1 parser (<code>httparse</code>) over a blocking <code>UnixListener</code>, YAML wire bodies reusing the spec's existing <code>serde_yaml</code>, no async runtime.</p>
+        <p>Milestones 1-4 were tested entirely against fakes; Milestone 5's FreeBSD VM verification was the first time the whole stack ran against the real system end-to-end, and it promptly found two real bugs that no fake-backed test could have caught, both in code shipped since Milestone 2:</p>
+        <ul>
+          <li><code>keel-jail</code>'s <code>destroy</code> only ran <code>jail -r</code>, never reaping the process <code>start_command</code> had spawned into the jail. The kill left a zombie holding a reference into the jail's rootfs mount, so an immediately following dataset teardown failed with "device busy", exactly the sequence <code>Reconciler::delete</code> runs on every deletion of a jail with a running command. Fixed by tracking spawned children per jail name and blocking-waiting on only the destroyed jail's own children.</li>
+          <li>Independently, even with that fixed, <code>zfs destroy</code> could still fail with "dataset is busy" for a brief window after <code>jail -r</code> returns, a real kernel-level mount-release timing gap, reproducible from a plain shell with no Rust involved. Fixed with a short bounded retry, the same pattern already used for <code>clone_from_base</code>'s snapshot race.</li>
+        </ul>
+        <p>Milestone 5 finished at 96 tests on macOS, plus a clean 5-for-5 real apply → running → delete cycle against actual jails, ZFS clones, VNET networking, and <code>rctl</code> limits on the FreeBSD VM.</p>
+      </div>
+
+      <div class="milestone">
+        <h3>Milestone 6 <span class="badge">rc.d service + smoke test</span></h3>
+        <p>The milestone that turns <code>keel-agentd</code> from "a binary you run in a terminal" into a real FreeBSD system service, closing out sub-project 1. No new code was needed for daemonization itself: an <code>rc.d</code> script wraps the unchanged Milestone 5 binary with the base system's <code>daemon(8)</code> utility, using <code>-r</code> for restart-on-crash and <code>-S</code> to route its output to syslog. The only Rust changes were two <code>eprintln!</code> call sites (daemon startup, per-jail reconciliation failures), no logging framework, no <code>daemonize</code>/<code>signal-hook</code> dependency, no custom <code>SIGTERM</code> handler, since the existing "jails outlive the daemon" design already makes the default terminate-on-signal behavior correct. A committed smoke test script (<code>scripts/smoke-test.sh</code>) proves the whole lifecycle end-to-end: install, start, apply a real spec, kill <code>keel-agentd</code> directly to simulate a crash, confirm both the automatic restart and correct state recovery with no duplicate jail, stop the service and confirm the jail keeps running, clean teardown.</p>
+        <p>One design subtlety mattered before any code was written: <code>daemon(8)</code> takes two different pidfile flags, and combining <code>-r</code> with the wrong one (<code>-p</code>, the child's pid) means <code>service ... stop</code> kills the child directly while <code>daemon(8)</code> is still watching and immediately restarts it, the stop command would silently do nothing. Verified directly on the VM before committing to the design; the rc.d script uses <code>-P</code> (the supervisor's own pid) throughout.</p>
+        <p>Full VM verification surfaced two more real bugs, neither reachable by any fakes-backed test, since both are genuine OS/supervisor-interaction characteristics that only exist under a real <code>daemon(8)</code>-supervised run:</p>
+        <ul>
+          <li><code>keel-jail</code>'s <code>start_command</code> spawned the jailed process with Rust's default stdio inheritance, so a long-running jail held <code>keel-agentd</code>'s own stdout/stderr open. Under <code>daemon(8) -S</code>, those are the write end of a pipe <code>daemon(8)</code> reads to detect (via EOF) that <code>keel-agentd</code> itself died and needs restarting, an inherited pipe held open by the jailed workload meant <code>daemon(8)</code> silently never restarted a killed <code>keel-agentd</code> whenever any jail with a running command was active. Root-caused on the VM with <code>procstat -f</code>, showing the jailed process's fd 0/1/2 as a pipe shared with <code>daemon(8)</code>'s own relay pipe; fixed by giving the jailed process its own <code>/dev/null</code> stdio.</li>
+          <li>The smoke test's own "jails outlive the daemon" check was a permanent false negative: <code>jls</code>'s default columns never include the jail's name, only its dataset path, so <code>grep</code>-ing for the name-prefixed string could never match regardless of whether the jail was actually still running. Fixed with a direct <code>jls -j &lt;name&gt;</code> lookup instead.</li>
+        </ul>
+        <p>Milestone 6 finished at 97 tests on macOS (96 plus one new regression test pinned to the exact stdio-leak mechanism via <code>procstat</code>), plus two consecutive clean end-to-end smoke test runs on the FreeBSD VM.</p>
+      </div>
+
+      <div class="milestone">
+        <h3>Milestone 7 <span class="badge">keel-controlplane, the node registry</span></h3>
+        <p>The first milestone of sub-project 2 (the multi-node control plane), deliberately scoped to answer only "which nodes exist, and are they alive", no scheduling, no placement, no spec-forwarding, all of which stay separate future sub-projects. A new crate, <code>keel-controlplane</code>, follows the exact same shape <code>keel-agentd</code> already established: a single worker thread exclusively owns an in-memory <code>Registry</code>, reachable only through an <code>mpsc</code> command channel, fronted by the same hand-rolled <code>httparse</code>-based HTTP server <code>keel-agentd</code> uses for its local API, just over a <code>TcpListener</code> instead of a Unix socket, since nodes live on separate hosts. Three endpoints: register a node, heartbeat a node, list all nodes with their liveness computed on read (<code>Alive</code> within 15 seconds of the last heartbeat, <code>Dead</code> after) rather than tracked by a background sweep.</p>
+        <p><code>keel-agentd</code> gained three new, entirely optional CLI flags (<code>--node-id</code>, <code>--control-plane-addr</code>, <code>--advertise-addr</code>) and a <code>registration.rs</code> background thread: register once at startup, heartbeat every 5 seconds, and treat any heartbeat failure, a rejected/unknown node or a connection error, identically, by simply re-registering on the next tick. There is deliberately no persistence anywhere in this milestone and no backoff: a control plane that restarts forgets every node, and every node notices and re-registers within one heartbeat interval, the same self-healing-over-durability bet the reconciler already made in Milestone 4, just applied to cluster membership instead of jail state.</p>
+        <p>One constraint surfaced only once tests were being written, not before: the design assumed an in-process test could simulate "the control plane restarts" by dropping a <code>TcpListener</code> and rebinding a fresh one to the same address. Verified directly that this doesn't work, <code>std::net::TcpListener::bind</code> fails with "Address already in use" as long as the original socket is still alive and listening in another thread, regardless of <code>SO_REUSEADDR</code>. That specific behavior, the one genuinely OS-level part of this milestone, was verified for real instead, against three separate FreeBSD VMs: all three nodes registered and showed <code>Alive</code> within one heartbeat interval; killing <code>keel-agentd</code> on one node flipped only that node to <code>Dead</code> after the 15-second threshold, the other two unaffected; restarting <code>keel-controlplane</code> emptied the registry (<code>[]</code>), and both surviving nodes' own logs showed the expected <code>heartbeat failed: control plane returned status 404</code> → re-register cycle, landing back at all-<code>Alive</code> within about one heartbeat interval with neither node process ever restarted.</p>
+        <p>Milestone 7 finished at 122 tests on macOS (96 inherited, 26 new across <code>keel-controlplane</code>'s registry/worker/http layers and <code>keel-agentd</code>'s new CLI flags and registration client), zero warnings, final whole-branch review clean with no Critical or Important findings.</p>
+      </div>
+
+      <div class="milestone">
+        <h3>Roadmap <span class="badge">what's next</span></h3>
+        <p><strong>Sub-project 1: single-node jail reconciliation daemon - complete.</strong> Jail spec language, jail lifecycle + ZFS clone provisioning, VNET networking, the reconciliation core, the local HTTP API + CLI, and <code>rc.d</code> service integration with an end-to-end smoke test are all done.</p>
+        <p><strong>Sub-project 2: multi-node control plane - in progress.</strong> The node registry (register/heartbeat/list over TCP, self-healing membership) is done. Routing jail specs to a specific node through the control plane is not yet designed.</p>
+        <p><strong>Not yet designed</strong> (future sub-projects, each will get its own spec): a scheduler for bin-packing jails across nodes, cluster networking (cross-node overlay, service discovery/load balancing), storage orchestration beyond a single host's ZFS pool, and bhyve VM workloads alongside jails.</p>
+      </div>
+
+    </div>
+  </section>
+</main>
+<footer class="site-footer">
+  <div class="container">
+    <p>Keel is open source on <a href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub</a>.</p>
+  </div>
+</footer>
+</body>
+</html>
