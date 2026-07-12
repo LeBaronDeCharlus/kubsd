@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HTTP API Reference · Keel Docs</title>
+<link rel="icon" href="../assets/keel-logo.png">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container nav">
+    <a class="brand" href="../index.html"><img src="../assets/keel-logo.png" alt="Keel logo" class="brand-logo">Keel</a>
+    <nav class="nav-links">
+      <a href="../why.html">Why</a>
+      <div class="nav-dropdown">
+        <a href="index.html">Docs</a>
+        <div class="nav-dropdown-menu">
+          <a href="architecture.html">Architecture</a>
+          <a href="jailspec.html">JailSpec Reference</a>
+          <a href="cli.html">CLI Reference</a>
+          <a href="api.html">HTTP API Reference</a>
+        </div>
+      </div>
+      <a href="../quickstart.html">Quickstart</a>
+      <a href="../journey.html">Journey</a>
+      <a class="nav-github" href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+  <section class="page-header">
+    <div class="container">
+      <h1>HTTP API reference</h1>
+      <p class="lead">Both APIs speak YAML request/response bodies over HTTP/1.1, parsed with a small hand-rolled parser (<code>httparse</code>), no async runtime.</p>
+    </div>
+  </section>
+
+  <section id="agentd">
+    <div class="container">
+      <h2>keel-agentd (Unix socket)</h2>
+      <p>Default socket: <code>/var/run/keel-agentd.sock</code>.</p>
+      <table>
+        <thead><tr><th>Method &amp; path</th><th>Body</th><th>Success</th><th>Errors</th></tr></thead>
+        <tbody>
+          <tr><td><code>PUT /jails/&lt;name&gt;</code></td><td>JailSpec YAML; <code>metadata.name</code> must match <code>&lt;name&gt;</code></td><td>200, reconciled immediately before responding</td><td>400 invalid YAML or name/body mismatch, 409 attempted change to an immutable field</td></tr>
+          <tr><td><code>GET /jails</code></td><td>none</td><td>200, YAML list of every tracked jail</td><td>&mdash;</td></tr>
+          <tr><td><code>GET /jails/&lt;name&gt;</code></td><td>none</td><td>200, YAML for that jail</td><td>404 unknown jail</td></tr>
+          <tr><td><code>DELETE /jails/&lt;name&gt;</code></td><td>none</td><td>200, jail/dataset/network/limits torn down before responding</td><td>404 unknown jail</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="controlplane">
+    <div class="container">
+      <h2>keel-controlplane (TCP)</h2>
+      <p>Nodes live on separate hosts, so this API is served over a <code>TcpListener</code> instead of a Unix socket.</p>
+      <table>
+        <thead><tr><th>Method &amp; path</th><th>Body</th><th>Success</th><th>Errors</th></tr></thead>
+        <tbody>
+          <tr><td><code>POST /nodes/register</code></td><td>YAML: <code>id</code>, <code>addr</code></td><td>200, node registered or re-registered</td><td>400 invalid YAML</td></tr>
+          <tr><td><code>POST /nodes/&lt;id&gt;/heartbeat</code></td><td>none</td><td>200, node's last-seen time updated</td><td>404 unknown node (the node should re-register)</td></tr>
+          <tr><td><code>GET /nodes</code></td><td>none</td><td>200, YAML list of every node: <code>id</code>, <code>addr</code>, computed <code>status</code> (<code>Alive</code> within 15 seconds of the last heartbeat, otherwise <code>Dead</code>), and <code>last_seen_secs</code></td><td>&mdash;</td></tr>
+        </tbody>
+      </table>
+      <p>Liveness is computed on every read rather than tracked by a background sweep. There is no persistence: a control-plane restart forgets every node, and each node notices on its next heartbeat and re-registers automatically.</p>
+    </div>
+  </section>
+</main>
+<footer class="site-footer">
+  <div class="container">
+    <p>Keel is open source on <a href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub</a>.</p>
+  </div>
+</footer>
+</body>
+</html>
