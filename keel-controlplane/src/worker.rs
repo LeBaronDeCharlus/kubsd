@@ -1,4 +1,4 @@
-use crate::registry::{Registry, UnknownNode};
+use crate::registry::{Registry, ResolveError, UnknownNode};
 use crate::wire::NodeStatus;
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
@@ -8,6 +8,7 @@ pub enum Command {
     Register(String, String, Sender<()>),
     Heartbeat(String, Sender<Result<(), UnknownNode>>),
     List(Sender<Vec<NodeStatus>>),
+    Resolve(String, Sender<Result<String, ResolveError>>),
 }
 
 pub fn spawn(mut registry: Registry) -> (JoinHandle<()>, Sender<Command>) {
@@ -32,6 +33,10 @@ fn handle_command(registry: &mut Registry, command: Command) {
         }
         Command::List(reply) => {
             let _ = reply.send(registry.list(Instant::now()));
+        }
+        Command::Resolve(id, reply) => {
+            let result = registry.resolve(&id, Instant::now());
+            let _ = reply.send(result);
         }
     }
 }
@@ -84,5 +89,27 @@ mod tests {
         let (list_tx, list_rx) = mpsc::channel();
         commands.send(Command::List(list_tx)).unwrap();
         assert_eq!(list_rx.recv().unwrap(), vec![]);
+    }
+
+    #[test]
+    fn resolve_command_on_a_registered_alive_node_returns_its_address() {
+        let commands = spawn(Registry::new()).1;
+
+        let (reg_tx, reg_rx) = mpsc::channel();
+        commands.send(Command::Register("node-1".to_string(), "10.0.0.1".to_string(), reg_tx)).unwrap();
+        reg_rx.recv().unwrap();
+
+        let (resolve_tx, resolve_rx) = mpsc::channel();
+        commands.send(Command::Resolve("node-1".to_string(), resolve_tx)).unwrap();
+        assert_eq!(resolve_rx.recv().unwrap(), Ok("10.0.0.1".to_string()));
+    }
+
+    #[test]
+    fn resolve_command_on_an_unknown_node_returns_an_error() {
+        let commands = spawn(Registry::new()).1;
+
+        let (resolve_tx, resolve_rx) = mpsc::channel();
+        commands.send(Command::Resolve("missing".to_string(), resolve_tx)).unwrap();
+        assert!(resolve_rx.recv().unwrap().is_err());
     }
 }
