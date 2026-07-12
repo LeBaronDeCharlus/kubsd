@@ -3,6 +3,7 @@ use crate::wire::ErrorBody;
 use crate::worker::Command;
 use keel_spec::JailSpec;
 use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
@@ -15,6 +16,16 @@ pub fn run(listener: UnixListener, commands: Sender<Command>) {
         let commands = commands.clone();
         thread::spawn(move || {
             let _ = handle_connection(stream, &commands);
+        });
+    }
+}
+
+pub fn run_tcp(listener: TcpListener, commands: Sender<Command>) {
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { continue };
+        let commands = commands.clone();
+        thread::spawn(move || {
+            let _ = handle_connection_tcp(stream, &commands);
         });
     }
 }
@@ -32,6 +43,15 @@ fn handle_connection(mut stream: UnixStream, commands: &Sender<Command>) -> io::
     };
     let (status, body) = route(&request, commands);
     write_response(&mut stream, status, &body)
+}
+
+fn handle_connection_tcp(mut stream: TcpStream, commands: &Sender<Command>) -> io::Result<()> {
+    let request = match read_request_tcp(&mut stream)? {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+    let (status, body) = route(&request, commands);
+    write_response_tcp(&mut stream, status, &body)
 }
 
 fn read_request(stream: &mut UnixStream) -> io::Result<Option<ParsedRequest>> {
@@ -83,7 +103,67 @@ fn read_request(stream: &mut UnixStream) -> io::Result<Option<ParsedRequest>> {
     Ok(Some(ParsedRequest { method, path, body }))
 }
 
+fn read_request_tcp(stream: &mut TcpStream) -> io::Result<Option<ParsedRequest>> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+
+    let (method, path, header_len, content_length) = loop {
+        let mut headers = [httparse::EMPTY_HEADER; 16];
+        let mut req = httparse::Request::new(&mut headers);
+        match req.parse(&buf) {
+            Ok(httparse::Status::Complete(header_len)) => {
+                let content_length = req
+                    .headers
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|h| std::str::from_utf8(h.value).ok())
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let method = req.method.unwrap_or("").to_string();
+                let path = req.path.unwrap_or("").to_string();
+                break (method, path, header_len, content_length);
+            }
+            Ok(httparse::Status::Partial) => {
+                if buf.len() >= MAX_MESSAGE_BYTES {
+                    return Ok(None);
+                }
+                let n = stream.read(&mut chunk)?;
+                if n == 0 {
+                    return Ok(None);
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(_) => return Ok(None),
+        }
+    };
+
+    let total_len = header_len + content_length;
+    if total_len > MAX_MESSAGE_BYTES {
+        return Ok(None);
+    }
+    while buf.len() < total_len {
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let body = buf[header_len..total_len].to_vec();
+    Ok(Some(ParsedRequest { method, path, body }))
+}
+
 fn write_response(stream: &mut UnixStream, status: u16, body: &[u8]) -> io::Result<()> {
+    let header = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Length: {}\r\nContent-Type: application/yaml\r\nConnection: close\r\n\r\n",
+        reason_phrase(status),
+        body.len()
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
+}
+
+fn write_response_tcp(stream: &mut TcpStream, status: u16, body: &[u8]) -> io::Result<()> {
     let header = format!(
         "HTTP/1.1 {status} {}\r\nContent-Length: {}\r\nContent-Type: application/yaml\r\nConnection: close\r\n\r\n",
         reason_phrase(status),
@@ -349,5 +429,83 @@ mod tests {
             response.is_empty(),
             "server should close the connection without responding to an oversized request, got: {response:?}"
         );
+    }
+
+    fn start_tcp_test_server(name: &str) -> String {
+        let state_dir = std::env::temp_dir().join(format!("keel-agentd-http-tcp-test-state-{name}"));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        let zfs = FakeZfsManager::new();
+        zfs.seed_dataset("zroot/keel/base/14.2-web");
+        let reconciler = Reconciler::new(
+            FakeJailRuntime::new(),
+            zfs,
+            FakeNetManager::new(),
+            "zroot".to_string(),
+            state_dir,
+        )
+        .unwrap();
+        let (_worker_handle, commands) = worker::spawn(reconciler);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || run_tcp(listener, commands));
+        addr
+    }
+
+    fn send_request_tcp(addr: &str, method: &str, path: &str, body: &str) -> (u16, String) {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let request =
+            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        stream.write_all(request.as_bytes()).unwrap();
+        if let Err(e) = stream.shutdown(std::net::Shutdown::Write) {
+            assert_eq!(e.kind(), std::io::ErrorKind::NotConnected, "unexpected shutdown error: {e}");
+        }
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+
+        let mut headers = [httparse::EMPTY_HEADER; 16];
+        let mut parsed = httparse::Response::new(&mut headers);
+        let header_len = match parsed.parse(&response).unwrap() {
+            httparse::Status::Complete(len) => len,
+            httparse::Status::Partial => panic!("incomplete response: {response:?}"),
+        };
+        let status = parsed.code.unwrap();
+        let body = String::from_utf8(response[header_len..].to_vec()).unwrap();
+        (status, body)
+    }
+
+    #[test]
+    fn put_valid_spec_over_tcp_returns_200_and_provisions_the_jail() {
+        let addr = start_tcp_test_server("put_valid_spec_over_tcp_returns_200_and_provisions_the_jail");
+        let (status, _) = send_request_tcp(&addr, "PUT", "/jails/web-1", &sample_spec_yaml("web-1"));
+        assert_eq!(status, 200);
+
+        let (status, body) = send_request_tcp(&addr, "GET", "/jails/web-1", "");
+        assert_eq!(status, 200);
+        assert!(body.contains("running: true"), "expected running: true in body: {body}");
+    }
+
+    #[test]
+    fn get_jails_over_tcp_lists_all_applied_jails() {
+        let addr = start_tcp_test_server("get_jails_over_tcp_lists_all_applied_jails");
+        send_request_tcp(&addr, "PUT", "/jails/web-1", &sample_spec_yaml("web-1"));
+        send_request_tcp(&addr, "PUT", "/jails/web-2", &sample_spec_yaml("web-2"));
+
+        let (status, body) = send_request_tcp(&addr, "GET", "/jails", "");
+        assert_eq!(status, 200);
+        assert!(body.contains("web-1"));
+        assert!(body.contains("web-2"));
+    }
+
+    #[test]
+    fn delete_over_tcp_removes_a_provisioned_jail() {
+        let addr = start_tcp_test_server("delete_over_tcp_removes_a_provisioned_jail");
+        send_request_tcp(&addr, "PUT", "/jails/web-1", &sample_spec_yaml("web-1"));
+        let (status, _) = send_request_tcp(&addr, "DELETE", "/jails/web-1", "");
+        assert_eq!(status, 200);
+
+        let (status, _) = send_request_tcp(&addr, "GET", "/jails/web-1", "");
+        assert_eq!(status, 404, "deleted jail should no longer be found");
     }
 }
