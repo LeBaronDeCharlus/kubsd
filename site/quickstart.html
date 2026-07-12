@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quickstart · Keel</title>
+<link rel="icon" href="assets/keel-logo.png">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container nav">
+    <a class="brand" href="index.html"><img src="assets/keel-logo.png" alt="Keel logo" class="brand-logo">Keel</a>
+    <nav class="nav-links">
+      <a href="why.html">Why</a>
+      <div class="nav-dropdown">
+        <a href="docs/index.html">Docs</a>
+        <div class="nav-dropdown-menu">
+          <a href="docs/architecture.html">Architecture</a>
+          <a href="docs/jailspec.html">JailSpec Reference</a>
+          <a href="docs/cli.html">CLI Reference</a>
+          <a href="docs/api.html">HTTP API Reference</a>
+        </div>
+      </div>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="journey.html">Journey</a>
+      <a class="nav-github" href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+  <section class="page-header">
+    <div class="container">
+      <h1>Quickstart</h1>
+      <p class="lead">Build Keel from source and apply your first jail spec against a real FreeBSD host.</p>
+    </div>
+  </section>
+
+  <section id="prerequisites">
+    <div class="container">
+      <h2>Prerequisites</h2>
+      <ul>
+        <li>A FreeBSD 15.1 host or VM with jails, ZFS, and VNET already usable (a ZFS pool such as <code>zroot</code>, and <code>vnet</code>/<code>if_bridge</code>/<code>if_epair</code> kernel support).</li>
+        <li>Root access on that host (jail/ZFS/<code>rctl(8)</code> management requires it).</li>
+        <li>The Rust toolchain (<a href="https://rustup.rs" target="_blank" rel="noopener">rustup</a>) installed on the host, or cross-compiled binaries copied over.</li>
+        <li>A populated base dataset for at least one jail image, e.g. <code>zroot/keel/base/14.2-web</code>, containing a FreeBSD userland and your application.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="build">
+    <div class="container">
+      <h2>1. Clone and build</h2>
+      <pre>git clone https://github.com/lebarondecharlus/keel.git
+cd keel
+cargo build --release --workspace</pre>
+      <p>This produces <code>target/release/keel-agentd</code> and <code>target/release/keelctl</code>.</p>
+    </div>
+  </section>
+
+  <section id="spec">
+    <div class="container">
+      <h2>2. Write a jail spec</h2>
+      <p>Save the following as <code>jail.yaml</code>. This is the same example used in <code>keel-spec</code>'s own tests:</p>
+      <pre>apiVersion: keel/v1
+kind: Jail
+metadata:
+  name: web-1
+spec:
+  image: base/14.2-web
+  command: ["/usr/local/bin/myapp"]
+  network:
+    vnet: true
+    bridge: keel0
+    address: 10.0.0.5/24
+  resources:
+    cpu: "2"
+    memory: "512M"
+  restartPolicy: Always</pre>
+      <p><code>image</code> must match an existing base dataset: with the default <code>--pool zroot</code>, <code>image: base/14.2-web</code> resolves to <code>zroot/keel/base/14.2-web</code>.</p>
+    </div>
+  </section>
+
+  <section id="run">
+    <div class="container">
+      <h2>3. Run keel-agentd</h2>
+      <pre># as root
+./target/release/keel-agentd</pre>
+      <p>By default this reconciles against pool <code>zroot</code>, keeps its state under <code>/var/db/keel</code>, and serves its API on the Unix socket <code>/var/run/keel-agentd.sock</code>. Override any of these with <code>--pool</code>, <code>--state-dir</code>, or <code>--socket</code>.</p>
+    </div>
+  </section>
+
+  <section id="apply">
+    <div class="container">
+      <h2>4. Apply and inspect the jail</h2>
+      <pre># from another shell, as root
+./target/release/keelctl apply -f jail.yaml
+./target/release/keelctl get
+./target/release/keelctl get web-1</pre>
+      <p>Confirm it's really running:</p>
+      <pre>jls -j keel-web-1</pre>
+      <p>Keel prefixes every jail it manages with <code>keel-</code>, so the spec named <code>web-1</code> becomes the jail <code>keel-web-1</code>.</p>
+    </div>
+  </section>
+
+  <section id="cleanup">
+    <div class="container">
+      <h2>5. Clean up</h2>
+      <pre>./target/release/keelctl delete web-1</pre>
+    </div>
+  </section>
+
+  <section id="automated">
+    <div class="container">
+      <h2>The automated version</h2>
+      <p><code>scripts/smoke-test.sh</code> in the repository runs this entire lifecycle end-to-end against a real <code>rc.d</code>-managed <code>keel-agentd</code> service, including killing the daemon mid-flight to prove the automatic restart and state recovery both work, then a clean teardown. See that script and <a href="docs/architecture.html">Architecture</a> for how the pieces fit together.</p>
+    </div>
+  </section>
+</main>
+<footer class="site-footer">
+  <div class="container">
+    <p>Keel is open source on <a href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub</a>.</p>
+  </div>
+</footer>
+</body>
+</html>
