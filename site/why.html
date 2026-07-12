@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Why Keel · Keel</title>
+<link rel="icon" href="assets/keel-logo.png">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container nav">
+    <a class="brand" href="index.html"><img src="assets/keel-logo.png" alt="Keel logo" class="brand-logo">Keel</a>
+    <nav class="nav-links">
+      <a href="why.html">Why</a>
+      <div class="nav-dropdown">
+        <a href="docs/index.html">Docs</a>
+        <div class="nav-dropdown-menu">
+          <a href="docs/architecture.html">Architecture</a>
+          <a href="docs/jailspec.html">JailSpec Reference</a>
+          <a href="docs/cli.html">CLI Reference</a>
+          <a href="docs/api.html">HTTP API Reference</a>
+        </div>
+      </div>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="journey.html">Journey</a>
+      <a class="nav-github" href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+  <section class="page-header">
+    <div class="container">
+      <h1>Why Keel</h1>
+      <p class="lead">FreeBSD has the primitives. Keel is the piece that ties them together.</p>
+    </div>
+  </section>
+
+  <section id="motivation">
+    <div class="container">
+      <h2>Motivation</h2>
+      <p>FreeBSD has mature, battle-tested primitives for isolation and resource control: jails, ZFS snapshots/clones, <code>rctl(8)</code> resource limits, VNET per-jail networking. What it lacks is something that ties them together the way Kubernetes ties together Linux namespaces, cgroups, and overlay networking.</p>
+      <p>Existing FreeBSD jail tools (<code>bastille</code>, <code>ezjail</code>, <code>cbsd</code>, plain <code>jail.conf</code>) are good at <em>creating</em> jails, but none of them are <em>reconciliation-based</em>: none continuously watch a declarative spec and drive the live system to match it, restart what crashed, clean up what was removed, or survive their own restarts without losing track of what they manage. That gap, declarative, self-healing orchestration for FreeBSD, is what Keel is for.</p>
+    </div>
+  </section>
+
+  <section id="why-freebsd">
+    <div class="container">
+      <h2>Why FreeBSD</h2>
+      <p>Jails, ZFS, and VNET are not bolted-on features; they're core, long-lived parts of the base system. That means Keel can be a comparatively thin layer: most of what a container orchestrator normally has to build (copy-on-write filesystem layers, resource accounting, network namespace isolation) is already correct and well-tested at the OS level.</p>
+    </div>
+  </section>
+
+  <section id="vs-kubernetes">
+    <div class="container">
+      <h2>How this differs from Kubernetes</h2>
+      <p class="lead">Keel borrows Kubernetes' shape (declarative specs, a reconciliation loop, a CLI that will mirror <code>kubectl</code>) but it is not trying to be a drop-in replacement, and today it is far smaller in scope:</p>
+      <table class="vs-table">
+        <thead><tr><th></th><th>Kubernetes</th><th>Keel (current)</th></tr></thead>
+        <tbody>
+          <tr><td>Workload unit</td><td>Pod (Linux containers)</td><td>Jail</td></tr>
+          <tr><td>Isolation</td><td>namespaces + cgroups</td><td>jails + <code>rctl(8)</code></td></tr>
+          <tr><td>Filesystem</td><td>overlay/container images</td><td>ZFS clones of a base dataset</td></tr>
+          <tr><td>Networking</td><td>CNI, overlay networks, Services</td><td>VNET + <code>epair(4)</code> + <code>bridge(4)</code>, static IPs</td></tr>
+          <tr><td>Scope</td><td>multi-node cluster, scheduler</td><td>single node (kubelet-equivalent only)</td></tr>
+          <tr><td>Control plane</td><td>API server + etcd + scheduler</td><td>none yet, one local daemon per host</td></tr>
+        </tbody>
+      </table>
+      <p>In other words: what exists today is the FreeBSD analog of a <strong>kubelet</strong>, not a full cluster. There is no scheduler, no multi-node API server, and no cluster networking yet; see the <a href="journey.html">journey</a> for how the project got here and what's next.</p>
+    </div>
+  </section>
+
+  <section id="why-youd-use-it">
+    <div class="container">
+      <h2>Why you'd use it</h2>
+      <ul class="feature-list">
+        <li><strong>Declarative jails.</strong> Describe a jail (image, command, resources, network, restart policy) as a spec; apply it; the daemon makes reality match it, continuously, not a one-shot script.</li>
+        <li><strong>Self-healing.</strong> Crashed jails restart automatically per policy, with crash-loop backoff so a persistently broken jail doesn't spin forever.</li>
+        <li><strong>Safe by construction.</strong> The daemon only ever touches jails it created (name-prefixed and tracked in its own state), so it can share a host with other jails or tooling without stepping on them. State is crash-safe: killing the daemon or the whole VM never leaves it confused about what it manages.</li>
+        <li><strong>Fast provisioning.</strong> Jail root filesystems are ZFS clones of a base image, so creating a new jail is close to instant and cheap on disk.</li>
+      </ul>
+    </div>
+  </section>
+</main>
+<footer class="site-footer">
+  <div class="container">
+    <p>Keel is open source on <a href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub</a>.</p>
+  </div>
+</footer>
+</body>
+</html>
