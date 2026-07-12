@@ -1,3 +1,4 @@
+pub mod http;
 pub mod registry;
 pub mod wire;
 pub mod worker;
