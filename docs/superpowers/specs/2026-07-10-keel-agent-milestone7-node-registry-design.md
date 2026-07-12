@@ -54,11 +54,17 @@ over the network.
   (see Open Questions) recorded for future milestones' use, not something
   this milestone dials into or validates. `keel-agentd`'s own API stays
   Unix-socket-only; it gains no new network listener.
-- Crash-safe persistence of the registry (see Milestone 6's design spec
-  for the precedent this follows: self-healing over durability, applied
-  here to cluster membership instead of jail state). A control-plane
-  restart is expected to briefly forget every node; this is the accepted
-  behavior, not a bug to work around.
+- Crash-safe persistence of the registry. This is a deliberate departure
+  from the durability-first precedent set by Milestone 4's on-disk jail
+  state store, which exists precisely because losing track of a jail is
+  expensive (orphaned or duplicated jails on the next reconcile). Losing
+  registry membership is cheap by comparison: every node re-registers
+  within one `HEARTBEAT_INTERVAL` of the control plane forgetting it (the
+  self-healing membership described in Goals above), so the cost of
+  skipping persistence here is a few seconds of stale liveness data, not
+  silent resource leakage. A control-plane restart is expected to briefly
+  forget every node; this is the accepted behavior, not a bug to work
+  around.
 - Authentication/authorization between nodes and the control plane. Same
   trust model as the existing Unix-socket API's `0600` permission bit:
   same-network trust is assumed for this milestone; hardening this is
@@ -181,7 +187,8 @@ new flags, `--node-id node-4`/`node-5`, `--advertise-addr` their own IP,
   registration/idempotency), `heartbeat` on a known vs. unknown id,
   `list`'s Alive/Dead computation around the `DEAD_THRESHOLD` boundary.
   `http.rs` tests analogous to `keel-agentd`'s (real `TcpListener` bound
-  to an ephemeral `127.0.0.1:0` port, subprocess-level requests).
+  to an ephemeral `127.0.0.1:0` port, an in-process server thread hit
+  with real socket connections rather than direct function calls).
 - `keel-agentd`'s `registration.rs`: tested against a real, in-process
   `keel-controlplane` test server (the same `http::run` used in
   production, bound to an ephemeral port) — no FreeBSD or VM needed,
