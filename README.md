@@ -255,6 +255,56 @@ Milestone 6 finished at 97 tests on macOS (96 plus one new regression test
 pinned to the exact stdio-leak mechanism via `procstat`), plus two
 consecutive clean end-to-end smoke test runs on the FreeBSD VM.
 
+### Milestone 7: `keel-controlplane`, the node registry
+
+The first milestone of sub-project 2 (the multi-node control plane),
+deliberately scoped to answer only "which nodes exist, and are they
+alive" — no scheduling, no placement, no spec-forwarding, all of which
+stay separate future sub-projects. A new crate, `keel-controlplane`,
+follows the exact same shape `keel-agentd` already established: a single
+worker thread exclusively owns an in-memory `Registry`, reachable only
+through an `mpsc` command channel, fronted by the same hand-rolled
+`httparse`-based HTTP server `keel-agentd` uses for its local API — just
+over a `TcpListener` instead of a Unix socket, since nodes live on
+separate hosts. Three endpoints: register a node, heartbeat a node, list
+all nodes with their liveness computed on read (`Alive` within 15
+seconds of the last heartbeat, `Dead` after) rather than tracked by a
+background sweep.
+
+`keel-agentd` gained three new, entirely optional CLI flags
+(`--node-id`, `--control-plane-addr`, `--advertise-addr`) and a
+`registration.rs` background thread: register once at startup, heartbeat
+every 5 seconds, and treat *any* heartbeat failure — a rejected/unknown
+node or a connection error — identically, by simply re-registering on
+the next tick. There is deliberately no persistence anywhere in this
+milestone and no backoff: a control plane that restarts forgets every
+node, and every node notices and re-registers within one heartbeat
+interval, the same self-healing-over-durability bet the reconciler
+already made in Milestone 4, just applied to cluster membership instead
+of jail state.
+
+One constraint surfaced only once tests were being written, not before:
+the design assumed an in-process test could simulate "the control plane
+restarts" by dropping a `TcpListener` and rebinding a fresh one to the
+same address. Verified directly that this doesn't work —
+`std::net::TcpListener::bind` fails with "Address already in use" as
+long as the original socket is still alive and listening in another
+thread, regardless of `SO_REUSEADDR`. That specific behavior — the one
+genuinely OS-level part of this milestone — was verified for real
+instead, against three separate FreeBSD VMs: all three nodes registered
+and showed `Alive` within one heartbeat interval; killing `keel-agentd`
+on one node flipped only that node to `Dead` after the 15-second
+threshold, the other two unaffected; restarting `keel-controlplane`
+emptied the registry (`[]`), and both surviving nodes' own logs showed
+the expected `heartbeat failed: control plane returned status 404` →
+re-register cycle, landing back at all-`Alive` within about one
+heartbeat interval with neither node process ever restarted.
+
+Milestone 7 finished at 122 tests on macOS (96 inherited, 26 new across
+`keel-controlplane`'s registry/worker/http layers and `keel-agentd`'s new
+CLI flags and registration client), zero warnings, final whole-branch
+review clean with no Critical or Important findings.
+
 ## Roadmap
 
 **Sub-project 1: single-node jail reconciliation daemon — complete**
@@ -266,9 +316,13 @@ consecutive clean end-to-end smoke test runs on the FreeBSD VM.
 5. ~~Local HTTP API + CLI, wired to the real jail/ZFS/net implementations~~ done
 6. ~~`rc.d` service integration and an end-to-end smoke test on the FreeBSD VM~~ done
 
+**Sub-project 2: multi-node control plane — in progress**
+
+7. ~~Node registry: `keel-controlplane`, register/heartbeat/list over TCP, self-healing membership~~ done
+8. Routing jail specs to a specific node through the control plane (not yet designed)
+
 **Not yet designed** (future sub-projects, each will get its own spec):
 
-- Multi-node control plane (API server, cluster state store)
 - Scheduler (bin-packing jails across nodes)
 - Cluster networking (cross-node overlay, service discovery/load balancing)
 - Storage orchestration beyond a single host's ZFS pool
