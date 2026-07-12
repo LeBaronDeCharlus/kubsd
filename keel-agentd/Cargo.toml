@@ -8,6 +8,7 @@ keel-spec = { path = "../keel-spec" }
 keel-jail = { path = "../keel-jail" }
 keel-zfs = { path = "../keel-zfs" }
 keel-net = { path = "../keel-net" }
+keel-controlplane = { path = "../keel-controlplane" }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 thiserror = "1"
