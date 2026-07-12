@@ -1,9 +1,10 @@
 use crate::wire::{ErrorBody, NodeRegistration};
 use crate::worker::Command;
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
+use std::time::Duration;
 
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
@@ -109,6 +110,16 @@ fn route(request: &ParsedRequest, commands: &Sender<Command>) -> (u16, Vec<u8>) 
         ("POST", ["nodes", "register"]) => handle_register(&request.body, commands),
         ("POST", ["nodes", id, "heartbeat"]) => handle_heartbeat(id, commands),
         ("GET", ["nodes"]) => handle_list(commands),
+        ("PUT", ["nodes", id, "jails", name]) => {
+            handle_forward(id, "PUT", &format!("/jails/{name}"), &request.body, commands)
+        }
+        ("GET", ["nodes", id, "jails"]) => handle_forward(id, "GET", "/jails", &[], commands),
+        ("GET", ["nodes", id, "jails", name]) => {
+            handle_forward(id, "GET", &format!("/jails/{name}"), &[], commands)
+        }
+        ("DELETE", ["nodes", id, "jails", name]) => {
+            handle_forward(id, "DELETE", &format!("/jails/{name}"), &[], commands)
+        }
         _ => error_response(404, format!("no route for {} {}", request.method, request.path)),
     }
 }
@@ -149,6 +160,53 @@ fn handle_list(commands: &Sender<Command>) -> (u16, Vec<u8>) {
         Ok(statuses) => yaml_response(200, &statuses),
         Err(_) => error_response(500, "control plane worker did not respond".to_string()),
     }
+}
+
+const FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const FORWARD_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn handle_forward(id: &str, method: &str, path: &str, body: &[u8], commands: &Sender<Command>) -> (u16, Vec<u8>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::Resolve(id.to_string(), reply_tx)).is_err() {
+        return error_response(500, "control plane worker is not running".to_string());
+    }
+    let addr = match reply_rx.recv() {
+        Ok(Ok(addr)) => addr,
+        Ok(Err(e)) => return error_response(404, e.to_string()),
+        Err(_) => return error_response(500, "control plane worker did not respond".to_string()),
+    };
+    match forward(&addr, method, path, body) {
+        Ok((status, response_body)) => (status, response_body),
+        Err(e) => error_response(500, format!("failed to reach node '{id}' at {addr}: {e}")),
+    }
+}
+
+fn forward(addr: &str, method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
+    let socket_addr = addr
+        .to_socket_addrs()
+        .map_err(|e| e.to_string())?
+        .next()
+        .ok_or_else(|| "could not resolve address".to_string())?;
+    let mut stream =
+        TcpStream::connect_timeout(&socket_addr, FORWARD_CONNECT_TIMEOUT).map_err(|e| e.to_string())?;
+    stream.set_read_timeout(Some(FORWARD_READ_TIMEOUT)).ok();
+
+    let request = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n", body.len());
+    stream.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
+    stream.write_all(body).map_err(|e| e.to_string())?;
+    stream.shutdown(std::net::Shutdown::Write).ok();
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).map_err(|e| e.to_string())?;
+
+    let mut headers = [httparse::EMPTY_HEADER; 16];
+    let mut parsed = httparse::Response::new(&mut headers);
+    let header_len = match parsed.parse(&response).map_err(|e| e.to_string())? {
+        httparse::Status::Complete(len) => len,
+        httparse::Status::Partial => return Err("incomplete response".to_string()),
+    };
+    let status = parsed.code.ok_or_else(|| "missing status code".to_string())?;
+    Ok((status, response[header_len..].to_vec()))
 }
 
 fn error_response(status: u16, message: String) -> (u16, Vec<u8>) {
@@ -252,5 +310,78 @@ mod tests {
         let addr = start_test_server();
         let (status, _) = send_request(&addr, "POST", "/nodes/register", "not: valid: yaml: at: all: -");
         assert_eq!(status, 400);
+    }
+
+    fn start_fake_remote_agentd(status: u16, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nContent-Type: application/yaml\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        addr
+    }
+
+    fn register_node(cp_addr: &str, id: &str, node_addr: &str) {
+        send_request(cp_addr, "POST", "/nodes/register", &format!("id: {id}\naddr: {node_addr}\n"));
+    }
+
+    #[test]
+    fn forward_put_relays_status_and_body_from_the_target_node() {
+        let cp_addr = start_test_server();
+        let node_addr = start_fake_remote_agentd(200, "running: true\n");
+        register_node(&cp_addr, "node-1", &node_addr);
+
+        let (status, body) = send_request(&cp_addr, "PUT", "/nodes/node-1/jails/web-1", "apiVersion: keel/v1\n");
+        assert_eq!(status, 200);
+        assert!(body.contains("running: true"), "expected relayed body, got: {body}");
+    }
+
+    #[test]
+    fn forward_get_relays_status_and_body_from_the_target_node() {
+        let cp_addr = start_test_server();
+        let node_addr = start_fake_remote_agentd(200, "jails: fake-list\n");
+        register_node(&cp_addr, "node-1", &node_addr);
+
+        let (status, body) = send_request(&cp_addr, "GET", "/nodes/node-1/jails", "");
+        assert_eq!(status, 200);
+        assert!(body.contains("fake-list"), "expected relayed body, got: {body}");
+    }
+
+    #[test]
+    fn forward_delete_relays_status_from_the_target_node() {
+        let cp_addr = start_test_server();
+        let node_addr = start_fake_remote_agentd(200, "");
+        register_node(&cp_addr, "node-1", &node_addr);
+
+        let (status, _) = send_request(&cp_addr, "DELETE", "/nodes/node-1/jails/web-1", "");
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn forward_to_an_unknown_node_returns_404() {
+        let cp_addr = start_test_server();
+        let (status, body) = send_request(&cp_addr, "GET", "/nodes/missing/jails", "");
+        assert_eq!(status, 404);
+        assert!(body.contains("unknown node"), "expected 'unknown node' in body: {body}");
+    }
+
+    #[test]
+    fn forward_to_a_node_with_nothing_listening_returns_500() {
+        let cp_addr = start_test_server();
+        register_node(&cp_addr, "node-1", "127.0.0.1:1");
+
+        let (status, body) = send_request(&cp_addr, "GET", "/nodes/node-1/jails", "");
+        assert_eq!(status, 500);
+        assert!(body.contains("failed to reach node"), "expected forwarding failure in body: {body}");
     }
 }
