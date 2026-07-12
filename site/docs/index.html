@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Documentation · Keel</title>
+<link rel="icon" href="../assets/keel-logo.png">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container nav">
+    <a class="brand" href="../index.html"><img src="../assets/keel-logo.png" alt="Keel logo" class="brand-logo">Keel</a>
+    <nav class="nav-links">
+      <a href="../why.html">Why</a>
+      <div class="nav-dropdown">
+        <a href="index.html">Docs</a>
+        <div class="nav-dropdown-menu">
+          <a href="architecture.html">Architecture</a>
+          <a href="jailspec.html">JailSpec Reference</a>
+          <a href="cli.html">CLI Reference</a>
+          <a href="api.html">HTTP API Reference</a>
+        </div>
+      </div>
+      <a href="../quickstart.html">Quickstart</a>
+      <a href="../journey.html">Journey</a>
+      <a class="nav-github" href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+  <section class="page-header">
+    <div class="container">
+      <h1>Documentation</h1>
+      <p class="lead">Reference material for the JailSpec YAML format, the keelctl CLI, and the keel-agentd / keel-controlplane HTTP APIs, plus an overview of how the crates fit together.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="container">
+      <div class="link-card-grid">
+        <a class="link-card" href="architecture.html">
+          <h3>Architecture</h3>
+          <p>The crate map and how keel-agentd's Reconciler, keel-spec, keel-jail, keel-zfs, and keel-net compose, plus the single-worker-thread pattern shared with keel-controlplane.</p>
+        </a>
+        <a class="link-card" href="jailspec.html">
+          <h3>JailSpec reference</h3>
+          <p>Every field in the JailSpec YAML format: types, meaning, and which fields are immutable after the first apply.</p>
+        </a>
+        <a class="link-card" href="cli.html">
+          <h3>keelctl CLI reference</h3>
+          <p>apply, get, and delete: flags, example invocations, and example output.</p>
+        </a>
+        <a class="link-card" href="api.html">
+          <h3>HTTP API reference</h3>
+          <p>keel-agentd's Unix-socket API and keel-controlplane's TCP API: routes, request/response bodies, and error cases.</p>
+        </a>
+      </div>
+    </div>
+  </section>
+</main>
+<footer class="site-footer">
+  <div class="container">
+    <p>Keel is open source on <a href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub</a>.</p>
+  </div>
+</footer>
+</body>
+</html>
