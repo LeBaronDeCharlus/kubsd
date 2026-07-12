@@ -53,8 +53,8 @@ fn send_request(addr: &str, method: &str, path: &str, body: &str) -> Result<(), 
 
     let mut headers = [httparse::EMPTY_HEADER; 16];
     let mut parsed = httparse::Response::new(&mut headers);
-    let header_len = match parsed.parse(&response).map_err(|e| format!("malformed response: {e}"))? {
-        httparse::Status::Complete(len) => len,
+    match parsed.parse(&response).map_err(|e| format!("malformed response: {e}"))? {
+        httparse::Status::Complete(_) => {}
         httparse::Status::Partial => return Err("incomplete response from control plane".to_string()),
     };
     let status = parsed.code.unwrap_or(0);
