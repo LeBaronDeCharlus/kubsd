@@ -13,6 +13,9 @@ struct Config {
     pool: String,
     state_dir: PathBuf,
     socket: PathBuf,
+    node_id: Option<String>,
+    control_plane_addr: Option<String>,
+    advertise_addr: Option<String>,
 }
 
 impl Default for Config {
@@ -21,21 +24,34 @@ impl Default for Config {
             pool: "zroot".to_string(),
             state_dir: PathBuf::from("/var/db/keel"),
             socket: PathBuf::from("/var/run/keel-agentd.sock"),
+            node_id: None,
+            control_plane_addr: None,
+            advertise_addr: None,
         }
     }
 }
 
 fn parse_args() -> Config {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(args: impl Iterator<Item = String>) -> Config {
     let mut config = Config::default();
-    let mut args = std::env::args().skip(1);
+    let mut args = args;
     while let Some(flag) = args.next() {
         let value = args.next().unwrap_or_else(|| panic!("missing value for {flag}"));
         match flag.as_str() {
             "--pool" => config.pool = value,
             "--state-dir" => config.state_dir = PathBuf::from(value),
             "--socket" => config.socket = PathBuf::from(value),
+            "--node-id" => config.node_id = Some(value),
+            "--control-plane-addr" => config.control_plane_addr = Some(value),
+            "--advertise-addr" => config.advertise_addr = Some(value),
             other => panic!("unknown flag: {other}"),
         }
+    }
+    if config.control_plane_addr.is_some() && (config.node_id.is_none() || config.advertise_addr.is_none()) {
+        panic!("--node-id and --advertise-addr are required when --control-plane-addr is set");
     }
     config
 }
@@ -77,4 +93,48 @@ fn main() {
         .expect("failed to set socket permissions");
 
     keel_agentd::http::run(listener, commands);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(strs: &[&str]) -> impl Iterator<Item = String> {
+        strs.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
+    }
+
+    #[test]
+    fn defaults_have_no_control_plane_configuration() {
+        let config = parse_args_from(args(&["--pool", "zroot"]));
+        assert_eq!(config.node_id, None);
+        assert_eq!(config.control_plane_addr, None);
+        assert_eq!(config.advertise_addr, None);
+    }
+
+    #[test]
+    fn parses_all_three_new_flags() {
+        let config = parse_args_from(args(&[
+            "--node-id",
+            "node-2",
+            "--control-plane-addr",
+            "192.168.64.2:7620",
+            "--advertise-addr",
+            "192.168.64.2",
+        ]));
+        assert_eq!(config.node_id, Some("node-2".to_string()));
+        assert_eq!(config.control_plane_addr, Some("192.168.64.2:7620".to_string()));
+        assert_eq!(config.advertise_addr, Some("192.168.64.2".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "--node-id and --advertise-addr are required when --control-plane-addr is set")]
+    fn control_plane_addr_without_node_id_panics() {
+        parse_args_from(args(&["--control-plane-addr", "192.168.64.2:7620", "--advertise-addr", "192.168.64.2"]));
+    }
+
+    #[test]
+    #[should_panic(expected = "--node-id and --advertise-addr are required when --control-plane-addr is set")]
+    fn control_plane_addr_without_advertise_addr_panics() {
+        parse_args_from(args(&["--control-plane-addr", "192.168.64.2:7620", "--node-id", "node-2"]));
+    }
 }
