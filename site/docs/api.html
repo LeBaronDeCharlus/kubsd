@@ -44,7 +44,7 @@
         <thead><tr><th>Method &amp; path</th><th>Body</th><th>Success</th><th>Errors</th></tr></thead>
         <tbody>
           <tr><td><code>PUT /jails/&lt;name&gt;</code></td><td>JailSpec YAML; <code>metadata.name</code> must match <code>&lt;name&gt;</code></td><td>200, reconciled immediately before responding</td><td>400 invalid YAML or name/body mismatch, 409 attempted change to an immutable field</td></tr>
-          <tr><td><code>GET /jails</code></td><td>none</td><td>200, YAML list of every tracked jail</td><td>&mdash;</td></tr>
+          <tr><td><code>GET /jails</code></td><td>none</td><td>200, YAML list of every tracked jail</td><td>None</td></tr>
           <tr><td><code>GET /jails/&lt;name&gt;</code></td><td>none</td><td>200, YAML for that jail</td><td>404 unknown jail</td></tr>
           <tr><td><code>DELETE /jails/&lt;name&gt;</code></td><td>none</td><td>200, jail/dataset/network/limits torn down before responding</td><td>404 unknown jail</td></tr>
         </tbody>
@@ -61,7 +61,7 @@
         <tbody>
           <tr><td><code>POST /nodes/register</code></td><td>YAML: <code>id</code>, <code>addr</code></td><td>200, node registered or re-registered</td><td>400 invalid YAML</td></tr>
           <tr><td><code>POST /nodes/&lt;id&gt;/heartbeat</code></td><td>none</td><td>200, node's last-seen time updated</td><td>404 unknown node (the node should re-register)</td></tr>
-          <tr><td><code>GET /nodes</code></td><td>none</td><td>200, YAML list of every node: <code>id</code>, <code>addr</code>, computed <code>status</code> (<code>Alive</code> within 15 seconds of the last heartbeat, otherwise <code>Dead</code>), and <code>last_seen_secs</code></td><td>&mdash;</td></tr>
+          <tr><td><code>GET /nodes</code></td><td>none</td><td>200, YAML list of every node: <code>id</code>, <code>addr</code>, computed <code>status</code> (<code>Alive</code> within 15 seconds of the last heartbeat, otherwise <code>Dead</code>), and <code>last_seen_secs</code></td><td>None</td></tr>
         </tbody>
       </table>
       <p>Liveness is computed on every read rather than tracked by a background sweep. There is no persistence: a control-plane restart forgets every node, and each node notices on its next heartbeat and re-registers automatically.</p>
