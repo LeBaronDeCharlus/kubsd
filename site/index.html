@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keel · Declarative, self-healing orchestration for FreeBSD jails</title>
+<link rel="icon" href="assets/keel-logo.png">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container nav">
+    <a class="brand" href="index.html"><img src="assets/keel-logo.png" alt="Keel logo" class="brand-logo">Keel</a>
+    <nav class="nav-links">
+      <a href="why.html">Why</a>
+      <div class="nav-dropdown">
+        <a href="docs/index.html">Docs</a>
+        <div class="nav-dropdown-menu">
+          <a href="docs/architecture.html">Architecture</a>
+          <a href="docs/jailspec.html">JailSpec Reference</a>
+          <a href="docs/cli.html">CLI Reference</a>
+          <a href="docs/api.html">HTTP API Reference</a>
+        </div>
+      </div>
+      <a href="quickstart.html">Quickstart</a>
+      <a href="journey.html">Journey</a>
+      <a class="nav-github" href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+  <section class="hero">
+    <div class="container">
+      <img src="assets/keel-logo.png" alt="Keel logo" class="hero-logo">
+      <h1>Keel</h1>
+      <p class="tagline">Declarative, self-healing orchestration for FreeBSD jails.</p>
+      <div class="hero-ctas">
+        <a class="btn btn-primary" href="quickstart.html">Get started</a>
+        <a class="btn btn-secondary" href="docs/index.html">Read the docs</a>
+        <a class="btn btn-secondary" href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">View on GitHub</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="status">
+    <div class="container">
+      <div class="status-banner">
+        <strong>Sub-project 1</strong> (single-node jail reconciliation daemon) is complete.
+        <strong>Sub-project 2</strong> (multi-node control plane) is in progress: the node
+        registry is done, spec routing is not yet designed.
+        <a href="journey.html">See the full journey &rarr;</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="features">
+    <div class="container">
+      <h2>Why you'd use it</h2>
+      <p class="lead">Keel ties FreeBSD's own isolation and resource-control primitives together the way Kubernetes ties together Linux namespaces, cgroups, and overlay networking.</p>
+      <div class="card-grid">
+        <div class="card">
+          <h3>Declarative jails</h3>
+          <p>Describe a jail (image, command, resources, network, restart policy) as a spec; apply it; the daemon makes reality match it, continuously, not a one-shot script.</p>
+        </div>
+        <div class="card">
+          <h3>Self-healing</h3>
+          <p>Crashed jails restart automatically per policy, with crash-loop backoff so a persistently broken jail doesn't spin forever.</p>
+        </div>
+        <div class="card">
+          <h3>Safe by construction</h3>
+          <p>The daemon only ever touches jails it created (name-prefixed and tracked in its own state), so it can share a host with other jails or tooling without stepping on them.</p>
+        </div>
+        <div class="card">
+          <h3>Fast provisioning</h3>
+          <p>Jail root filesystems are ZFS clones of a base image, so creating a new jail is close to instant and cheap on disk.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="comparison">
+    <div class="container">
+      <h2>How this differs from Kubernetes</h2>
+      <p class="lead">Keel borrows Kubernetes' shape, not its scope. Today it's the FreeBSD analog of a kubelet, not a full cluster.</p>
+      <table class="vs-table">
+        <thead><tr><th></th><th>Kubernetes</th><th>Keel (current)</th></tr></thead>
+        <tbody>
+          <tr><td>Workload unit</td><td>Pod (Linux containers)</td><td>Jail</td></tr>
+          <tr><td>Filesystem</td><td>overlay/container images</td><td>ZFS clones of a base dataset</td></tr>
+          <tr><td>Scope</td><td>multi-node cluster, scheduler</td><td>single node (kubelet-equivalent only)</td></tr>
+        </tbody>
+      </table>
+      <p><a href="why.html#vs-kubernetes">Read the full comparison &rarr;</a></p>
+    </div>
+  </section>
+</main>
+<footer class="site-footer">
+  <div class="container">
+    <p>Keel is open source on <a href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub</a>.</p>
+  </div>
+</footer>
+</body>
+</html>
