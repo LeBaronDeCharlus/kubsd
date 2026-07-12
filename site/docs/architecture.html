@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture · Keel Docs</title>
+<link rel="icon" href="../assets/keel-logo.png">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container nav">
+    <a class="brand" href="../index.html"><img src="../assets/keel-logo.png" alt="Keel logo" class="brand-logo">Keel</a>
+    <nav class="nav-links">
+      <a href="../why.html">Why</a>
+      <div class="nav-dropdown">
+        <a href="index.html">Docs</a>
+        <div class="nav-dropdown-menu">
+          <a href="architecture.html">Architecture</a>
+          <a href="jailspec.html">JailSpec Reference</a>
+          <a href="cli.html">CLI Reference</a>
+          <a href="api.html">HTTP API Reference</a>
+        </div>
+      </div>
+      <a href="../quickstart.html">Quickstart</a>
+      <a href="../journey.html">Journey</a>
+      <a class="nav-github" href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+  <section class="page-header">
+    <div class="container">
+      <h1>Architecture</h1>
+      <p class="lead">How Keel's crates fit together, today.</p>
+    </div>
+  </section>
+
+  <section id="crates">
+    <div class="container">
+      <h2>Crate map</h2>
+      <table>
+        <thead><tr><th>Crate</th><th>Responsibility</th></tr></thead>
+        <tbody>
+          <tr><td><code>keel-spec</code></td><td>The <code>JailSpec</code> YAML schema, parsing, and validation. No FreeBSD dependency; runs on any OS.</td></tr>
+          <tr><td><code>keel-jail</code></td><td>The <code>JailRuntime</code> trait: create/start/stop/destroy a jail, check if it's running. A fake in-memory implementation plus a real one that shells out to <code>jail(8)</code>, <code>jexec(8)</code>, and <code>rctl(8)</code>.</td></tr>
+          <tr><td><code>keel-zfs</code></td><td>The <code>ZfsManager</code> trait: clone a jail's root filesystem from a base dataset, destroy it again. Fake plus a real implementation over <code>zfs(8)</code>.</td></tr>
+          <tr><td><code>keel-net</code></td><td>The <code>NetManager</code> trait: create a bridge, attach a jail to it over an <code>epair(4)</code> pair with a static address, tear it down. Fake plus a real implementation over FreeBSD networking commands.</td></tr>
+          <tr><td><code>keel-agentd</code></td><td>The reconciliation daemon: a generic <code>Reconciler&lt;J, Z, N&gt;</code> over the three traits above, a crash-safe on-disk state store, crash-loop backoff, and a local HTTP API over a Unix socket.</td></tr>
+          <tr><td><code>keelctl</code></td><td>The CLI: <code>apply</code>, <code>get</code>, <code>delete</code>, talking to <code>keel-agentd</code>'s Unix socket.</td></tr>
+          <tr><td><code>keel-controlplane</code></td><td>The node registry: register/heartbeat/list nodes over TCP, with liveness computed on read rather than tracked by a background sweep.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="trait-pattern">
+    <div class="container">
+      <h2>The trait + fake + real pattern</h2>
+      <p>Every FreeBSD-facing crate follows the same shape: a trait describing what the crate does (<code>JailRuntime</code>, <code>ZfsManager</code>, <code>NetManager</code>), an in-memory <code>Fake</code> implementation for fast tests on any machine, and a real implementation that shells out to the corresponding FreeBSD command. <code>keel-agentd</code>'s <code>Reconciler&lt;J, Z, N&gt;</code> is generic over all three, so the exact same reconciliation logic runs against <code>Fake*</code> implementations in CI and against <code>Process*</code>/<code>Cli*</code> implementations on a real host.</p>
+    </div>
+  </section>
+
+  <section id="reconciliation-flow">
+    <div class="container">
+      <h2>Reconciliation flow</h2>
+      <p><code>Reconciler</code>'s public API is small on purpose: <code>new</code>, <code>apply</code>, <code>delete</code>, <code>reconcile</code>. <code>apply</code> and <code>delete</code> update the desired state immediately (a caller's request is reconciled before the HTTP response returns); <code>reconcile</code> runs on a 5-second timer and diffs desired versus observed state for every jail in one pass, provisioning what's missing, restarting what crashed (with per-jail backoff starting at one second, doubling to a five-minute cap, and resetting after sixty seconds of stable uptime), and cleaning up what was removed. A failure reconciling one jail is returned in a per-jail failure list rather than aborting the whole pass, so one broken jail never blocks the others.</p>
+    </div>
+  </section>
+
+  <section id="worker-thread">
+    <div class="container">
+      <h2>Single-worker-thread ownership</h2>
+      <p>Both <code>keel-agentd</code> and <code>keel-controlplane</code> use the same concurrency pattern: a single worker thread exclusively owns the mutable state (the <code>Reconciler</code> in one case, an in-memory <code>Registry</code> in the other), reachable only through an <code>mpsc</code> command channel. The HTTP server (a small hand-rolled parser over <code>httparse</code>, no async runtime) and, for <code>keel-agentd</code>, the reconciliation timer, only ever reach that state through the channel, so there is never a second concurrent owner to synchronize against.</p>
+    </div>
+  </section>
+</main>
+<footer class="site-footer">
+  <div class="container">
+    <p>Keel is open source on <a href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub</a>.</p>
+  </div>
+</footer>
+</body>
+</html>
