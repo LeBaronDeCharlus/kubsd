@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JailSpec Reference · Keel Docs</title>
+<link rel="icon" href="../assets/keel-logo.png">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container nav">
+    <a class="brand" href="../index.html"><img src="../assets/keel-logo.png" alt="Keel logo" class="brand-logo">Keel</a>
+    <nav class="nav-links">
+      <a href="../why.html">Why</a>
+      <div class="nav-dropdown">
+        <a href="index.html">Docs</a>
+        <div class="nav-dropdown-menu">
+          <a href="architecture.html">Architecture</a>
+          <a href="jailspec.html">JailSpec Reference</a>
+          <a href="cli.html">CLI Reference</a>
+          <a href="api.html">HTTP API Reference</a>
+        </div>
+      </div>
+      <a href="../quickstart.html">Quickstart</a>
+      <a href="../journey.html">Journey</a>
+      <a class="nav-github" href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+  <section class="page-header">
+    <div class="container">
+      <h1>JailSpec reference</h1>
+      <p class="lead">The YAML schema for a Keel jail, defined in <code>keel-spec</code>.</p>
+    </div>
+  </section>
+
+  <section id="example">
+    <div class="container">
+      <h2>Example</h2>
+      <pre>apiVersion: keel/v1
+kind: Jail
+metadata:
+  name: web-1
+spec:
+  image: base/14.2-web
+  command: ["/usr/local/bin/myapp"]
+  network:
+    vnet: true
+    bridge: keel0
+    address: 10.0.0.5/24
+  resources:
+    cpu: "2"
+    memory: "512M"
+  restartPolicy: Always</pre>
+    </div>
+  </section>
+
+  <section id="fields">
+    <div class="container">
+      <h2>Fields</h2>
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>apiVersion</code></td><td>string</td><td>Schema version, currently always <code>keel/v1</code>.</td></tr>
+          <tr><td><code>kind</code></td><td>string</td><td>Resource kind, currently always <code>Jail</code>.</td></tr>
+          <tr><td><code>metadata.name</code></td><td>string</td><td>The jail's spec name. Must pass Keel's name validation. Immutable: it identifies the jail for its whole lifetime; changing it means applying a new jail, not renaming this one. The real FreeBSD jail is named <code>keel-&lt;name&gt;</code>.</td></tr>
+          <tr><td><code>spec.image</code></td><td>string</td><td>Which base ZFS dataset to clone the jail's root filesystem from. With the default pool <code>zroot</code>, <code>image: base/14.2-web</code> resolves to the dataset <code>zroot/keel/base/14.2-web</code>, which must already exist and be populated. Immutable after first apply; changing it means destroying and recreating the jail.</td></tr>
+          <tr><td><code>spec.command</code></td><td>list of strings</td><td>The command (and its arguments) to run inside the jail.</td></tr>
+          <tr><td><code>spec.network.vnet</code></td><td>boolean</td><td>Whether the jail gets its own VNET network stack. VNET-enabled jails are created differently from the start, so this cannot be changed after first apply.</td></tr>
+          <tr><td><code>spec.network.bridge</code></td><td>string</td><td>The <code>bridge(4)</code> interface the jail's <code>epair(4)</code> pair attaches to.</td></tr>
+          <tr><td><code>spec.network.address</code></td><td>string (CIDR)</td><td>The static address assigned to the jail's side of the <code>epair(4)</code> pair, e.g. <code>10.0.0.5/24</code>. Validated as a CIDR address.</td></tr>
+          <tr><td><code>spec.resources.cpu</code></td><td>string</td><td>CPU limit, parsed into an <code>rctl(8)</code> <code>pcpu</code> percentage (e.g. <code>"2"</code> means 2 cores' worth).</td></tr>
+          <tr><td><code>spec.resources.memory</code></td><td>string</td><td>Memory limit, parsed into bytes for <code>rctl(8)</code> (e.g. <code>"512M"</code>).</td></tr>
+          <tr><td><code>spec.restartPolicy</code></td><td><code>Always</code> | <code>OnFailure</code> | <code>Never</code></td><td>Whether the reconciler restarts the jail's command after it exits, and under what conditions.</td></tr>
+        </tbody>
+      </table>
+      <p>Fields not listed as immutable above can change on a re-apply of the same <code>metadata.name</code>; the reconciler diffs the new spec against the running jail's state and reconciles the difference.</p>
+    </div>
+  </section>
+</main>
+<footer class="site-footer">
+  <div class="container">
+    <p>Keel is open source on <a href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub</a>.</p>
+  </div>
+</footer>
+</body>
+</html>
