@@ -75,6 +75,15 @@ fn main() {
         config.socket.display()
     );
 
+    if let (Some(node_id), Some(control_plane_addr), Some(advertise_addr)) =
+        (config.node_id.clone(), config.control_plane_addr.clone(), config.advertise_addr.clone())
+    {
+        eprintln!(
+            "keel-agentd: registering with control plane at {control_plane_addr} as node '{node_id}' ({advertise_addr})"
+        );
+        keel_agentd::registration::spawn(node_id, advertise_addr, control_plane_addr, Duration::from_secs(5));
+    }
+
     let (_worker_handle, commands) = worker::spawn(reconciler);
 
     let timer_commands = commands.clone();
