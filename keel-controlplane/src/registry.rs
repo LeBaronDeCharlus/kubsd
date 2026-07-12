@@ -19,6 +19,14 @@ pub struct Registry {
 #[error("unknown node '{0}'")]
 pub struct UnknownNode(pub String);
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ResolveError {
+    #[error("unknown node '{0}'")]
+    Unknown(String),
+    #[error("node '{id}' is dead (last seen {last_seen_secs}s ago)")]
+    Dead { id: String, last_seen_secs: u64 },
+}
+
 impl Registry {
     pub fn new() -> Self {
         Self::default()
@@ -54,6 +62,15 @@ impl Registry {
             .collect();
         statuses.sort_by(|a, b| a.id.cmp(&b.id));
         statuses
+    }
+
+    pub fn resolve(&self, id: &str, now: Instant) -> Result<String, ResolveError> {
+        let record = self.nodes.get(id).ok_or_else(|| ResolveError::Unknown(id.to_string()))?;
+        let elapsed = now.saturating_duration_since(record.last_heartbeat);
+        if elapsed >= DEAD_THRESHOLD {
+            return Err(ResolveError::Dead { id: id.to_string(), last_seen_secs: elapsed.as_secs() });
+        }
+        Ok(record.addr.clone())
     }
 }
 
@@ -139,5 +156,34 @@ mod tests {
     fn list_on_an_empty_registry_is_empty() {
         let registry = Registry::new();
         assert_eq!(registry.list(Instant::now()), vec![]);
+    }
+
+    #[test]
+    fn resolve_on_an_unknown_node_returns_unknown_error() {
+        let registry = Registry::new();
+        let err = registry.resolve("missing", Instant::now()).unwrap_err();
+        assert_eq!(err, ResolveError::Unknown("missing".to_string()));
+    }
+
+    #[test]
+    fn resolve_on_an_alive_node_returns_its_address() {
+        let mut registry = Registry::new();
+        let now = Instant::now();
+        registry.register("node-1".to_string(), "10.0.0.1".to_string(), now);
+        assert_eq!(registry.resolve("node-1", now), Ok("10.0.0.1".to_string()));
+    }
+
+    #[test]
+    fn resolve_on_a_dead_node_returns_dead_error_with_elapsed_seconds() {
+        let mut registry = Registry::new();
+        let t0 = Instant::now();
+        registry.register("node-1".to_string(), "10.0.0.1".to_string(), t0);
+
+        let at_threshold = t0 + DEAD_THRESHOLD;
+        let err = registry.resolve("node-1", at_threshold).unwrap_err();
+        assert_eq!(
+            err,
+            ResolveError::Dead { id: "node-1".to_string(), last_seen_secs: DEAD_THRESHOLD.as_secs() }
+        );
     }
 }
