@@ -76,7 +76,29 @@ impl JailRuntime for ProcessJailRuntime {
     }
 
     fn destroy(&self, name: &str) -> Result<(), JailError> {
-        Self::run_checked("jail", &["-r", name])?;
+        let output = Self::run("jail", &["-r", name])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // `jail -r` on a jail that doesn't exist prints
+            // `jail: "<name>" not found` and exits 1 — the same condition
+            // `Reconciler::delete` already tolerates from `FakeJailRuntime`
+            // (which returns `NotFound` directly), for the real case of
+            // deleting a record that was applied but never got as far as
+            // being provisioned. Matching this specific stderr text (the
+            // same idiom `remove_resource_limits` below already uses for
+            // `rctl`'s "No such process") is what actually makes that
+            // tolerance engage against the real jail runtime; without it,
+            // this case surfaced as a plain `CommandFailed` instead,
+            // reproduced end-to-end during Milestone 8 VM verification.
+            if stderr.contains("not found") {
+                return Err(JailError::NotFound(name.to_string()));
+            }
+            return Err(JailError::CommandFailed(
+                format!("jail -r {name}"),
+                output.status,
+                stderr.into_owned(),
+            ));
+        }
         // `jail -r` kills every process in the jail and blocks until
         // removal completes, but the kernel doesn't fully release a killed
         // child until its parent (us, since `start_command` spawned it via

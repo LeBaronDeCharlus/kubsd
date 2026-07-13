@@ -101,6 +101,27 @@ fn remove_resource_limits_on_jail_with_no_limits_set_is_a_no_op_success() {
 }
 
 #[test]
+fn destroy_on_a_never_created_jail_returns_not_found() {
+    // Reproduces a real bug found during Milestone 8 VM verification:
+    // `destroy` always mapped a failing `jail -r` to `JailError::
+    // CommandFailed`, never `JailError::NotFound`, so `Reconciler::
+    // delete`'s documented tolerance for "a record that was applied but
+    // never got as far as being provisioned" (added in Milestone 4) never
+    // actually engaged against the real jail runtime, only against
+    // `FakeJailRuntime`'s test double, whose `destroy` already returns
+    // `NotFound` directly.
+    let runtime = ProcessJailRuntime::new();
+    let name = "keel-test-destroy-never-created";
+
+    let _ = runtime.destroy(name);
+
+    match runtime.destroy(name) {
+        Err(keel_jail::JailError::NotFound(n)) => assert_eq!(n, name),
+        other => panic!("expected NotFound for a jail that was never created, got: {other:?}"),
+    }
+}
+
+#[test]
 fn jail_exists_distinguishes_created_from_never_existed() {
     let runtime = ProcessJailRuntime::new();
     let name = "keel-test-jail-exists";
