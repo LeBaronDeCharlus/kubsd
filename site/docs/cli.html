@@ -43,7 +43,7 @@
         <thead><tr><th>Flag</th><th>Default</th><th>Meaning</th></tr></thead>
         <tbody>
           <tr><td><code>--socket PATH</code></td><td><code>/var/run/keel-agentd.sock</code></td><td>Path to the keel-agentd Unix socket to talk to. Ignored if <code>--control-plane-addr</code> is given.</td></tr>
-          <tr><td><code>--control-plane-addr ADDR</code></td><td>none</td><td>Address of a keel-controlplane to route through instead of a local socket. Alone, the control plane schedules the request onto whichever node has the fewest jails; combined with <code>--node</code>, it routes to that exact node instead.</td></tr>
+          <tr><td><code>--control-plane-addr ADDR</code></td><td>none</td><td>Address of a keel-controlplane to route through instead of a local socket. Alone, the control plane schedules the request onto whichever alive node has the most CPU/memory headroom; combined with <code>--node</code>, it routes to that exact node instead.</td></tr>
           <tr><td><code>--node ID</code></td><td>none</td><td>Pins the request to a specific node's keel-agentd instead of letting the control plane schedule it. Requires <code>--control-plane-addr</code>.</td></tr>
         </tbody>
       </table>

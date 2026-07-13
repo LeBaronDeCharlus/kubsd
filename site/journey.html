@@ -116,11 +116,18 @@
       </div>
 
       <div class="milestone">
+        <h3>Milestone 10 <span class="badge">resource-aware bin-packing</span></h3>
+        <p>The second milestone of sub-project 3: the scheduler introduced in Milestone 9 picked a node by jail count alone; this milestone teaches it to consider actual CPU and memory instead. <code>keel-agentd</code> detects its own capacity once at startup via <code>sysctl -n hw.ncpu</code>/<code>sysctl -n hw.physmem</code> (the same shell-out idiom already used for <code>jail(8)</code>/<code>zfs(8)</code>), reports it once at registration, and reports its currently committed load, the sum of <code>spec.resources.{cpu,memory}</code> across every jail its own <code>Reconciler</code> tracks, on every heartbeat. <code>keel-controlplane</code>'s <code>scheduler::pick_node</code> now ranks <code>Alive</code> nodes by <code>min(free_cpu/capacity_cpu, free_memory/capacity_memory)</code>, the fraction of headroom in whichever resource is most constrained, rather than by jail count, while remaining completely opaque to <code>JailSpec</code> bodies: it never learns a node's numbers by parsing a spec, only by the node self-reporting its own aggregate totals.</p>
+        <p>This is a ranking heuristic, not admission control: the scheduler never sees an incoming jail's own resource request, since that would require deserializing the spec, which stays off-limits, so it can't guarantee a chosen node actually has room. A node that turns out unable to fit a jail simply fails that apply normally, the same honest limitation Milestone 9's count-based version already had.</p>
+        <p>Milestone 10 finished at 171 tests on macOS (161 inherited, 10 new across <code>keel-agentd</code>'s new <code>capacity</code> module and <code>Reconciler::committed_resources</code>, and <code>keel-controlplane</code>'s wire, registry, scheduler, worker, and http layers), final whole-branch review clean, and full VM verification across three real nodes: detected capacity matched direct <code>sysctl</code> queries exactly; a large jail committing most of one node's capacity landed there first (both nodes tied at registration), and a second, smaller jail then correctly landed on the other node, the one with more headroom fraction rather than fewer jails; sticky re-apply and named-node routing stayed completely unaffected throughout.</p>
+      </div>
+
+      <div class="milestone">
         <h3>Roadmap <span class="badge">what's next</span></h3>
         <p><strong>Sub-project 1: single-node jail reconciliation daemon: complete.</strong> Jail spec language, jail lifecycle + ZFS clone provisioning, VNET networking, the reconciliation core, the local HTTP API + CLI, and <code>rc.d</code> service integration with an end-to-end smoke test are all done.</p>
         <p><strong>Sub-project 2: multi-node control plane: complete.</strong> The node registry (register/heartbeat/list over TCP, self-healing membership) and routing jail specs to a specific node through the control plane are both done.</p>
-        <p><strong>Sub-project 3: scheduling and cluster growth: in progress.</strong> A count-based scheduler for automatic node placement is done.</p>
-        <p><strong>Not yet designed</strong> (future sub-projects, each will get its own spec): resource-aware bin-packing (CPU/memory-based placement, once nodes report capacity), cluster networking (cross-node overlay, service discovery/load balancing), storage orchestration beyond a single host's ZFS pool, and bhyve VM workloads alongside jails.</p>
+        <p><strong>Sub-project 3: scheduling and cluster growth: in progress.</strong> Automatic node placement and resource-aware bin-packing (CPU/memory headroom, not just jail count) are both done.</p>
+        <p><strong>Not yet designed</strong> (future sub-projects, each will get its own spec): cluster networking (cross-node overlay, service discovery/load balancing), storage orchestration beyond a single host's ZFS pool, and bhyve VM workloads alongside jails.</p>
       </div>
 
     </div>

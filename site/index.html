@@ -48,8 +48,8 @@
         <strong>Sub-project 1</strong> (single-node jail reconciliation daemon) is complete.
         <strong>Sub-project 2</strong> (multi-node control plane) is complete: the node
         registry and routing a spec to a specific node are both done.
-        <strong>Sub-project 3</strong> is in progress: a count-based scheduler for
-        automatic node placement is done; resource-aware bin-packing is not yet designed.
+        <strong>Sub-project 3</strong> is in progress: automatic node placement and
+        resource-aware bin-packing (CPU/memory headroom, not just jail count) are both done.
         <a href="journey.html">See the full journey &rarr;</a>
       </div>
     </div>
@@ -89,7 +89,7 @@
         <tbody>
           <tr><td>Workload unit</td><td>Pod (Linux containers)</td><td>Jail</td></tr>
           <tr><td>Filesystem</td><td>overlay/container images</td><td>ZFS clones of a base dataset</td></tr>
-          <tr><td>Scope</td><td>multi-node cluster, resource-aware scheduler</td><td>multi-node, count-based scheduler</td></tr>
+          <tr><td>Scope</td><td>multi-node cluster, resource-aware scheduler</td><td>multi-node, resource-aware scheduler (heuristic)</td></tr>
         </tbody>
       </table>
       <p><a href="why.html#vs-kubernetes">Read the full comparison &rarr;</a></p>

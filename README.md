@@ -54,13 +54,13 @@ drop-in replacement, and today it is far smaller in scope:
 | Isolation | namespaces + cgroups | jails + `rctl(8)` |
 | Filesystem | overlay/container images | ZFS clones of a base dataset |
 | Networking | CNI, overlay networks, Services | VNET + `epair(4)` + `bridge(4)`, static IPs |
-| Scope | multi-node cluster, resource-aware scheduler | multi-node, count-based scheduler (no resource awareness yet) |
-| Control plane | API server + etcd + scheduler | node registry + count-based scheduler + spec routing |
+| Scope | multi-node cluster, resource-aware scheduler | multi-node, resource-aware scheduler (heuristic, no admission guarantee) |
+| Control plane | API server + etcd + scheduler | node registry + resource-aware scheduler + spec routing |
 
 In other words: what exists today spans a **kubelet** plus a thin
-multi-node control plane with a basic scheduler (count-based placement,
-node registry, routing a spec to a node either automatically or by name),
-not a full cluster. There is no resource-aware bin-packing or cluster
+multi-node control plane with a resource-aware scheduler (headroom-based
+placement by CPU/memory, node registry, routing a spec to a node either
+automatically or by name), not a full cluster. There is no cluster
 networking yet; see [Roadmap](#roadmap) below.
 
 ## Why you'd use it
@@ -400,6 +400,42 @@ kept it on its original node even after a third, emptier node joined,
 and plain named-node `keelctl` usage stayed completely unaffected
 throughout.
 
+### Milestone 10: resource-aware bin-packing
+
+The second milestone of sub-project 3: the scheduler introduced in
+Milestone 9 picked a node by jail count alone; this milestone teaches it
+to consider actual CPU and memory instead. `keel-agentd` detects its own
+capacity once at startup via `sysctl -n hw.ncpu`/`sysctl -n hw.physmem`
+(the same shell-out idiom already used for `jail(8)`/`zfs(8)`), reports
+it once at registration, and reports its currently committed load, the
+sum of `spec.resources.{cpu,memory}` across every jail its own
+`Reconciler` tracks, on every heartbeat. `keel-controlplane`'s
+`scheduler::pick_node` now ranks `Alive` nodes by
+`min(free_cpu/capacity_cpu, free_memory/capacity_memory)`, the fraction
+of headroom in whichever resource is most constrained, rather than by
+jail count, while remaining completely opaque to `JailSpec` bodies: it
+never learns a node's numbers by parsing a spec, only by the node
+self-reporting its own aggregate totals.
+
+This is a ranking heuristic, not admission control: the scheduler never
+sees an incoming jail's own resource request, since that would require
+deserializing the spec, which stays off-limits, so it can't guarantee a
+chosen node actually has room. A node that turns out unable to fit a
+jail simply fails that apply normally, the same honest limitation
+Milestone 9's count-based version already had.
+
+Milestone 10 finished at 171 tests on macOS (161 inherited, 10 new
+across `keel-agentd`'s new `capacity` module and
+`Reconciler::committed_resources`, and `keel-controlplane`'s wire,
+registry, scheduler, worker, and http layers), final whole-branch review
+clean, and full VM verification across three real nodes: detected
+capacity matched direct `sysctl` queries exactly; a large jail
+committing most of one node's capacity landed there first (both nodes
+tied at registration), and a second, smaller jail then correctly landed
+on the other node, the one with more headroom fraction rather than fewer
+jails; sticky re-apply and named-node routing stayed completely
+unaffected throughout.
+
 ## Roadmap
 
 **Sub-project 1: single-node jail reconciliation daemon (complete)**
@@ -419,10 +455,10 @@ throughout.
 **Sub-project 3: scheduling and cluster growth (in progress)**
 
 9. ~~Scheduler: automatic node placement by jail count, sticky on re-apply~~ done
+10. ~~Resource-aware bin-packing: node-reported CPU/memory capacity and committed load, headroom-based placement~~ done
 
 **Not yet designed** (future sub-projects, each will get its own spec):
 
-- Resource-aware bin-packing (CPU/memory-based placement, once nodes report capacity)
 - Cluster networking (cross-node overlay, service discovery/load balancing)
 - Storage orchestration beyond a single host's ZFS pool
 - bhyve VM workloads alongside jails
