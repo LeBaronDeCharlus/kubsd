@@ -218,7 +218,16 @@ fn handle_register(body: &[u8], commands: &Sender<Command>) -> (u16, Vec<u8>) {
         Err(e) => return error_response(400, format!("invalid YAML: {e}")),
     };
     let (reply_tx, reply_rx) = mpsc::channel();
-    if commands.send(Command::Register(registration.id, registration.addr, reply_tx)).is_err() {
+    if commands
+        .send(Command::Register(
+            registration.id,
+            registration.addr,
+            registration.capacity_cpu,
+            registration.capacity_memory,
+            reply_tx,
+        ))
+        .is_err()
+    {
         return error_response(500, "control plane worker is not running".to_string());
     }
     match reply_rx.recv() {
@@ -229,7 +238,12 @@ fn handle_register(body: &[u8], commands: &Sender<Command>) -> (u16, Vec<u8>) {
 
 fn handle_heartbeat(id: &str, commands: &Sender<Command>) -> (u16, Vec<u8>) {
     let (reply_tx, reply_rx) = mpsc::channel();
-    if commands.send(Command::Heartbeat(id.to_string(), reply_tx)).is_err() {
+    // Stopgap literals, not defaults: this handler doesn't parse the
+    // request body yet (that's Task 7's job of deserializing the new
+    // `Heartbeat` wire type). Mirrors the same stopgap pattern already
+    // used in worker.rs's Command::Register/Heartbeat arms pending this
+    // milestone's later tasks.
+    if commands.send(Command::Heartbeat(id.to_string(), 0.0, 0, reply_tx)).is_err() {
         return error_response(500, "control plane worker is not running".to_string());
     }
     match reply_rx.recv() {

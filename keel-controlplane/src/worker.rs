@@ -23,8 +23,8 @@ pub enum PlacementError {
 }
 
 pub enum Command {
-    Register(String, String, Sender<()>),
-    Heartbeat(String, Sender<Result<(), UnknownNode>>),
+    Register(String, String, f64, u64, Sender<()>),
+    Heartbeat(String, f64, u64, Sender<Result<(), UnknownNode>>),
     List(Sender<Vec<NodeStatus>>),
     Resolve(String, Sender<Result<String, ResolveError>>),
     ResolveOrSchedule(String, Sender<Result<(String, String), ScheduleOrResolveError>>),
@@ -45,18 +45,12 @@ pub fn spawn(mut registry: Registry, mut placements: Placements) -> (JoinHandle<
 
 fn handle_command(registry: &mut Registry, placements: &mut Placements, command: Command) {
     match command {
-        Command::Register(id, addr, reply) => {
-            // Stopgap literals, not defaults: `Command::Register` doesn't carry
-            // capacity data yet (that's Task 6's job of threading it through from
-            // the wire layer). Mirrors the same stopgap pattern Task 3 used in
-            // `Registry::list()` pending Task 4.
-            registry.register(id, addr, 0.0, 0, Instant::now());
+        Command::Register(id, addr, capacity_cpu, capacity_memory, reply) => {
+            registry.register(id, addr, capacity_cpu, capacity_memory, Instant::now());
             let _ = reply.send(());
         }
-        Command::Heartbeat(id, reply) => {
-            // Stopgap literals, not defaults: see the comment on `Command::Register`
-            // above. `Command::Heartbeat` doesn't carry committed-resource data yet.
-            let result = registry.heartbeat(&id, 0.0, 0, Instant::now());
+        Command::Heartbeat(id, committed_cpu, committed_memory, reply) => {
+            let result = registry.heartbeat(&id, committed_cpu, committed_memory, Instant::now());
             let _ = reply.send(result);
         }
         Command::List(reply) => {
@@ -124,7 +118,15 @@ mod tests {
         let commands = spawn(Registry::new(), Placements::new()).1;
 
         let (reg_tx, reg_rx) = mpsc::channel();
-        commands.send(Command::Register("node-1".to_string(), "10.0.0.1".to_string(), reg_tx)).unwrap();
+        commands
+            .send(Command::Register(
+                "node-1".to_string(),
+                "10.0.0.1".to_string(),
+                4.0,
+                8 * 1024 * 1024 * 1024,
+                reg_tx,
+            ))
+            .unwrap();
         reg_rx.recv().unwrap();
 
         let (list_tx, list_rx) = mpsc::channel();
@@ -139,7 +141,7 @@ mod tests {
         let commands = spawn(Registry::new(), Placements::new()).1;
 
         let (hb_tx, hb_rx) = mpsc::channel();
-        commands.send(Command::Heartbeat("missing".to_string(), hb_tx)).unwrap();
+        commands.send(Command::Heartbeat("missing".to_string(), 0.0, 0, hb_tx)).unwrap();
         assert!(hb_rx.recv().unwrap().is_err());
     }
 
@@ -148,11 +150,19 @@ mod tests {
         let commands = spawn(Registry::new(), Placements::new()).1;
 
         let (reg_tx, reg_rx) = mpsc::channel();
-        commands.send(Command::Register("node-1".to_string(), "10.0.0.1".to_string(), reg_tx)).unwrap();
+        commands
+            .send(Command::Register(
+                "node-1".to_string(),
+                "10.0.0.1".to_string(),
+                4.0,
+                8 * 1024 * 1024 * 1024,
+                reg_tx,
+            ))
+            .unwrap();
         reg_rx.recv().unwrap();
 
         let (hb_tx, hb_rx) = mpsc::channel();
-        commands.send(Command::Heartbeat("node-1".to_string(), hb_tx)).unwrap();
+        commands.send(Command::Heartbeat("node-1".to_string(), 0.0, 0, hb_tx)).unwrap();
         assert!(hb_rx.recv().unwrap().is_ok());
     }
 
@@ -170,7 +180,15 @@ mod tests {
         let commands = spawn(Registry::new(), Placements::new()).1;
 
         let (reg_tx, reg_rx) = mpsc::channel();
-        commands.send(Command::Register("node-1".to_string(), "10.0.0.1".to_string(), reg_tx)).unwrap();
+        commands
+            .send(Command::Register(
+                "node-1".to_string(),
+                "10.0.0.1".to_string(),
+                4.0,
+                8 * 1024 * 1024 * 1024,
+                reg_tx,
+            ))
+            .unwrap();
         reg_rx.recv().unwrap();
 
         let (resolve_tx, resolve_rx) = mpsc::channel();
@@ -187,17 +205,25 @@ mod tests {
         assert!(resolve_rx.recv().unwrap().is_err());
     }
 
-    fn register_node(commands: &Sender<Command>, id: &str, addr: &str) {
+    fn register_node(commands: &Sender<Command>, id: &str, addr: &str, capacity_cpu: f64, capacity_memory: u64) {
         let (reg_tx, reg_rx) = mpsc::channel();
-        commands.send(Command::Register(id.to_string(), addr.to_string(), reg_tx)).unwrap();
+        commands
+            .send(Command::Register(id.to_string(), addr.to_string(), capacity_cpu, capacity_memory, reg_tx))
+            .unwrap();
         reg_rx.recv().unwrap();
+    }
+
+    fn heartbeat_node(commands: &Sender<Command>, id: &str, committed_cpu: f64, committed_memory: u64) {
+        let (hb_tx, hb_rx) = mpsc::channel();
+        commands.send(Command::Heartbeat(id.to_string(), committed_cpu, committed_memory, hb_tx)).unwrap();
+        hb_rx.recv().unwrap().unwrap();
     }
 
     #[test]
     fn resolve_or_schedule_on_a_fresh_jail_name_with_equal_headroom_breaks_ties_by_ascending_id() {
         let commands = spawn(Registry::new(), Placements::new()).1;
-        register_node(&commands, "node-1", "10.0.0.1");
-        register_node(&commands, "node-2", "10.0.0.2");
+        register_node(&commands, "node-1", "10.0.0.1", 4.0, 8 * 1024 * 1024 * 1024);
+        register_node(&commands, "node-2", "10.0.0.2", 4.0, 8 * 1024 * 1024 * 1024);
 
         let (tx, rx) = mpsc::channel();
         commands.send(Command::ResolveOrSchedule("web-1".to_string(), tx)).unwrap();
@@ -205,10 +231,23 @@ mod tests {
     }
 
     #[test]
+    fn resolve_or_schedule_on_a_fresh_jail_name_schedules_onto_the_node_with_more_headroom() {
+        let commands = spawn(Registry::new(), Placements::new()).1;
+        register_node(&commands, "node-1", "10.0.0.1", 4.0, 100);
+        register_node(&commands, "node-2", "10.0.0.2", 4.0, 100);
+        heartbeat_node(&commands, "node-1", 3.0, 10); // 25% cpu headroom
+        heartbeat_node(&commands, "node-2", 1.0, 10); // 75% cpu headroom
+
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::ResolveOrSchedule("web-1".to_string(), tx)).unwrap();
+        assert_eq!(rx.recv().unwrap(), Ok(("node-2".to_string(), "10.0.0.2".to_string())));
+    }
+
+    #[test]
     fn resolve_or_schedule_on_an_already_placed_jail_is_sticky() {
         let commands = spawn(Registry::new(), Placements::new()).1;
-        register_node(&commands, "node-1", "10.0.0.1");
-        register_node(&commands, "node-2", "10.0.0.2");
+        register_node(&commands, "node-1", "10.0.0.1", 4.0, 8 * 1024 * 1024 * 1024);
+        register_node(&commands, "node-2", "10.0.0.2", 4.0, 8 * 1024 * 1024 * 1024);
 
         let (rec_tx, rec_rx) = mpsc::channel();
         commands.send(Command::RecordPlacement("web-1".to_string(), "node-1".to_string(), rec_tx)).unwrap();
@@ -240,7 +279,7 @@ mod tests {
     #[test]
     fn record_then_remove_placement_is_reflected_by_resolve_placement() {
         let commands = spawn(Registry::new(), Placements::new()).1;
-        register_node(&commands, "node-1", "10.0.0.1");
+        register_node(&commands, "node-1", "10.0.0.1", 4.0, 8 * 1024 * 1024 * 1024);
 
         let (rec_tx, rec_rx) = mpsc::channel();
         commands.send(Command::RecordPlacement("web-1".to_string(), "node-1".to_string(), rec_tx)).unwrap();
