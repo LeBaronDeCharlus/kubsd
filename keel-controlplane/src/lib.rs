@@ -1,6 +1,7 @@
 pub mod http;
 pub mod placements;
 pub mod registry;
+pub mod scheduler;
 pub mod wire;
 pub mod worker;
 
