@@ -570,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_put_lands_on_the_lower_id_node_when_counts_are_equal() {
+    fn scheduled_put_lands_on_the_lower_id_node_when_headroom_is_equal() {
         let cp_addr = start_test_server();
         let node_a_addr = start_fake_remote_agentd(200, "node: node-a\n");
         let node_b_addr = start_fake_remote_agentd(200, "node: node-b\n");
@@ -592,8 +592,8 @@ mod tests {
         assert_eq!(status, 200);
         assert!(body.contains("node-a"));
 
-        // node-0 joins with a lower id and zero recorded jails, and would win
-        // a fresh scheduling decision -- but web-1 is already placed, so it
+        // node-0 joins with a lower id and full headroom, and would win a
+        // fresh scheduling decision -- but web-1 is already placed, so it
         // must stay put.
         let node_0_addr = start_fake_remote_agentd(200, "node: node-0\n");
         register_node(&cp_addr, "node-0", &node_0_addr);
