@@ -1,5 +1,5 @@
 use crate::wire::{ErrorBody, NodeRegistration};
-use crate::worker::Command;
+use crate::worker::{Command, ScheduleOrResolveError};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{self, Sender};
@@ -100,6 +100,7 @@ fn reason_phrase(status: u16) -> &'static str {
         404 => "Not Found",
         409 => "Conflict",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "Unknown",
     }
 }
@@ -112,16 +113,102 @@ fn route(request: &ParsedRequest, commands: &Sender<Command>) -> (u16, Vec<u8>) 
         ("POST", ["nodes", id, "heartbeat"]) => handle_heartbeat(id, commands),
         ("GET", ["nodes"]) => handle_list(commands),
         ("PUT", ["nodes", id, "jails", name]) => {
-            handle_forward(id, "PUT", &format!("/jails/{name}"), &request.body, commands)
+            let (status, body) = handle_forward(id, "PUT", &format!("/jails/{name}"), &request.body, commands);
+            if (200..300).contains(&status) {
+                send_record_placement(name, id, commands);
+            }
+            (status, body)
         }
         ("GET", ["nodes", id, "jails"]) => handle_forward(id, "GET", "/jails", &[], commands),
         ("GET", ["nodes", id, "jails", name]) => {
             handle_forward(id, "GET", &format!("/jails/{name}"), &[], commands)
         }
         ("DELETE", ["nodes", id, "jails", name]) => {
-            handle_forward(id, "DELETE", &format!("/jails/{name}"), &[], commands)
+            let (status, body) = handle_forward(id, "DELETE", &format!("/jails/{name}"), &[], commands);
+            if (200..300).contains(&status) {
+                send_remove_placement(name, commands);
+            }
+            (status, body)
         }
+        ("PUT", ["jails", name]) => handle_scheduled_apply(name, &request.body, commands),
+        ("GET", ["jails", name]) => handle_scheduled_read(name, commands),
+        ("DELETE", ["jails", name]) => handle_scheduled_delete(name, commands),
         _ => error_response(404, format!("no route for {} {}", request.method, request.path)),
+    }
+}
+
+fn handle_scheduled_apply(name: &str, body: &[u8], commands: &Sender<Command>) -> (u16, Vec<u8>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::ResolveOrSchedule(name.to_string(), reply_tx)).is_err() {
+        return error_response(500, "control plane worker is not running".to_string());
+    }
+    let (node_id, addr) = match reply_rx.recv() {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(ScheduleOrResolveError::Schedule(e))) => return error_response(503, e.to_string()),
+        Ok(Err(ScheduleOrResolveError::Resolve(e))) => return error_response(404, e.to_string()),
+        Err(_) => return error_response(500, "control plane worker did not respond".to_string()),
+    };
+    match forward(&addr, "PUT", &format!("/jails/{name}"), body) {
+        Ok((status, response_body)) => {
+            if (200..300).contains(&status) {
+                send_record_placement(name, &node_id, commands);
+            }
+            (status, response_body)
+        }
+        Err(e) => error_response(500, format!("failed to reach node '{node_id}' at {addr}: {e}")),
+    }
+}
+
+fn handle_scheduled_read(name: &str, commands: &Sender<Command>) -> (u16, Vec<u8>) {
+    let (node_id, addr) = match resolve_placement(name, commands) {
+        Ok(pair) => pair,
+        Err(response) => return response,
+    };
+    match forward(&addr, "GET", &format!("/jails/{name}"), &[]) {
+        Ok((status, response_body)) => (status, response_body),
+        Err(e) => error_response(500, format!("failed to reach node '{node_id}' at {addr}: {e}")),
+    }
+}
+
+fn handle_scheduled_delete(name: &str, commands: &Sender<Command>) -> (u16, Vec<u8>) {
+    let (node_id, addr) = match resolve_placement(name, commands) {
+        Ok(pair) => pair,
+        Err(response) => return response,
+    };
+    match forward(&addr, "DELETE", &format!("/jails/{name}"), &[]) {
+        Ok((status, response_body)) => {
+            if (200..300).contains(&status) {
+                send_remove_placement(name, commands);
+            }
+            (status, response_body)
+        }
+        Err(e) => error_response(500, format!("failed to reach node '{node_id}' at {addr}: {e}")),
+    }
+}
+
+fn resolve_placement(name: &str, commands: &Sender<Command>) -> Result<(String, String), (u16, Vec<u8>)> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::ResolvePlacement(name.to_string(), reply_tx)).is_err() {
+        return Err(error_response(500, "control plane worker is not running".to_string()));
+    }
+    match reply_rx.recv() {
+        Ok(Ok(pair)) => Ok(pair),
+        Ok(Err(e)) => Err(error_response(404, e.to_string())),
+        Err(_) => Err(error_response(500, "control plane worker did not respond".to_string())),
+    }
+}
+
+fn send_record_placement(name: &str, node_id: &str, commands: &Sender<Command>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::RecordPlacement(name.to_string(), node_id.to_string(), reply_tx)).is_ok() {
+        let _ = reply_rx.recv();
+    }
+}
+
+fn send_remove_placement(name: &str, commands: &Sender<Command>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::RemovePlacement(name.to_string(), reply_tx)).is_ok() {
+        let _ = reply_rx.recv();
     }
 }
 
@@ -224,13 +311,14 @@ fn yaml_response<T: serde::Serialize>(status: u16, value: &T) -> (u16, Vec<u8>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::placements::Placements;
     use crate::registry::Registry;
     use crate::worker;
 
     fn start_test_server() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let (_worker_handle, commands) = worker::spawn(Registry::new());
+        let (_worker_handle, commands) = worker::spawn(Registry::new(), Placements::new());
         thread::spawn(move || run(listener, commands));
         addr
     }
@@ -397,5 +485,89 @@ mod tests {
         let (status, body) = send_request(&cp_addr, "GET", "/nodes/node-1/jails", "");
         assert_eq!(status, 500);
         assert!(body.contains("failed to reach node"), "expected forwarding failure in body: {body}");
+    }
+
+    #[test]
+    fn scheduled_put_lands_on_the_lower_id_node_when_counts_are_equal() {
+        let cp_addr = start_test_server();
+        let node_a_addr = start_fake_remote_agentd(200, "node: node-a\n");
+        let node_b_addr = start_fake_remote_agentd(200, "node: node-b\n");
+        register_node(&cp_addr, "node-b", &node_b_addr);
+        register_node(&cp_addr, "node-a", &node_a_addr);
+
+        let (status, body) = send_request(&cp_addr, "PUT", "/jails/web-1", "apiVersion: keel/v1\n");
+        assert_eq!(status, 200);
+        assert!(body.contains("node-a"), "expected the lower id (node-a) to win the tie, got: {body}");
+    }
+
+    #[test]
+    fn scheduled_put_is_sticky_across_repeated_apply() {
+        let cp_addr = start_test_server();
+        let node_a_addr = start_fake_remote_agentd(200, "node: node-a\n");
+        register_node(&cp_addr, "node-a", &node_a_addr);
+
+        let (status, body) = send_request(&cp_addr, "PUT", "/jails/web-1", "apiVersion: keel/v1\n");
+        assert_eq!(status, 200);
+        assert!(body.contains("node-a"));
+
+        // node-0 joins with a lower id and zero recorded jails, and would win
+        // a fresh scheduling decision -- but web-1 is already placed, so it
+        // must stay put.
+        let node_0_addr = start_fake_remote_agentd(200, "node: node-0\n");
+        register_node(&cp_addr, "node-0", &node_0_addr);
+
+        let (status, body) = send_request(&cp_addr, "PUT", "/jails/web-1", "apiVersion: keel/v1\n");
+        assert_eq!(status, 200);
+        assert!(body.contains("node-a"), "expected sticky placement on node-a, got: {body}");
+    }
+
+    #[test]
+    fn scheduled_get_and_delete_on_an_unplaced_jail_return_404() {
+        let cp_addr = start_test_server();
+
+        let (status, body) = send_request(&cp_addr, "GET", "/jails/missing", "");
+        assert_eq!(status, 404);
+        assert!(body.contains("no known placement"), "got: {body}");
+
+        let (status, body) = send_request(&cp_addr, "DELETE", "/jails/missing", "");
+        assert_eq!(status, 404);
+        assert!(body.contains("no known placement"), "got: {body}");
+    }
+
+    #[test]
+    fn scheduled_delete_removes_the_placement_so_a_later_get_returns_404() {
+        let cp_addr = start_test_server();
+        let node_addr = start_fake_remote_agentd(200, "node: node-a\n");
+        register_node(&cp_addr, "node-a", &node_addr);
+
+        send_request(&cp_addr, "PUT", "/jails/web-1", "apiVersion: keel/v1\n");
+        let (status, _) = send_request(&cp_addr, "DELETE", "/jails/web-1", "");
+        assert_eq!(status, 200);
+
+        let (status, body) = send_request(&cp_addr, "GET", "/jails/web-1", "");
+        assert_eq!(status, 404);
+        assert!(body.contains("no known placement"), "got: {body}");
+    }
+
+    #[test]
+    fn scheduled_put_with_no_alive_nodes_returns_503() {
+        let cp_addr = start_test_server();
+        let (status, body) = send_request(&cp_addr, "PUT", "/jails/web-1", "apiVersion: keel/v1\n");
+        assert_eq!(status, 503);
+        assert!(body.contains("no alive nodes"), "got: {body}");
+    }
+
+    #[test]
+    fn named_route_apply_and_scheduled_route_share_the_same_placement_table() {
+        let cp_addr = start_test_server();
+        let node_addr = start_fake_remote_agentd(200, "running: true\n");
+        register_node(&cp_addr, "node-1", &node_addr);
+
+        let (status, _) = send_request(&cp_addr, "PUT", "/nodes/node-1/jails/web-1", "apiVersion: keel/v1\n");
+        assert_eq!(status, 200);
+
+        let (status, body) = send_request(&cp_addr, "GET", "/jails/web-1", "");
+        assert_eq!(status, 200, "expected the scheduled GET to find the placement recorded by the named-node PUT");
+        assert!(body.contains("running: true"), "got: {body}");
     }
 }
