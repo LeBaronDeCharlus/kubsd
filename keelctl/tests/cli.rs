@@ -81,7 +81,13 @@ fn start_test_control_plane_with_node(node_id: &str, node_addr: &str) -> String 
 
     let (reg_tx, reg_rx) = std::sync::mpsc::channel();
     commands
-        .send(keel_controlplane::worker::Command::Register(node_id.to_string(), node_addr.to_string(), reg_tx))
+        .send(keel_controlplane::worker::Command::Register(
+            node_id.to_string(),
+            node_addr.to_string(),
+            4.0,
+            8 * 1024 * 1024 * 1024,
+            reg_tx,
+        ))
         .unwrap();
     reg_rx.recv().unwrap();
 
