@@ -54,12 +54,13 @@ drop-in replacement, and today it is far smaller in scope:
 | Isolation | namespaces + cgroups | jails + `rctl(8)` |
 | Filesystem | overlay/container images | ZFS clones of a base dataset |
 | Networking | CNI, overlay networks, Services | VNET + `epair(4)` + `bridge(4)`, static IPs |
-| Scope | multi-node cluster, scheduler | multi-node (manual placement), no scheduler yet |
-| Control plane | API server + etcd + scheduler | node registry + spec routing, no scheduler |
+| Scope | multi-node cluster, resource-aware scheduler | multi-node, count-based scheduler (no resource awareness yet) |
+| Control plane | API server + etcd + scheduler | node registry + count-based scheduler + spec routing |
 
 In other words: what exists today spans a **kubelet** plus a thin
-multi-node control plane (node registry and routing a spec to a node you
-name yourself), not a full cluster. There is no scheduler and no cluster
+multi-node control plane with a basic scheduler (count-based placement,
+node registry, routing a spec to a node either automatically or by name),
+not a full cluster. There is no resource-aware bin-packing or cluster
 networking yet; see [Roadmap](#roadmap) below.
 
 ## Why you'd use it
@@ -362,6 +363,43 @@ unknown-node and dead-node targets were rejected with clear errors
 before any connection attempt, and plain single-node `keelctl` usage
 stayed completely unaffected throughout.
 
+### Milestone 9: scheduler, automatic node placement
+
+The first milestone of sub-project 3, and the one that finally answers
+"which node does an unscheduled jail land on": given the node registry
+and node-forwarding from Milestones 7-8, a client can now apply, get, or
+delete a `JailSpec` without naming a node at all. `keel-controlplane`
+gained a new in-memory `Placements` table (`jail_name -> node_id`), owned
+by the same single worker thread that already owns the node `Registry`,
+and a pure `scheduler::pick_node` function: among `Alive` nodes, pick the
+one with the fewest jails currently recorded in `Placements`, ties
+broken by ascending node id. Placement is by jail count only, not real
+CPU/memory pressure, since nodes report no capacity today; teaching them
+to is future work, if it's ever needed.
+
+Three new routes, `PUT`/`GET`/`DELETE /jails/<name>` (no node segment in
+the path), sit alongside Milestone 8's unchanged
+`/nodes/<id>/jails/<name>` routes, which now also update the same
+`Placements` table on success, so jail counts and lookups stay
+consistent no matter which route family placed a given jail. Applying an
+already-placed jail is sticky, forwarding to the same node it originally
+landed on rather than re-scheduling; a jail whose recorded node has
+since gone `Dead` is never silently rescheduled elsewhere, it surfaces
+the same `Dead` error a named-node route already gives, and a human can
+still explicitly repin it via the named route. `keelctl`'s `--node` flag
+became optional: `--control-plane-addr` alone now means "schedule it,"
+while `--control-plane-addr --node <id>` keeps Milestone 8's exact-node
+behavior unchanged.
+
+Milestone 9 finished at 161 tests on macOS (139 inherited, 22 new across
+`keel-controlplane`'s `Placements`, `scheduler`, `worker`, and `http`
+layers), final whole-branch review clean, and full VM verification
+across three real nodes: applying two differently-named specs with no
+`--node` landed them on two different nodes, re-applying one of them
+kept it on its original node even after a third, emptier node joined,
+and plain named-node `keelctl` usage stayed completely unaffected
+throughout.
+
 ## Roadmap
 
 **Sub-project 1: single-node jail reconciliation daemon (complete)**
@@ -378,9 +416,13 @@ stayed completely unaffected throughout.
 7. ~~Node registry: `keel-controlplane`, register/heartbeat/list over TCP, self-healing membership~~ done
 8. ~~Routing jail specs to a specific node through the control plane~~ done
 
+**Sub-project 3: scheduling and cluster growth (in progress)**
+
+9. ~~Scheduler: automatic node placement by jail count, sticky on re-apply~~ done
+
 **Not yet designed** (future sub-projects, each will get its own spec):
 
-- Scheduler (bin-packing jails across nodes)
+- Resource-aware bin-packing (CPU/memory-based placement, once nodes report capacity)
 - Cluster networking (cross-node overlay, service discovery/load balancing)
 - Storage orchestration beyond a single host's ZFS pool
 - bhyve VM workloads alongside jails

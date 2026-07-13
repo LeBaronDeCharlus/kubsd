@@ -42,20 +42,21 @@
       <table>
         <thead><tr><th>Flag</th><th>Default</th><th>Meaning</th></tr></thead>
         <tbody>
-          <tr><td><code>--socket PATH</code></td><td><code>/var/run/keel-agentd.sock</code></td><td>Path to the keel-agentd Unix socket to talk to. Ignored if <code>--control-plane-addr</code>/<code>--node</code> are given.</td></tr>
-          <tr><td><code>--control-plane-addr ADDR</code></td><td>none</td><td>Address of a keel-controlplane to route through instead of a local socket. Must be given together with <code>--node</code>.</td></tr>
-          <tr><td><code>--node ID</code></td><td>none</td><td>Which node's keel-agentd to route the request to, resolved by the control plane. Must be given together with <code>--control-plane-addr</code>.</td></tr>
+          <tr><td><code>--socket PATH</code></td><td><code>/var/run/keel-agentd.sock</code></td><td>Path to the keel-agentd Unix socket to talk to. Ignored if <code>--control-plane-addr</code> is given.</td></tr>
+          <tr><td><code>--control-plane-addr ADDR</code></td><td>none</td><td>Address of a keel-controlplane to route through instead of a local socket. Alone, the control plane schedules the request onto whichever node has the fewest jails; combined with <code>--node</code>, it routes to that exact node instead.</td></tr>
+          <tr><td><code>--node ID</code></td><td>none</td><td>Pins the request to a specific node's keel-agentd instead of letting the control plane schedule it. Requires <code>--control-plane-addr</code>.</td></tr>
         </tbody>
       </table>
-      <p>Giving exactly one of <code>--control-plane-addr</code>/<code>--node</code> without the other is a usage error. Giving neither preserves keelctl's original behavior exactly: talk directly to <code>--socket</code> (or its default).</p>
+      <p>Giving <code>--node</code> without <code>--control-plane-addr</code> is a usage error. Giving <code>--control-plane-addr</code> alone is valid: it schedules automatically. Giving neither preserves keelctl's original behavior exactly: talk directly to <code>--socket</code> (or its default).</p>
     </div>
   </section>
 
   <section id="apply">
     <div class="container">
       <h2>keelctl apply -f FILE</h2>
-      <p>Reads a <code>JailSpec</code> YAML file, validates it locally, and sends it as a <code>PUT /jails/&lt;name&gt;</code> request (the name comes from the spec's own <code>metadata.name</code>), or, when routed, <code>PUT /nodes/&lt;node&gt;/jails/&lt;name&gt;</code>.</p>
+      <p>Reads a <code>JailSpec</code> YAML file, validates it locally, and sends it as a <code>PUT /jails/&lt;name&gt;</code> request (the name comes from the spec's own <code>metadata.name</code>). Routed through a control plane with no <code>--node</code>, that same <code>PUT /jails/&lt;name&gt;</code> path is scheduled automatically onto the least-loaded alive node; with <code>--node</code>, it's <code>PUT /nodes/&lt;node&gt;/jails/&lt;name&gt;</code> instead, landing on exactly that node.</p>
       <pre>keelctl apply -f jail.yaml
+keelctl --control-plane-addr 10.0.0.2:7620 apply -f jail.yaml
 keelctl --control-plane-addr 10.0.0.2:7620 --node node-4 apply -f jail.yaml</pre>
     </div>
   </section>
@@ -63,9 +64,10 @@ keelctl --control-plane-addr 10.0.0.2:7620 --node node-4 apply -f jail.yaml</pre
   <section id="get">
     <div class="container">
       <h2>keelctl get [name]</h2>
-      <p>With no argument, lists every jail keel-agentd (or the routed-to node) is tracking (<code>GET /jails</code>, or <code>GET /nodes/&lt;node&gt;/jails</code> when routed). With a name, fetches just that one (<code>GET /jails/&lt;name&gt;</code>, or <code>GET /nodes/&lt;node&gt;/jails/&lt;name&gt;</code>).</p>
+      <p>With no argument, lists every jail keel-agentd (or the routed-to node) is tracking (<code>GET /jails</code>, or <code>GET /nodes/&lt;node&gt;/jails</code> when routed by name). With a name, fetches just that one: <code>GET /jails/&lt;name&gt;</code> directly, or through a control plane with no <code>--node</code>, the same path resolved against whichever node the jail was placed on; with <code>--node</code>, <code>GET /nodes/&lt;node&gt;/jails/&lt;name&gt;</code>.</p>
       <pre>keelctl get
 keelctl get web-1
+keelctl --control-plane-addr 10.0.0.2:7620 get web-1
 keelctl --control-plane-addr 10.0.0.2:7620 --node node-4 get web-1</pre>
     </div>
   </section>
@@ -73,8 +75,9 @@ keelctl --control-plane-addr 10.0.0.2:7620 --node node-4 get web-1</pre>
   <section id="delete">
     <div class="container">
       <h2>keelctl delete NAME</h2>
-      <p>Tears down the named jail, its ZFS dataset, its network attachment, and its resource limits (<code>DELETE /jails/&lt;name&gt;</code>, or <code>DELETE /nodes/&lt;node&gt;/jails/&lt;name&gt;</code> when routed).</p>
+      <p>Tears down the named jail, its ZFS dataset, its network attachment, and its resource limits (<code>DELETE /jails/&lt;name&gt;</code>, or <code>DELETE /nodes/&lt;node&gt;/jails/&lt;name&gt;</code> when routed by name). Through a control plane with no <code>--node</code>, deleting also clears the jail's recorded placement.</p>
       <pre>keelctl delete web-1
+keelctl --control-plane-addr 10.0.0.2:7620 delete web-1
 keelctl --control-plane-addr 10.0.0.2:7620 --node node-4 delete web-1</pre>
     </div>
   </section>

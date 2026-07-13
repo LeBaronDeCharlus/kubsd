@@ -48,7 +48,7 @@
           <tr><td><code>keel-net</code></td><td>The <code>NetManager</code> trait: create a bridge, attach a jail to it over an <code>epair(4)</code> pair with a static address, tear it down. Fake plus a real implementation over FreeBSD networking commands.</td></tr>
           <tr><td><code>keel-agentd</code></td><td>The reconciliation daemon: a generic <code>Reconciler&lt;J, Z, N&gt;</code> over the three traits above, a crash-safe on-disk state store, crash-loop backoff, and a local HTTP API over a Unix socket.</td></tr>
           <tr><td><code>keelctl</code></td><td>The CLI: <code>apply</code>, <code>get</code>, <code>delete</code>, talking to <code>keel-agentd</code>'s Unix socket directly, or routed through <code>keel-controlplane</code> to a named node.</td></tr>
-          <tr><td><code>keel-controlplane</code></td><td>The node registry and request router: register/heartbeat/list nodes over TCP (liveness computed on read, not a background sweep), plus byte-opaque forwarding of apply/get/delete to a named node's <code>keel-agentd</code>.</td></tr>
+          <tr><td><code>keel-controlplane</code></td><td>The node registry, scheduler, and request router: register/heartbeat/list nodes over TCP (liveness computed on read, not a background sweep), a count-based scheduler that picks a node when none is named, and byte-opaque forwarding of apply/get/delete to a named or scheduled node's <code>keel-agentd</code>.</td></tr>
         </tbody>
       </table>
     </div>
@@ -80,6 +80,14 @@
       <h2>Routing a spec to a node</h2>
       <p>A node is a routing-layer concept only: it never appears in a <code>JailSpec</code>. When a request arrives at <code>keel-controlplane</code> for <code>/nodes/&lt;id&gt;/jails/...</code>, the worker thread first resolves <code>&lt;id&gt;</code> against the <code>Registry</code>, the same liveness computation <code>GET /nodes</code> uses, rejecting an unknown or <code>Dead</code> node immediately, before any network call. Only once a live address comes back does the handler open a fresh TCP connection to that node's <code>keel-agentd</code>, forward the request byte-for-byte, and relay the response back untouched; the body is never deserialized, so <code>keel-controlplane</code> has no dependency on <code>keel-spec</code>.</p>
       <p>On the receiving end, <code>keel-agentd</code>'s jails API is transport-agnostic: the same route table serves both the always-on Unix socket and a second, entirely optional TCP listener, bound to <code>--advertise-addr</code> only when the node is configured to register with a control plane. A node with no control-plane flags set behaves exactly as it did before this existed.</p>
+    </div>
+  </section>
+
+  <section id="scheduling">
+    <div class="container">
+      <h2>Scheduling: picking a node automatically</h2>
+      <p>Alongside the node-naming routes, <code>keel-controlplane</code> serves a second route family, <code>/jails/&lt;name&gt;</code> with no node segment. On <code>PUT</code>, if the jail name has no recorded placement yet, a pure <code>scheduler::pick_node</code> function picks the <code>Alive</code> node with the fewest jails recorded in a new in-memory <code>Placements</code> table (<code>jail_name -&gt; node_id</code>), ties broken by ascending node id, then forwards there exactly like the named-node path. Resolving is a pure read: <code>Placements</code> is only written after a confirmed success response comes back, so a failed apply never leaves a phantom placement.</p>
+      <p>Re-applying an already-placed jail is sticky: it always resolves to the node already recorded, never a fresh scheduling decision, so a jail is never silently split across two nodes. If that recorded node has since gone <code>Dead</code>, the request fails with the same error a named-node route would give; nothing reschedules it automatically. The two route families share one <code>Placements</code> table: a jail applied by explicit node name is just as visible to a later scheduled <code>GET</code> as one the scheduler placed itself.</p>
     </div>
   </section>
 </main>
