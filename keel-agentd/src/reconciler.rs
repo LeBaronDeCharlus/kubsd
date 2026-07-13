@@ -230,6 +230,16 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager> Reconciler<J, Z, N> {
         names.sort();
         names.iter().filter_map(|name| self.get(name, now)).collect()
     }
+
+    pub fn committed_resources(&self) -> (f64, u64) {
+        self.records.values().fold((0.0, 0u64), |(cpu, mem), record| {
+            let cpu_cores = keel_spec::parse_cpu_cores(&record.spec.spec.resources.cpu)
+                .expect("resources were already validated at apply time");
+            let mem_bytes = keel_spec::parse_memory_bytes(&record.spec.spec.resources.memory)
+                .expect("resources were already validated at apply time");
+            (cpu + cpu_cores, mem + mem_bytes)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +294,42 @@ mod tests {
         let reconciler = new_reconciler(dir);
         assert!(reconciler.records.is_empty());
         assert_eq!(reconciler.next_epair_ordinal, 1);
+    }
+
+    fn sample_spec_with_resources(name: &str, cpu: &str, memory: &str) -> JailSpec {
+        let mut spec = sample_spec(name);
+        spec.spec.resources = ResourcesSpec { cpu: cpu.to_string(), memory: memory.to_string() };
+        spec
+    }
+
+    #[test]
+    fn committed_resources_on_an_empty_reconciler_is_zero() {
+        let dir = test_state_dir("committed_resources_on_an_empty_reconciler_is_zero");
+        let reconciler = new_reconciler(dir);
+        assert_eq!(reconciler.committed_resources(), (0.0, 0));
+    }
+
+    #[test]
+    fn committed_resources_sums_across_all_tracked_jails() {
+        let dir = test_state_dir("committed_resources_sums_across_all_tracked_jails");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.apply(sample_spec_with_resources("web-1", "2", "512M")).unwrap();
+        reconciler.apply(sample_spec_with_resources("web-2", "1.5", "1G")).unwrap();
+        let (cpu, memory) = reconciler.committed_resources();
+        assert_eq!(cpu, 3.5);
+        assert_eq!(memory, 512 * 1024 * 1024 + 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn committed_resources_drops_a_deleted_jails_contribution() {
+        let dir = test_state_dir("committed_resources_drops_a_deleted_jails_contribution");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.apply(sample_spec_with_resources("web-1", "2", "512M")).unwrap();
+        reconciler.apply(sample_spec_with_resources("web-2", "1", "256M")).unwrap();
+        reconciler.delete("web-1").unwrap();
+        let (cpu, memory) = reconciler.committed_resources();
+        assert_eq!(cpu, 1.0);
+        assert_eq!(memory, 256 * 1024 * 1024);
     }
 
     #[test]

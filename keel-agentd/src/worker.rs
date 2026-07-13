@@ -13,6 +13,7 @@ pub enum Command {
     Get(Option<String>, Sender<Vec<JailStatus>>),
     Delete(String, Sender<Result<(), ReconcileError>>),
     Tick,
+    CommittedResources(Sender<(f64, u64)>),
 }
 
 pub fn spawn<J, Z, N>(mut reconciler: Reconciler<J, Z, N>) -> (JoinHandle<()>, Sender<Command>)
@@ -63,6 +64,9 @@ fn handle_command<J: JailRuntime, Z: ZfsManager, N: NetManager>(
             for (name, error) in reconciler.reconcile(Instant::now()) {
                 eprintln!("keel-agentd: reconcile error for jail '{name}': {error}");
             }
+        }
+        Command::CommittedResources(reply) => {
+            let _ = reply.send(reconciler.committed_resources());
         }
     }
 }
@@ -181,5 +185,19 @@ mod tests {
         let (get_tx, get_rx) = mpsc::channel();
         commands.send(Command::Get(None, get_tx)).unwrap();
         assert!(get_rx.recv().unwrap().is_empty());
+    }
+
+    #[test]
+    fn committed_resources_command_returns_the_reconcilers_totals() {
+        let commands = spawn_test_worker("committed_resources_command_returns_the_reconcilers_totals");
+
+        let (apply_tx, apply_rx) = mpsc::channel();
+        commands.send(Command::Apply(sample_spec("web-1"), apply_tx)).unwrap();
+        apply_rx.recv().unwrap().unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::CommittedResources(tx)).unwrap();
+        // sample_spec's fixed resources: cpu "2", memory "512M".
+        assert_eq!(rx.recv().unwrap(), (2.0, 512 * 1024 * 1024));
     }
 }
