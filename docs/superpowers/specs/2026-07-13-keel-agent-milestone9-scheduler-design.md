@@ -154,15 +154,25 @@ pub enum Command {
 }
 ```
 
-- `ResolveOrSchedule` (used by `PUT /jails/{name}` and, for bookkeeping,
-  after a successful named-node `PUT`): if `Placements.get(name)` is
-  `Some(node_id)`, resolve it through `Registry::resolve` exactly like
-  today's `Resolve` command (surfacing `Dead`/`Unknown` the same way).
-  Otherwise, take `Registry`'s current `Alive` ids and `Placements`'
-  counts, call `scheduler::pick_node`, and resolve the winning id's
-  address. It does **not** call `Placements::set` itself — that only
-  happens after the forward succeeds (see below), so a failed apply never
-  leaves a phantom placement.
+`worker::spawn` currently takes only a `Registry` (`pub fn spawn(mut registry: Registry)`).
+This milestone changes its signature to also own a `Placements`
+(`pub fn spawn(mut registry: Registry, mut placements: Placements)`), since
+the whole point is one worker thread owning both tables. `keel-controlplane`'s
+`main.rs` (currently `worker::spawn(Registry::new())`) and `http.rs`'s
+`start_test_server` test helper (currently the same one-argument call) both
+need updating to pass `Placements::new()` alongside `Registry::new()`.
+
+- `ResolveOrSchedule` (used only by `PUT /jails/{name}`, the scheduled
+  route): if `Placements.get(name)` is `Some(node_id)`, resolve it
+  through `Registry::resolve` exactly like today's `Resolve` command
+  (surfacing `Dead`/`Unknown` the same way). Otherwise, take `Registry`'s
+  current `Alive` ids and `Placements`' counts, call
+  `scheduler::pick_node`, and resolve the winning id's address. It does
+  **not** call `Placements::set` itself — that only happens after the
+  forward succeeds (see below), so a failed apply never leaves a phantom
+  placement. (The bookkeeping that runs after a successful named-node
+  `PUT` is the separate `RecordPlacement` command described next, not
+  `ResolveOrSchedule`.)
 - `ResolvePlacement` (used by `GET`/`DELETE /jails/{name}`): looks up
   `Placements.get(name)` only, no scheduling; `None` is a distinct
   `PlacementError::NotPlaced`, `Some` resolves through `Registry` the same
@@ -201,11 +211,35 @@ additions to the four existing `/nodes/{id}/jails/...` arms:
   `RemovePlacement(name)` before responding.
 - The four existing named-node arms (`PUT`/`GET`/`DELETE
   /nodes/{id}/jails/{name}` and the list `GET /nodes/{id}/jails`) keep
-  their exact Milestone 8 behavior; `handle_forward`'s `PUT` and `DELETE`
-  callers additionally send `RecordPlacement(name, id)` /
-  `RemovePlacement(name)` after a `2xx` response, same as the scheduled
-  path. The list route (`GET /nodes/{id}/jails`, no single jail name) is
-  untouched, since it has no single name to record against.
+  their exact Milestone 8 behavior. `handle_forward` itself stays generic
+  (it's also used by the list route, which has no single jail name to
+  record); the bookkeeping is added in `route()`'s `PUT`/`DELETE` arms,
+  which already have `name` in scope, wrapping the existing call:
+
+  ```rust
+  ("PUT", ["nodes", id, "jails", name]) => {
+      let (status, body) =
+          handle_forward(id, "PUT", &format!("/jails/{name}"), &request.body, commands);
+      if (200..300).contains(&status) {
+          send_record_placement(name, id, commands);
+      }
+      (status, body)
+  }
+  ("DELETE", ["nodes", id, "jails", name]) => {
+      let (status, body) = handle_forward(id, "DELETE", &format!("/jails/{name}"), &[], commands);
+      if (200..300).contains(&status) {
+          send_remove_placement(name, commands);
+      }
+      (status, body)
+  }
+  ```
+
+  `send_record_placement`/`send_remove_placement` are small shared
+  helpers (fire-and-forget the `RecordPlacement`/`RemovePlacement`
+  command and wait for the reply) reused by `handle_scheduled_apply` and
+  `handle_scheduled_delete` too, so the bookkeeping call is written once.
+  The `GET` single-jail arm and the list arm are untouched, since neither
+  is a write.
 
 `reason_phrase` gains one entry: `503 => "Service Unavailable"`.
 
