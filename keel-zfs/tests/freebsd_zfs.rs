@@ -28,6 +28,25 @@ fn destroy_dataset_removes_a_dataset_created_for_the_test() {
 }
 
 #[test]
+fn destroy_dataset_on_a_never_created_dataset_returns_not_found() {
+    // Reproduces a real bug found while verifying Milestone 8's keel-jail
+    // NotFound fix end-to-end: `destroy_dataset` always mapped a failing
+    // `zfs destroy` to `ZfsError::CommandFailed`, never `ZfsError::
+    // NotFound`, so `Reconciler::delete`'s documented tolerance for a
+    // record whose provisioning failed before this dataset was ever
+    // cloned never actually engaged against the real ZFS manager, only
+    // against `FakeZfsManager`'s test double.
+    let zfs = CliZfsManager::new();
+    let dataset = "zroot/keel/jails/destroy-never-created-scratch";
+    let _ = zfs.destroy_dataset(dataset);
+
+    match zfs.destroy_dataset(dataset) {
+        Err(keel_zfs::ZfsError::NotFound(d)) => assert_eq!(d, dataset),
+        other => panic!("expected NotFound for a dataset that was never created, got: {other:?}"),
+    }
+}
+
+#[test]
 fn clone_from_base_creates_a_usable_clone() {
     let zfs = CliZfsManager::new();
     let target = "zroot/keel/jails/clone-test-scratch";

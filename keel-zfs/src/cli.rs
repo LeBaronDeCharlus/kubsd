@@ -68,6 +68,19 @@ impl ZfsManager for CliZfsManager {
             match Self::run_checked(&["destroy", dataset]) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
+                    // `zfs destroy` on a dataset that doesn't exist prints
+                    // `cannot open '<dataset>': dataset does not exist` and
+                    // exits 1 (verified directly on the real VM) — the same
+                    // condition `Reconciler::delete` already tolerates from
+                    // `FakeZfsManager` (which returns `NotFound` directly),
+                    // for the real case of deleting a record whose
+                    // provisioning failed before this dataset was ever
+                    // cloned. `keel-jail::ProcessJailRuntime::destroy` had
+                    // the identical gap for `jail -r`, fixed in Milestone 8.
+                    if matches!(&e, ZfsError::CommandFailed(_, _, stderr) if stderr.contains("dataset does not exist"))
+                    {
+                        return Err(ZfsError::NotFound(dataset.to_string()));
+                    }
                     let is_busy =
                         matches!(&e, ZfsError::CommandFailed(_, _, stderr) if stderr.contains("dataset is busy"));
                     last_err = Some(e);
