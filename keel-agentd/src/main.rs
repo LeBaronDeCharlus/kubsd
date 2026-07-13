@@ -81,14 +81,19 @@ fn main() {
     if let (Some(node_id), Some(control_plane_addr), Some(advertise_addr)) =
         (config.node_id.clone(), config.control_plane_addr.clone(), config.advertise_addr.clone())
     {
+        let (capacity_cpu, capacity_memory) = keel_agentd::capacity::detect()
+            .unwrap_or_else(|e| panic!("failed to detect node capacity via sysctl: {e}"));
         eprintln!(
-            "keel-agentd: registering with control plane at {control_plane_addr} as node '{node_id}' ({advertise_addr})"
+            "keel-agentd: registering with control plane at {control_plane_addr} as node '{node_id}' ({advertise_addr}), capacity {capacity_cpu} cores / {capacity_memory} bytes"
         );
         keel_agentd::registration::spawn(
             node_id,
             advertise_addr.clone(),
             control_plane_addr,
             Duration::from_secs(5),
+            capacity_cpu,
+            capacity_memory,
+            commands.clone(),
         );
 
         eprintln!("keel-agentd: serving jails API over TCP on {advertise_addr}");
