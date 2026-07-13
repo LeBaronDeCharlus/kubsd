@@ -71,14 +71,19 @@ fn handle_command(registry: &mut Registry, placements: &mut Placements, command:
             let result = if let Some(node_id) = placements.get(&jail_name).map(|s| s.to_string()) {
                 registry.resolve(&node_id, now).map(|addr| (node_id, addr)).map_err(ScheduleOrResolveError::from)
             } else {
-                let alive_ids: Vec<String> = registry
+                let nodes: Vec<scheduler::NodeResources> = registry
                     .list(now)
                     .into_iter()
                     .filter(|status| status.status == NodeState::Alive)
-                    .map(|status| status.id)
+                    .map(|status| scheduler::NodeResources {
+                        id: status.id,
+                        capacity_cpu: status.capacity_cpu,
+                        capacity_memory: status.capacity_memory,
+                        committed_cpu: status.committed_cpu,
+                        committed_memory: status.committed_memory,
+                    })
                     .collect();
-                let counts = placements.counts();
-                scheduler::pick_node(&alive_ids, &counts).map_err(ScheduleOrResolveError::from).and_then(
+                scheduler::pick_node(&nodes).map_err(ScheduleOrResolveError::from).and_then(
                     |node_id| {
                         registry
                             .resolve(&node_id, now)
@@ -200,7 +205,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         commands.send(Command::ResolveOrSchedule("web-1".to_string(), tx)).unwrap();
-        assert_eq!(rx.recv().unwrap(), Ok(("node-2".to_string(), "10.0.0.2".to_string())));
+        assert_eq!(rx.recv().unwrap(), Ok(("node-1".to_string(), "10.0.0.1".to_string())));
     }
 
     #[test]
