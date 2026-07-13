@@ -194,14 +194,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_or_schedule_on_a_fresh_jail_name_schedules_onto_the_least_loaded_alive_node() {
+    fn resolve_or_schedule_on_a_fresh_jail_name_with_equal_headroom_breaks_ties_by_ascending_id() {
         let commands = spawn(Registry::new(), Placements::new()).1;
         register_node(&commands, "node-1", "10.0.0.1");
         register_node(&commands, "node-2", "10.0.0.2");
-
-        let (rec_tx, rec_rx) = mpsc::channel();
-        commands.send(Command::RecordPlacement("existing".to_string(), "node-1".to_string(), rec_tx)).unwrap();
-        rec_rx.recv().unwrap();
 
         let (tx, rx) = mpsc::channel();
         commands.send(Command::ResolveOrSchedule("web-1".to_string(), tx)).unwrap();
