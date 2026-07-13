@@ -8,6 +8,10 @@ const DEAD_THRESHOLD: Duration = Duration::from_secs(15);
 struct NodeRecord {
     addr: String,
     last_heartbeat: Instant,
+    capacity_cpu: f64,
+    capacity_memory: u64,
+    committed_cpu: f64,
+    committed_memory: u64,
 }
 
 #[derive(Debug, Default)]
@@ -32,14 +36,32 @@ impl Registry {
         Self::default()
     }
 
-    pub fn register(&mut self, id: String, addr: String, now: Instant) {
-        self.nodes.insert(id, NodeRecord { addr, last_heartbeat: now });
+    pub fn register(&mut self, id: String, addr: String, capacity_cpu: f64, capacity_memory: u64, now: Instant) {
+        self.nodes.insert(
+            id,
+            NodeRecord {
+                addr,
+                last_heartbeat: now,
+                capacity_cpu,
+                capacity_memory,
+                committed_cpu: 0.0,
+                committed_memory: 0,
+            },
+        );
     }
 
-    pub fn heartbeat(&mut self, id: &str, now: Instant) -> Result<(), UnknownNode> {
+    pub fn heartbeat(
+        &mut self,
+        id: &str,
+        committed_cpu: f64,
+        committed_memory: u64,
+        now: Instant,
+    ) -> Result<(), UnknownNode> {
         match self.nodes.get_mut(id) {
             Some(record) => {
                 record.last_heartbeat = now;
+                record.committed_cpu = committed_cpu;
+                record.committed_memory = committed_memory;
                 Ok(())
             }
             None => Err(UnknownNode(id.to_string())),
@@ -57,10 +79,10 @@ impl Registry {
                     addr: record.addr.clone(),
                     status: if elapsed < DEAD_THRESHOLD { NodeState::Alive } else { NodeState::Dead },
                     last_seen_secs: elapsed.as_secs(),
-                    capacity_cpu: 0.0,
-                    capacity_memory: 0,
-                    committed_cpu: 0.0,
-                    committed_memory: 0,
+                    capacity_cpu: record.capacity_cpu,
+                    capacity_memory: record.capacity_memory,
+                    committed_cpu: record.committed_cpu,
+                    committed_memory: record.committed_memory,
                 }
             })
             .collect();
@@ -86,7 +108,7 @@ mod tests {
     fn register_then_list_shows_the_node_as_alive() {
         let mut registry = Registry::new();
         let now = Instant::now();
-        registry.register("node-1".to_string(), "192.168.64.4".to_string(), now);
+        registry.register("node-1".to_string(), "192.168.64.4".to_string(), 4.0, 8 * 1024 * 1024 * 1024, now);
 
         let statuses = registry.list(now);
         assert_eq!(statuses.len(), 1);
@@ -100,10 +122,10 @@ mod tests {
     fn reregistering_an_existing_id_refreshes_its_address_and_heartbeat() {
         let mut registry = Registry::new();
         let t0 = Instant::now();
-        registry.register("node-1".to_string(), "10.0.0.1".to_string(), t0);
+        registry.register("node-1".to_string(), "10.0.0.1".to_string(), 4.0, 8 * 1024 * 1024 * 1024, t0);
 
         let t1 = t0 + Duration::from_secs(5);
-        registry.register("node-1".to_string(), "10.0.0.2".to_string(), t1);
+        registry.register("node-1".to_string(), "10.0.0.2".to_string(), 4.0, 8 * 1024 * 1024 * 1024, t1);
 
         let statuses = registry.list(t1);
         assert_eq!(statuses.len(), 1, "re-registering must not create a second entry");
@@ -115,10 +137,10 @@ mod tests {
     fn heartbeat_on_a_known_node_updates_its_last_heartbeat() {
         let mut registry = Registry::new();
         let t0 = Instant::now();
-        registry.register("node-1".to_string(), "10.0.0.1".to_string(), t0);
+        registry.register("node-1".to_string(), "10.0.0.1".to_string(), 4.0, 8 * 1024 * 1024 * 1024, t0);
 
         let t1 = t0 + Duration::from_secs(10);
-        registry.heartbeat("node-1", t1).unwrap();
+        registry.heartbeat("node-1", 0.0, 0, t1).unwrap();
 
         let statuses = registry.list(t1);
         assert_eq!(statuses[0].last_seen_secs, 0);
@@ -127,7 +149,7 @@ mod tests {
     #[test]
     fn heartbeat_on_an_unknown_node_returns_unknown_node_error() {
         let mut registry = Registry::new();
-        let err = registry.heartbeat("missing", Instant::now()).unwrap_err();
+        let err = registry.heartbeat("missing", 0.0, 0, Instant::now()).unwrap_err();
         assert_eq!(err, UnknownNode("missing".to_string()));
         assert_eq!(err.to_string(), "unknown node 'missing'");
     }
@@ -136,7 +158,7 @@ mod tests {
     fn list_reports_dead_once_a_node_exceeds_the_dead_threshold() {
         let mut registry = Registry::new();
         let t0 = Instant::now();
-        registry.register("node-1".to_string(), "10.0.0.1".to_string(), t0);
+        registry.register("node-1".to_string(), "10.0.0.1".to_string(), 4.0, 8 * 1024 * 1024 * 1024, t0);
 
         let just_under = t0 + Duration::from_secs(14);
         assert_eq!(registry.list(just_under)[0].status, NodeState::Alive);
@@ -149,8 +171,8 @@ mod tests {
     fn list_is_sorted_by_id() {
         let mut registry = Registry::new();
         let now = Instant::now();
-        registry.register("node-2".to_string(), "10.0.0.2".to_string(), now);
-        registry.register("node-1".to_string(), "10.0.0.1".to_string(), now);
+        registry.register("node-2".to_string(), "10.0.0.2".to_string(), 4.0, 8 * 1024 * 1024 * 1024, now);
+        registry.register("node-1".to_string(), "10.0.0.1".to_string(), 4.0, 8 * 1024 * 1024 * 1024, now);
 
         let statuses = registry.list(now);
         assert_eq!(statuses.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), vec!["node-1", "node-2"]);
@@ -173,7 +195,7 @@ mod tests {
     fn resolve_on_an_alive_node_returns_its_address() {
         let mut registry = Registry::new();
         let now = Instant::now();
-        registry.register("node-1".to_string(), "10.0.0.1".to_string(), now);
+        registry.register("node-1".to_string(), "10.0.0.1".to_string(), 4.0, 8 * 1024 * 1024 * 1024, now);
         assert_eq!(registry.resolve("node-1", now), Ok("10.0.0.1".to_string()));
     }
 
@@ -181,7 +203,7 @@ mod tests {
     fn resolve_on_a_dead_node_returns_dead_error_with_elapsed_seconds() {
         let mut registry = Registry::new();
         let t0 = Instant::now();
-        registry.register("node-1".to_string(), "10.0.0.1".to_string(), t0);
+        registry.register("node-1".to_string(), "10.0.0.1".to_string(), 4.0, 8 * 1024 * 1024 * 1024, t0);
 
         let at_threshold = t0 + DEAD_THRESHOLD;
         let err = registry.resolve("node-1", at_threshold).unwrap_err();
@@ -189,5 +211,34 @@ mod tests {
             err,
             ResolveError::Dead { id: "node-1".to_string(), last_seen_secs: DEAD_THRESHOLD.as_secs() }
         );
+    }
+
+    #[test]
+    fn register_initializes_committed_resources_to_zero() {
+        let mut registry = Registry::new();
+        let now = Instant::now();
+        registry.register("node-1".to_string(), "10.0.0.1".to_string(), 4.0, 8 * 1024 * 1024 * 1024, now);
+
+        let statuses = registry.list(now);
+        assert_eq!(statuses[0].capacity_cpu, 4.0);
+        assert_eq!(statuses[0].capacity_memory, 8 * 1024 * 1024 * 1024);
+        assert_eq!(statuses[0].committed_cpu, 0.0);
+        assert_eq!(statuses[0].committed_memory, 0);
+    }
+
+    #[test]
+    fn heartbeat_updates_committed_resources_without_changing_capacity() {
+        let mut registry = Registry::new();
+        let t0 = Instant::now();
+        registry.register("node-1".to_string(), "10.0.0.1".to_string(), 4.0, 8 * 1024 * 1024 * 1024, t0);
+
+        let t1 = t0 + Duration::from_secs(5);
+        registry.heartbeat("node-1", 2.0, 1024 * 1024 * 1024, t1).unwrap();
+
+        let statuses = registry.list(t1);
+        assert_eq!(statuses[0].committed_cpu, 2.0);
+        assert_eq!(statuses[0].committed_memory, 1024 * 1024 * 1024);
+        assert_eq!(statuses[0].capacity_cpu, 4.0, "heartbeat must not change capacity");
+        assert_eq!(statuses[0].capacity_memory, 8 * 1024 * 1024 * 1024, "heartbeat must not change capacity");
     }
 }

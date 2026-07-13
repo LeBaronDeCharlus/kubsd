@@ -46,11 +46,17 @@ pub fn spawn(mut registry: Registry, mut placements: Placements) -> (JoinHandle<
 fn handle_command(registry: &mut Registry, placements: &mut Placements, command: Command) {
     match command {
         Command::Register(id, addr, reply) => {
-            registry.register(id, addr, Instant::now());
+            // Stopgap literals, not defaults: `Command::Register` doesn't carry
+            // capacity data yet (that's Task 6's job of threading it through from
+            // the wire layer). Mirrors the same stopgap pattern Task 3 used in
+            // `Registry::list()` pending Task 4.
+            registry.register(id, addr, 0.0, 0, Instant::now());
             let _ = reply.send(());
         }
         Command::Heartbeat(id, reply) => {
-            let result = registry.heartbeat(&id, Instant::now());
+            // Stopgap literals, not defaults: see the comment on `Command::Register`
+            // above. `Command::Heartbeat` doesn't carry committed-resource data yet.
+            let result = registry.heartbeat(&id, 0.0, 0, Instant::now());
             let _ = reply.send(result);
         }
         Command::List(reply) => {
