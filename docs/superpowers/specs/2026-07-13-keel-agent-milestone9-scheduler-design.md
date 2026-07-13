@@ -330,3 +330,12 @@ changes: `run_apply`/`run_get`/`run_delete`/`dispatch` are untouched.
   unchanged by this milestone.
 - Whether `keel-controlplane` needs its own `rc.d` script is still the
   same open question carried since Milestone 7; unaddressed here too.
+- "Least-loaded" is best-effort under concurrent fresh applies: since
+  `RecordPlacement` only commits after a confirmed response, two
+  concurrent `PUT`s for two new, distinct jail names can both observe the
+  same (stale) counts and land on the same node instead of balancing
+  across two. This never corrupts state (stickiness and the
+  no-phantom-placement guarantee both still hold) and doesn't violate any
+  goal this milestone claims, since precise bin-packing under concurrency
+  is explicitly out of scope, but it's worth naming so a future reader
+  doesn't mistake it for a bug.
