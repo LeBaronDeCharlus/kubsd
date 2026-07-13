@@ -68,6 +68,7 @@ fn send_request(addr: &str, method: &str, path: &str, body: &str) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use keel_controlplane::placements::Placements;
     use keel_controlplane::registry::Registry;
     use keel_controlplane::worker;
     use std::net::TcpListener;
@@ -75,7 +76,7 @@ mod tests {
     fn start_test_control_plane() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let (_worker_handle, commands) = worker::spawn(Registry::new());
+        let (_worker_handle, commands) = worker::spawn(Registry::new(), Placements::new());
         thread::spawn(move || keel_controlplane::http::run(listener, commands));
         addr
     }
