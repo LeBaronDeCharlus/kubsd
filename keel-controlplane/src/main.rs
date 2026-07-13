@@ -1,3 +1,4 @@
+use keel_controlplane::placements::Placements;
 use keel_controlplane::registry::Registry;
 use keel_controlplane::worker;
 use std::net::TcpListener;
@@ -29,7 +30,7 @@ fn main() {
     let config = parse_args();
     eprintln!("keel-controlplane: starting (addr={})", config.addr);
 
-    let (_worker_handle, commands) = worker::spawn(Registry::new());
+    let (_worker_handle, commands) = worker::spawn(Registry::new(), Placements::new());
 
     let listener = TcpListener::bind(&config.addr).expect("failed to bind TCP listener");
     keel_controlplane::http::run(listener, commands);
