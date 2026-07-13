@@ -57,7 +57,10 @@ impl Registry {
                     addr: record.addr.clone(),
                     status: if elapsed < DEAD_THRESHOLD { NodeState::Alive } else { NodeState::Dead },
                     last_seen_secs: elapsed.as_secs(),
-                    ..Default::default()
+                    capacity_cpu: 0.0,
+                    capacity_memory: 0,
+                    committed_cpu: 0.0,
+                    committed_memory: 0,
                 }
             })
             .collect();

@@ -4,17 +4,13 @@ use serde::{Deserialize, Serialize};
 pub struct NodeRegistration {
     pub id: String,
     pub addr: String,
-    #[serde(default)]
     pub capacity_cpu: f64,
-    #[serde(default)]
     pub capacity_memory: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Heartbeat {
-    #[serde(default)]
     pub committed_cpu: f64,
-    #[serde(default)]
     pub committed_memory: u64,
 }
 
@@ -30,29 +26,10 @@ pub struct NodeStatus {
     pub addr: String,
     pub status: NodeState,
     pub last_seen_secs: u64,
-    #[serde(default)]
     pub capacity_cpu: f64,
-    #[serde(default)]
     pub capacity_memory: u64,
-    #[serde(default)]
     pub committed_cpu: f64,
-    #[serde(default)]
     pub committed_memory: u64,
-}
-
-impl Default for NodeStatus {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            addr: String::new(),
-            status: NodeState::Alive,
-            last_seen_secs: 0,
-            capacity_cpu: 0.0,
-            capacity_memory: 0,
-            committed_cpu: 0.0,
-            committed_memory: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

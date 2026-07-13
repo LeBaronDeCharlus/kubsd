@@ -349,7 +349,12 @@ mod tests {
     #[test]
     fn register_returns_200_and_the_node_appears_in_get_nodes() {
         let addr = start_test_server();
-        let (status, _) = send_request(&addr, "POST", "/nodes/register", "id: node-1\naddr: 10.0.0.1\n");
+        let (status, _) = send_request(
+            &addr,
+            "POST",
+            "/nodes/register",
+            "id: node-1\naddr: 10.0.0.1\ncapacity_cpu: 4.0\ncapacity_memory: 8589934592\n",
+        );
         assert_eq!(status, 200);
 
         let (status, body) = send_request(&addr, "GET", "/nodes", "");
@@ -361,8 +366,18 @@ mod tests {
     #[test]
     fn reregistering_the_same_id_updates_its_address_without_duplicating() {
         let addr = start_test_server();
-        send_request(&addr, "POST", "/nodes/register", "id: node-1\naddr: 10.0.0.1\n");
-        send_request(&addr, "POST", "/nodes/register", "id: node-1\naddr: 10.0.0.2\n");
+        send_request(
+            &addr,
+            "POST",
+            "/nodes/register",
+            "id: node-1\naddr: 10.0.0.1\ncapacity_cpu: 4.0\ncapacity_memory: 8589934592\n",
+        );
+        send_request(
+            &addr,
+            "POST",
+            "/nodes/register",
+            "id: node-1\naddr: 10.0.0.2\ncapacity_cpu: 4.0\ncapacity_memory: 8589934592\n",
+        );
 
         let (_, body) = send_request(&addr, "GET", "/nodes", "");
         assert_eq!(body.matches("node-1").count(), 1, "expected exactly one node-1 entry, got body: {body}");
@@ -372,7 +387,12 @@ mod tests {
     #[test]
     fn heartbeat_on_a_registered_node_returns_200() {
         let addr = start_test_server();
-        send_request(&addr, "POST", "/nodes/register", "id: node-1\naddr: 10.0.0.1\n");
+        send_request(
+            &addr,
+            "POST",
+            "/nodes/register",
+            "id: node-1\naddr: 10.0.0.1\ncapacity_cpu: 4.0\ncapacity_memory: 8589934592\n",
+        );
 
         let (status, _) = send_request(&addr, "POST", "/nodes/node-1/heartbeat", "");
         assert_eq!(status, 200);
@@ -434,7 +454,12 @@ mod tests {
     }
 
     fn register_node(cp_addr: &str, id: &str, node_addr: &str) {
-        send_request(cp_addr, "POST", "/nodes/register", &format!("id: {id}\naddr: {node_addr}\n"));
+        send_request(
+            cp_addr,
+            "POST",
+            "/nodes/register",
+            &format!("id: {id}\naddr: {node_addr}\ncapacity_cpu: 4.0\ncapacity_memory: 8589934592\n"),
+        );
     }
 
     #[test]
