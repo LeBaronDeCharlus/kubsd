@@ -10,7 +10,7 @@ const DEFAULT_SOCKET: &str = "/var/run/keel-agentd.sock";
 
 enum Target {
     Socket(PathBuf),
-    ControlPlane { addr: String, node: String },
+    ControlPlane { addr: String, node: Option<String> },
 }
 
 fn main() -> ExitCode {
@@ -20,12 +20,12 @@ fn main() -> ExitCode {
     let node = extract_flag(&mut args, "--node");
 
     let target = match (control_plane_addr, node) {
-        (Some(addr), Some(node)) => Target::ControlPlane { addr, node },
-        (None, None) => Target::Socket(socket),
-        _ => {
-            eprintln!("error: --control-plane-addr and --node must be given together");
+        (Some(addr), node) => Target::ControlPlane { addr, node },
+        (None, Some(_)) => {
+            eprintln!("error: --node requires --control-plane-addr");
             return ExitCode::FAILURE;
         }
+        (None, None) => Target::Socket(socket),
     };
 
     let result = match args.split_first() {
@@ -65,7 +65,8 @@ fn extract_socket_flag(args: &mut Vec<String>) -> Option<PathBuf> {
 fn jails_path(target: &Target, suffix: &str) -> String {
     match target {
         Target::Socket(_) => suffix.to_string(),
-        Target::ControlPlane { node, .. } => format!("/nodes/{node}{suffix}"),
+        Target::ControlPlane { node: Some(node), .. } => format!("/nodes/{node}{suffix}"),
+        Target::ControlPlane { node: None, .. } => suffix.to_string(),
     }
 }
 

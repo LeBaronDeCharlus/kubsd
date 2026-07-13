@@ -76,7 +76,8 @@ fn start_test_agentd_tcp(name: &str) -> String {
 fn start_test_control_plane_with_node(node_id: &str, node_addr: &str) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let (_worker_handle, commands) = keel_controlplane::worker::spawn(keel_controlplane::Registry::new());
+    let (_worker_handle, commands) =
+        keel_controlplane::worker::spawn(keel_controlplane::Registry::new(), keel_controlplane::Placements::new());
 
     let (reg_tx, reg_rx) = std::sync::mpsc::channel();
     commands
@@ -95,6 +96,20 @@ fn run_keelctl_routed(control_plane_addr: &str, node: &str, args: &[&str]) -> (b
         .arg(control_plane_addr)
         .arg("--node")
         .arg(node)
+        .output()
+        .expect("failed to run keelctl binary");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+fn run_keelctl_scheduled(control_plane_addr: &str, args: &[&str]) -> (bool, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_keelctl"))
+        .args(args)
+        .arg("--control-plane-addr")
+        .arg(control_plane_addr)
         .output()
         .expect("failed to run keelctl binary");
     (
@@ -134,19 +149,21 @@ fn apply_through_the_control_plane_to_an_unknown_node_fails() {
 }
 
 #[test]
-fn control_plane_addr_without_node_is_a_usage_error() {
-    let output = Command::new(env!("CARGO_BIN_EXE_keelctl"))
-        .args(["get"])
-        .arg("--control-plane-addr")
-        .arg("127.0.0.1:1")
-        .output()
-        .expect("failed to run keelctl binary");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--control-plane-addr and --node must be given together"),
-        "got: {stderr}"
-    );
+fn control_plane_addr_without_node_schedules_through_the_control_plane() {
+    let node_addr = start_test_agentd_tcp("scheduled_round_trip");
+    let control_plane_addr = start_test_control_plane_with_node("node-1", &node_addr);
+    let spec_path = write_spec_file("scheduled_round_trip", "web-1");
+
+    let (ok, _, stderr) =
+        run_keelctl_scheduled(&control_plane_addr, &["apply", "-f", spec_path.to_str().unwrap()]);
+    assert!(ok, "apply failed: {stderr}");
+
+    let (ok, stdout, stderr) = run_keelctl_scheduled(&control_plane_addr, &["get", "web-1"]);
+    assert!(ok, "get failed: {stderr}");
+    assert!(stdout.contains("running: true"), "expected running: true, got: {stdout}");
+
+    let (ok, _, stderr) = run_keelctl_scheduled(&control_plane_addr, &["delete", "web-1"]);
+    assert!(ok, "delete failed: {stderr}");
 }
 
 #[test]
@@ -159,10 +176,7 @@ fn node_without_control_plane_addr_is_a_usage_error() {
         .expect("failed to run keelctl binary");
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--control-plane-addr and --node must be given together"),
-        "got: {stderr}"
-    );
+    assert!(stderr.contains("--node requires --control-plane-addr"), "got: {stderr}");
 }
 
 #[test]
