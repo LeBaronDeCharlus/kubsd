@@ -8,11 +8,12 @@ Date: 2026-07-13
 Milestone 9 gave `keel-controlplane` a scheduler, but a deliberately minimal
 one: it picks the `Alive` node with the fewest jails *recorded*, a pure
 count, with no idea how much CPU or memory those jails actually asked for.
-The Milestone 9 design spec named this exact gap in its Non-Goals:
-"Resource-aware bin-packing... gated on nodes reporting capacity at all,
-which they don't today." This milestone closes it: nodes learn and report
-their own capacity and committed load, and the scheduler ranks by resource
-headroom instead of jail count.
+The Milestone 9 design spec named this exact gap in its Open Questions /
+Deferred Decisions: "Resource-aware placement (real cpu/memory bin-packing)
+stays future work, gated on nodes reporting capacity at all, which they
+don't today." This milestone closes it: nodes learn and report their own
+capacity and committed load, and the scheduler ranks by resource headroom
+instead of jail count.
 
 The central architectural constraint carried forward from Milestones 8-9 is
 that `keel-controlplane` never deserializes a `JailSpec` and has no
@@ -464,6 +465,15 @@ milestone's HTTP-layer surface is exactly these two handlers.
   registry/http tests that construct `NodeStatus`/call `register`/
   `heartbeat` need their call sites and literal comparisons updated for
   the new fields, not new behavior, just a wider signature.
+- `keel-controlplane::placements`: `counts()` and its three existing
+  callers in this file's own test module (`counts_aggregates_multiple_
+  jails_on_the_same_node`, `counts_on_an_empty_table_is_empty`, and the two
+  `.counts()` assertions inside
+  `set_again_on_the_same_jail_overwrites_rather_than_duplicating`) are
+  deleted along with the method, per the Non-Goals above; the last test
+  keeps its `get`-based assertion, just drops the `.counts()` lines.
+  `set`/`get`/`remove` themselves are untouched and keep their existing
+  tests as-is.
 - `keel-controlplane::scheduler`: unit tests for `pick_node` mirroring
   Milestone 9's exact test shapes but with resource data instead of
   counts: no alive nodes; a single alive node; the node with more headroom
