@@ -47,8 +47,8 @@
           <tr><td><code>keel-zfs</code></td><td>The <code>ZfsManager</code> trait: clone a jail's root filesystem from a base dataset, destroy it again. Fake plus a real implementation over <code>zfs(8)</code>.</td></tr>
           <tr><td><code>keel-net</code></td><td>The <code>NetManager</code> trait: create a bridge, attach a jail to it over an <code>epair(4)</code> pair with a static address, tear it down. Fake plus a real implementation over FreeBSD networking commands.</td></tr>
           <tr><td><code>keel-agentd</code></td><td>The reconciliation daemon: a generic <code>Reconciler&lt;J, Z, N&gt;</code> over the three traits above, a crash-safe on-disk state store, crash-loop backoff, and a local HTTP API over a Unix socket.</td></tr>
-          <tr><td><code>keelctl</code></td><td>The CLI: <code>apply</code>, <code>get</code>, <code>delete</code>, talking to <code>keel-agentd</code>'s Unix socket.</td></tr>
-          <tr><td><code>keel-controlplane</code></td><td>The node registry: register/heartbeat/list nodes over TCP, with liveness computed on read rather than tracked by a background sweep.</td></tr>
+          <tr><td><code>keelctl</code></td><td>The CLI: <code>apply</code>, <code>get</code>, <code>delete</code>, talking to <code>keel-agentd</code>'s Unix socket directly, or routed through <code>keel-controlplane</code> to a named node.</td></tr>
+          <tr><td><code>keel-controlplane</code></td><td>The node registry and request router: register/heartbeat/list nodes over TCP (liveness computed on read, not a background sweep), plus byte-opaque forwarding of apply/get/delete to a named node's <code>keel-agentd</code>.</td></tr>
         </tbody>
       </table>
     </div>
@@ -72,6 +72,14 @@
     <div class="container">
       <h2>Single-worker-thread ownership</h2>
       <p>Both <code>keel-agentd</code> and <code>keel-controlplane</code> use the same concurrency pattern: a single worker thread exclusively owns the mutable state (the <code>Reconciler</code> in one case, an in-memory <code>Registry</code> in the other), reachable only through an <code>mpsc</code> command channel. The HTTP server (a small hand-rolled parser over <code>httparse</code>, no async runtime) and, for <code>keel-agentd</code>, the reconciliation timer, only ever reach that state through the channel, so there is never a second concurrent owner to synchronize against.</p>
+    </div>
+  </section>
+
+  <section id="routing">
+    <div class="container">
+      <h2>Routing a spec to a node</h2>
+      <p>A node is a routing-layer concept only: it never appears in a <code>JailSpec</code>. When a request arrives at <code>keel-controlplane</code> for <code>/nodes/&lt;id&gt;/jails/...</code>, the worker thread first resolves <code>&lt;id&gt;</code> against the <code>Registry</code>, the same liveness computation <code>GET /nodes</code> uses, rejecting an unknown or <code>Dead</code> node immediately, before any network call. Only once a live address comes back does the handler open a fresh TCP connection to that node's <code>keel-agentd</code>, forward the request byte-for-byte, and relay the response back untouched; the body is never deserialized, so <code>keel-controlplane</code> has no dependency on <code>keel-spec</code>.</p>
+      <p>On the receiving end, <code>keel-agentd</code>'s jails API is transport-agnostic: the same route table serves both the always-on Unix socket and a second, entirely optional TCP listener, bound to <code>--advertise-addr</code> only when the node is configured to register with a control plane. A node with no control-plane flags set behaves exactly as it did before this existed.</p>
     </div>
   </section>
 </main>

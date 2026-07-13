@@ -62,11 +62,11 @@
           <tr><td>Isolation</td><td>namespaces + cgroups</td><td>jails + <code>rctl(8)</code></td></tr>
           <tr><td>Filesystem</td><td>overlay/container images</td><td>ZFS clones of a base dataset</td></tr>
           <tr><td>Networking</td><td>CNI, overlay networks, Services</td><td>VNET + <code>epair(4)</code> + <code>bridge(4)</code>, static IPs</td></tr>
-          <tr><td>Scope</td><td>multi-node cluster, scheduler</td><td>single node (kubelet-equivalent only)</td></tr>
-          <tr><td>Control plane</td><td>API server + etcd + scheduler</td><td>none yet, one local daemon per host</td></tr>
+          <tr><td>Scope</td><td>multi-node cluster, scheduler</td><td>multi-node (manual placement), no scheduler yet</td></tr>
+          <tr><td>Control plane</td><td>API server + etcd + scheduler</td><td>node registry + spec routing, no scheduler</td></tr>
         </tbody>
       </table>
-      <p>In other words: what exists today is the FreeBSD analog of a <strong>kubelet</strong>, not a full cluster. There is no scheduler, no multi-node API server, and no cluster networking yet; see the <a href="journey.html">journey</a> for how the project got here and what's next.</p>
+      <p>In other words: what exists today spans a <strong>kubelet</strong> plus a thin multi-node control plane (node registry and routing a spec to a node you name yourself), not a full cluster. There is no scheduler and no cluster networking yet; see the <a href="journey.html">journey</a> for how the project got here and what's next.</p>
     </div>
   </section>
 

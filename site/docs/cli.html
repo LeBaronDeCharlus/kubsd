@@ -32,44 +32,50 @@
   <section class="page-header">
     <div class="container">
       <h1>keelctl CLI reference</h1>
-      <p class="lead">keelctl talks to keel-agentd's local HTTP API over its Unix socket.</p>
+      <p class="lead">keelctl talks to keel-agentd's local HTTP API over its Unix socket, or routes through keel-controlplane to a specific node.</p>
     </div>
   </section>
 
   <section id="socket-flag">
     <div class="container">
-      <h2>Global flag</h2>
+      <h2>Global flags</h2>
       <table>
         <thead><tr><th>Flag</th><th>Default</th><th>Meaning</th></tr></thead>
         <tbody>
-          <tr><td><code>--socket PATH</code></td><td><code>/var/run/keel-agentd.sock</code></td><td>Path to the keel-agentd Unix socket to talk to.</td></tr>
+          <tr><td><code>--socket PATH</code></td><td><code>/var/run/keel-agentd.sock</code></td><td>Path to the keel-agentd Unix socket to talk to. Ignored if <code>--control-plane-addr</code>/<code>--node</code> are given.</td></tr>
+          <tr><td><code>--control-plane-addr ADDR</code></td><td>none</td><td>Address of a keel-controlplane to route through instead of a local socket. Must be given together with <code>--node</code>.</td></tr>
+          <tr><td><code>--node ID</code></td><td>none</td><td>Which node's keel-agentd to route the request to, resolved by the control plane. Must be given together with <code>--control-plane-addr</code>.</td></tr>
         </tbody>
       </table>
+      <p>Giving exactly one of <code>--control-plane-addr</code>/<code>--node</code> without the other is a usage error. Giving neither preserves keelctl's original behavior exactly: talk directly to <code>--socket</code> (or its default).</p>
     </div>
   </section>
 
   <section id="apply">
     <div class="container">
       <h2>keelctl apply -f FILE</h2>
-      <p>Reads a <code>JailSpec</code> YAML file, validates it locally, and sends it as a <code>PUT /jails/&lt;name&gt;</code> request (the name comes from the spec's own <code>metadata.name</code>).</p>
-      <pre>keelctl apply -f jail.yaml</pre>
+      <p>Reads a <code>JailSpec</code> YAML file, validates it locally, and sends it as a <code>PUT /jails/&lt;name&gt;</code> request (the name comes from the spec's own <code>metadata.name</code>), or, when routed, <code>PUT /nodes/&lt;node&gt;/jails/&lt;name&gt;</code>.</p>
+      <pre>keelctl apply -f jail.yaml
+keelctl --control-plane-addr 10.0.0.2:7620 --node node-4 apply -f jail.yaml</pre>
     </div>
   </section>
 
   <section id="get">
     <div class="container">
       <h2>keelctl get [name]</h2>
-      <p>With no argument, lists every jail keel-agentd is tracking (<code>GET /jails</code>). With a name, fetches just that one (<code>GET /jails/&lt;name&gt;</code>).</p>
+      <p>With no argument, lists every jail keel-agentd (or the routed-to node) is tracking (<code>GET /jails</code>, or <code>GET /nodes/&lt;node&gt;/jails</code> when routed). With a name, fetches just that one (<code>GET /jails/&lt;name&gt;</code>, or <code>GET /nodes/&lt;node&gt;/jails/&lt;name&gt;</code>).</p>
       <pre>keelctl get
-keelctl get web-1</pre>
+keelctl get web-1
+keelctl --control-plane-addr 10.0.0.2:7620 --node node-4 get web-1</pre>
     </div>
   </section>
 
   <section id="delete">
     <div class="container">
       <h2>keelctl delete NAME</h2>
-      <p>Tears down the named jail, its ZFS dataset, its network attachment, and its resource limits (<code>DELETE /jails/&lt;name&gt;</code>).</p>
-      <pre>keelctl delete web-1</pre>
+      <p>Tears down the named jail, its ZFS dataset, its network attachment, and its resource limits (<code>DELETE /jails/&lt;name&gt;</code>, or <code>DELETE /nodes/&lt;node&gt;/jails/&lt;name&gt;</code> when routed).</p>
+      <pre>keelctl delete web-1
+keelctl --control-plane-addr 10.0.0.2:7620 --node node-4 delete web-1</pre>
     </div>
   </section>
 

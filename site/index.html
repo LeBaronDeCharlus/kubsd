@@ -46,8 +46,9 @@
     <div class="container">
       <div class="status-banner">
         <strong>Sub-project 1</strong> (single-node jail reconciliation daemon) is complete.
-        <strong>Sub-project 2</strong> (multi-node control plane) is in progress: the node
-        registry is done, spec routing is not yet designed.
+        <strong>Sub-project 2</strong> (multi-node control plane) is complete: the node
+        registry and routing a spec to a specific node are both done. A scheduler for
+        bin-packing jails across nodes is not yet designed.
         <a href="journey.html">See the full journey &rarr;</a>
       </div>
     </div>
@@ -87,7 +88,7 @@
         <tbody>
           <tr><td>Workload unit</td><td>Pod (Linux containers)</td><td>Jail</td></tr>
           <tr><td>Filesystem</td><td>overlay/container images</td><td>ZFS clones of a base dataset</td></tr>
-          <tr><td>Scope</td><td>multi-node cluster, scheduler</td><td>single node (kubelet-equivalent only)</td></tr>
+          <tr><td>Scope</td><td>multi-node cluster, scheduler</td><td>multi-node (manual placement), no scheduler yet</td></tr>
         </tbody>
       </table>
       <p><a href="why.html#vs-kubernetes">Read the full comparison &rarr;</a></p>

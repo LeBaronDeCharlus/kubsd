@@ -54,12 +54,13 @@ drop-in replacement, and today it is far smaller in scope:
 | Isolation | namespaces + cgroups | jails + `rctl(8)` |
 | Filesystem | overlay/container images | ZFS clones of a base dataset |
 | Networking | CNI, overlay networks, Services | VNET + `epair(4)` + `bridge(4)`, static IPs |
-| Scope | multi-node cluster, scheduler | single node (kubelet-equivalent only) |
-| Control plane | API server + etcd + scheduler | none yet, one local daemon per host |
+| Scope | multi-node cluster, scheduler | multi-node (manual placement), no scheduler yet |
+| Control plane | API server + etcd + scheduler | node registry + spec routing, no scheduler |
 
-In other words: what exists today is the FreeBSD analog of a **kubelet**,
-not a full cluster. There is no scheduler, no multi-node API server, and no
-cluster networking yet; see [Roadmap](#roadmap) below.
+In other words: what exists today spans a **kubelet** plus a thin
+multi-node control plane (node registry and routing a spec to a node you
+name yourself), not a full cluster. There is no scheduler and no cluster
+networking yet; see [Roadmap](#roadmap) below.
 
 ## Why you'd use it
 
@@ -305,9 +306,65 @@ Milestone 7 finished at 122 tests on macOS (96 inherited, 26 new across
 CLI flags and registration client), zero warnings, final whole-branch
 review clean with no Critical or Important findings.
 
+### Milestone 8: routing jail specs to a specific node
+
+The second milestone of sub-project 2, and the one that completes the
+multi-node control plane: given the node registry from Milestone 7, a
+client can now apply, get, or delete a `JailSpec` on a specific, named
+node by routing the request through `keel-controlplane`, rather than
+connecting to that node's `keel-agentd` directly. The caller always
+names the exact node; there is still no scheduler and no bin-packing,
+that stays a separate, not-yet-designed future sub-project.
+
+`keel-controlplane` gained `Registry::resolve` and four new HTTP routes
+(`PUT`/`GET`/`DELETE /nodes/<id>/jails/...`) that forward a request
+byte-for-byte over a fresh TCP connection to the resolved node's
+`keel-agentd`, relaying the response back untouched. It never
+deserializes the spec body, and gained no new dependency on `keel-spec`
+or `keel-agentd`'s wire types. Unknown or `Dead` nodes are rejected
+before any connection is attempted, not after a timeout. `keel-agentd`
+gained a second, entirely optional TCP listener serving the exact same
+jails API already served by its Unix socket, bound to `--advertise-addr`
+(whose contract changes from Milestone 7's undialed display string to a
+real, dialable `host:port`) only when the Milestone 7 control-plane
+flags are set; the Unix socket itself is completely unchanged. `keelctl`
+gained `--control-plane-addr`/`--node` flags to route through the
+control plane; omitting both preserves its exact prior behavior.
+
+VM verification found and fixed a real, if minor, test-only bug: a test
+helper added for the forwarding routes read an incoming request with a
+single, non-looping socket read, while the real forwarding code sends it
+as two separate writes before shutting down its write half. Under load
+that could leave unread bytes queued when the test helper's stream was
+dropped, and a BSD-derived TCP stack can turn that into a spurious reset
+instead of a clean close. Fixed by draining reads to EOF before
+responding.
+
+The VM run also turned up two real, pre-existing product bugs, both
+invisible to any fakes-backed test and both the same underlying gap:
+neither `keel-jail`'s `ProcessJailRuntime::destroy` nor `keel-zfs`'s
+`CliZfsManager::destroy_dataset` ever mapped a "doesn't exist" failure
+to the `NotFound` error variant `Reconciler::delete`'s Milestone 4
+tolerance already expects, so deleting a jail record whose provisioning
+failed before it was ever created (a scenario that had simply never
+come up in five prior milestones of VM testing) failed outright instead
+of succeeding as a no-op. Fixed in both crates by matching the real
+command's own "not found" stderr text, the same idiom already used
+elsewhere in each file, verified with new FreeBSD-only regression tests
+and a direct end-to-end reproduction of the original failure.
+
+Milestone 8 finished at 139 tests on macOS (122 inherited, 17 new across
+`keel-controlplane`'s forwarding layer, `keel-agentd`'s TCP listener, and
+`keelctl`'s routed mode), final whole-branch review clean, and full VM
+verification across three real nodes: a spec applied to one specific
+node landed there and nowhere else, routed `get`/`delete` worked,
+unknown-node and dead-node targets were rejected with clear errors
+before any connection attempt, and plain single-node `keelctl` usage
+stayed completely unaffected throughout.
+
 ## Roadmap
 
-**Sub-project 1: single-node jail reconciliation daemon — complete**
+**Sub-project 1: single-node jail reconciliation daemon (complete)**
 
 1. ~~FreeBSD dev environment + jail spec language (parsing, validation)~~ done
 2. ~~Jail lifecycle (`jail(8)`/`jls(8)`/`rctl(8)`) and ZFS clone provisioning~~ done
@@ -316,10 +373,10 @@ review clean with no Critical or Important findings.
 5. ~~Local HTTP API + CLI, wired to the real jail/ZFS/net implementations~~ done
 6. ~~`rc.d` service integration and an end-to-end smoke test on the FreeBSD VM~~ done
 
-**Sub-project 2: multi-node control plane — in progress**
+**Sub-project 2: multi-node control plane (complete)**
 
 7. ~~Node registry: `keel-controlplane`, register/heartbeat/list over TCP, self-healing membership~~ done
-8. Routing jail specs to a specific node through the control plane (not yet designed)
+8. ~~Routing jail specs to a specific node through the control plane~~ done
 
 **Not yet designed** (future sub-projects, each will get its own spec):
 
