@@ -1,4 +1,4 @@
-use crate::wire::{ErrorBody, NodeRegistration};
+use crate::wire::{ErrorBody, Heartbeat, NodeRegistration};
 use crate::worker::{Command, ScheduleOrResolveError};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -110,7 +110,7 @@ fn route(request: &ParsedRequest, commands: &Sender<Command>) -> (u16, Vec<u8>) 
         request.path.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
     match (request.method.as_str(), segments.as_slice()) {
         ("POST", ["nodes", "register"]) => handle_register(&request.body, commands),
-        ("POST", ["nodes", id, "heartbeat"]) => handle_heartbeat(id, commands),
+        ("POST", ["nodes", id, "heartbeat"]) => handle_heartbeat(id, &request.body, commands),
         ("GET", ["nodes"]) => handle_list(commands),
         ("PUT", ["nodes", id, "jails", name]) => {
             let (status, body) = handle_forward(id, "PUT", &format!("/jails/{name}"), &request.body, commands);
@@ -236,14 +236,16 @@ fn handle_register(body: &[u8], commands: &Sender<Command>) -> (u16, Vec<u8>) {
     }
 }
 
-fn handle_heartbeat(id: &str, commands: &Sender<Command>) -> (u16, Vec<u8>) {
+fn handle_heartbeat(id: &str, body: &[u8], commands: &Sender<Command>) -> (u16, Vec<u8>) {
+    let heartbeat: Heartbeat = match serde_yaml::from_slice(body) {
+        Ok(h) => h,
+        Err(e) => return error_response(400, format!("invalid YAML: {e}")),
+    };
     let (reply_tx, reply_rx) = mpsc::channel();
-    // Stopgap literals, not defaults: this handler doesn't parse the
-    // request body yet (that's Task 7's job of deserializing the new
-    // `Heartbeat` wire type). Mirrors the same stopgap pattern already
-    // used in worker.rs's Command::Register/Heartbeat arms pending this
-    // milestone's later tasks.
-    if commands.send(Command::Heartbeat(id.to_string(), 0.0, 0, reply_tx)).is_err() {
+    if commands
+        .send(Command::Heartbeat(id.to_string(), heartbeat.committed_cpu, heartbeat.committed_memory, reply_tx))
+        .is_err()
+    {
         return error_response(500, "control plane worker is not running".to_string());
     }
     match reply_rx.recv() {
@@ -408,14 +410,24 @@ mod tests {
             "id: node-1\naddr: 10.0.0.1\ncapacity_cpu: 4.0\ncapacity_memory: 8589934592\n",
         );
 
-        let (status, _) = send_request(&addr, "POST", "/nodes/node-1/heartbeat", "");
+        let (status, _) = send_request(
+            &addr,
+            "POST",
+            "/nodes/node-1/heartbeat",
+            "committed_cpu: 1\ncommitted_memory: 1073741824\n",
+        );
         assert_eq!(status, 200);
     }
 
     #[test]
     fn heartbeat_on_an_unknown_node_returns_404() {
         let addr = start_test_server();
-        let (status, body) = send_request(&addr, "POST", "/nodes/missing/heartbeat", "");
+        let (status, body) = send_request(
+            &addr,
+            "POST",
+            "/nodes/missing/heartbeat",
+            "committed_cpu: 0\ncommitted_memory: 0\n",
+        );
         assert_eq!(status, 404);
         assert!(body.contains("missing"));
     }
@@ -432,6 +444,37 @@ mod tests {
     fn register_with_invalid_yaml_returns_400() {
         let addr = start_test_server();
         let (status, _) = send_request(&addr, "POST", "/nodes/register", "not: valid: yaml: at: all: -");
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn get_nodes_includes_capacity_and_committed_resources() {
+        let addr = start_test_server();
+        send_request(
+            &addr,
+            "POST",
+            "/nodes/register",
+            "id: node-1\naddr: 10.0.0.1\ncapacity_cpu: 4\ncapacity_memory: 8589934592\n",
+        );
+
+        let (_, body) = send_request(&addr, "GET", "/nodes", "");
+        assert!(body.contains("capacity_cpu: 4"), "got: {body}");
+        assert!(body.contains("capacity_memory: 8589934592"), "got: {body}");
+        assert!(body.contains("committed_cpu: 0"), "got: {body}");
+        assert!(body.contains("committed_memory: 0"), "got: {body}");
+    }
+
+    #[test]
+    fn heartbeat_with_invalid_yaml_body_returns_400() {
+        let addr = start_test_server();
+        send_request(
+            &addr,
+            "POST",
+            "/nodes/register",
+            "id: node-1\naddr: 10.0.0.1\ncapacity_cpu: 4\ncapacity_memory: 8589934592\n",
+        );
+
+        let (status, _) = send_request(&addr, "POST", "/nodes/node-1/heartbeat", "not: valid: yaml: at: all: -");
         assert_eq!(status, 400);
     }
 
