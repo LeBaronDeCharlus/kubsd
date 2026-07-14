@@ -6,6 +6,7 @@ pub mod record;
 pub mod reconciler;
 pub mod registration;
 pub mod store;
+pub mod tls;
 pub mod wire;
 pub mod worker;
 
