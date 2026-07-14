@@ -4,6 +4,8 @@ use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+// each parameter is independently needed by the registration loop; bundling into a struct would be over-engineering for this single call site
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     node_id: String,
     advertise_addr: String,
