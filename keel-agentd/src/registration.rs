@@ -11,18 +11,19 @@ pub fn spawn(
     heartbeat_interval: Duration,
     capacity_cpu: f64,
     capacity_memory: u64,
+    token: String,
     commands: Sender<crate::worker::Command>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut registered = false;
         loop {
             if !registered {
-                match register_once(&control_plane_addr, &node_id, &advertise_addr, capacity_cpu, capacity_memory) {
+                match register_once(&control_plane_addr, &node_id, &advertise_addr, capacity_cpu, capacity_memory, &token) {
                     Ok(()) => registered = true,
                     Err(e) => eprintln!("keel-agentd: registration failed: {e}"),
                 }
             } else {
-                match heartbeat_once(&control_plane_addr, &node_id, &commands) {
+                match heartbeat_once(&control_plane_addr, &node_id, &commands, &token) {
                     Ok(()) => {}
                     Err(e) => {
                         eprintln!("keel-agentd: heartbeat failed: {e}");
@@ -41,28 +42,29 @@ fn register_once(
     advertise_addr: &str,
     capacity_cpu: f64,
     capacity_memory: u64,
+    token: &str,
 ) -> Result<(), String> {
     let body = format!(
         "id: {node_id}\naddr: {advertise_addr}\ncapacity_cpu: {capacity_cpu}\ncapacity_memory: {capacity_memory}\n"
     );
-    send_request(control_plane_addr, "POST", "/nodes/register", &body)
+    send_request(control_plane_addr, "POST", "/nodes/register", &body, token)
 }
 
-fn heartbeat_once(control_plane_addr: &str, node_id: &str, commands: &Sender<crate::worker::Command>) -> Result<(), String> {
+fn heartbeat_once(control_plane_addr: &str, node_id: &str, commands: &Sender<crate::worker::Command>, token: &str) -> Result<(), String> {
     let (tx, rx) = std::sync::mpsc::channel();
     commands
         .send(crate::worker::Command::CommittedResources(tx))
         .map_err(|_| "worker is not running".to_string())?;
     let (committed_cpu, committed_memory) = rx.recv().map_err(|_| "worker did not respond".to_string())?;
     let body = format!("committed_cpu: {committed_cpu}\ncommitted_memory: {committed_memory}\n");
-    send_request(control_plane_addr, "POST", &format!("/nodes/{node_id}/heartbeat"), &body)
+    send_request(control_plane_addr, "POST", &format!("/nodes/{node_id}/heartbeat"), &body, token)
 }
 
-fn send_request(addr: &str, method: &str, path: &str, body: &str) -> Result<(), String> {
+fn send_request(addr: &str, method: &str, path: &str, body: &str, token: &str) -> Result<(), String> {
     let mut stream =
         TcpStream::connect(addr).map_err(|e| format!("failed to connect to {addr}: {e}"))?;
     let request =
-        format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}", body.len());
     stream.write_all(request.as_bytes()).map_err(|e| format!("failed to send request: {e}"))?;
     stream.shutdown(std::net::Shutdown::Write).ok();
 
@@ -92,18 +94,19 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
 
-    fn start_test_control_plane() -> String {
+    fn start_test_control_plane(token: &str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let (_worker_handle, commands) = worker::spawn(Registry::new(), Placements::new());
-        thread::spawn(move || keel_controlplane::http::run(listener, commands));
+        let token = std::sync::Arc::new(token.to_string());
+        thread::spawn(move || keel_controlplane::http::run(listener, commands, token));
         addr
     }
 
-    fn get_nodes(control_plane_addr: &str) -> String {
+    fn get_nodes(control_plane_addr: &str, token: &str) -> String {
         let mut stream = TcpStream::connect(control_plane_addr).unwrap();
         stream
-            .write_all(b"GET /nodes HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+            .write_all(format!("GET /nodes HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n").as_bytes())
             .unwrap();
         stream.shutdown(std::net::Shutdown::Write).ok();
         let mut response = Vec::new();
@@ -113,7 +116,7 @@ mod tests {
 
     #[test]
     fn registers_and_then_keeps_heartbeating() {
-        let control_plane_addr = start_test_control_plane();
+        let control_plane_addr = start_test_control_plane("test-token");
         let (_worker_handle, commands) = crate::worker::spawn(
             crate::Reconciler::new(
                 keel_jail::FakeJailRuntime::new(),
@@ -131,11 +134,12 @@ mod tests {
             Duration::from_millis(50),
             4.0,
             8 * 1024 * 1024 * 1024,
+            "test-token".to_string(),
             commands,
         );
 
         thread::sleep(Duration::from_millis(200));
-        let body = get_nodes(&control_plane_addr);
+        let body = get_nodes(&control_plane_addr, "test-token");
         assert!(body.contains("node-1"), "expected node-1 to have registered, got: {body}");
         assert!(body.contains("Alive"), "expected node-1 to be Alive, got: {body}");
         assert!(body.contains("capacity_cpu: 4"), "expected reported capacity in body: {body}");
@@ -143,7 +147,7 @@ mod tests {
 
     #[test]
     fn heartbeats_report_the_reconcilers_committed_resources() {
-        let control_plane_addr = start_test_control_plane();
+        let control_plane_addr = start_test_control_plane("test-token");
         let zfs = keel_zfs::FakeZfsManager::new();
         zfs.seed_dataset("zroot/keel/base/14.2-web");
         let reconciler = crate::Reconciler::new(
@@ -182,11 +186,40 @@ mod tests {
 
         let control_plane_addr_clone = control_plane_addr.clone();
         let _handle =
-            spawn("node-1".to_string(), "10.0.0.1".to_string(), control_plane_addr_clone, Duration::from_millis(50), 4.0, 8 * 1024 * 1024 * 1024, commands);
+            spawn("node-1".to_string(), "10.0.0.1".to_string(), control_plane_addr_clone, Duration::from_millis(50), 4.0, 8 * 1024 * 1024 * 1024, "test-token".to_string(), commands);
 
         thread::sleep(Duration::from_millis(200));
-        let body = get_nodes(&control_plane_addr);
+        let body = get_nodes(&control_plane_addr, "test-token");
         assert!(body.contains("committed_cpu: 2"), "expected committed_cpu from the applied jail, got: {body}");
         assert!(body.contains("committed_memory: 536870912"), "expected committed_memory from the applied jail, got: {body}");
+    }
+
+    #[test]
+    fn registration_with_a_mismatched_token_never_registers() {
+        let control_plane_addr = start_test_control_plane("correct-token");
+        let (_worker_handle, commands) = crate::worker::spawn(
+            crate::Reconciler::new(
+                keel_jail::FakeJailRuntime::new(),
+                keel_zfs::FakeZfsManager::new(),
+                keel_net::FakeNetManager::new(),
+                "zroot".to_string(),
+                std::env::temp_dir().join("keel-agentd-registration-test-registration_with_a_mismatched_token_never_registers"),
+            )
+            .unwrap(),
+        );
+        let _handle = spawn(
+            "node-1".to_string(),
+            "10.0.0.1".to_string(),
+            control_plane_addr.clone(),
+            Duration::from_millis(50),
+            4.0,
+            8 * 1024 * 1024 * 1024,
+            "wrong-token".to_string(),
+            commands,
+        );
+
+        thread::sleep(Duration::from_millis(200));
+        let body = get_nodes(&control_plane_addr, "correct-token");
+        assert!(!body.contains("node-1"), "expected node-1 to never register with a mismatched token, got: {body}");
     }
 }

@@ -17,6 +17,7 @@ struct Config {
     node_id: Option<String>,
     control_plane_addr: Option<String>,
     advertise_addr: Option<String>,
+    auth_token_file: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -28,6 +29,7 @@ impl Default for Config {
             node_id: None,
             control_plane_addr: None,
             advertise_addr: None,
+            auth_token_file: None,
         }
     }
 }
@@ -48,11 +50,12 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Config {
             "--node-id" => config.node_id = Some(value),
             "--control-plane-addr" => config.control_plane_addr = Some(value),
             "--advertise-addr" => config.advertise_addr = Some(value),
+            "--auth-token-file" => config.auth_token_file = Some(PathBuf::from(value)),
             other => panic!("unknown flag: {other}"),
         }
     }
-    if config.control_plane_addr.is_some() && (config.node_id.is_none() || config.advertise_addr.is_none()) {
-        panic!("--node-id and --advertise-addr are required when --control-plane-addr is set");
+    if config.control_plane_addr.is_some() && (config.node_id.is_none() || config.advertise_addr.is_none() || config.auth_token_file.is_none()) {
+        panic!("--node-id, --advertise-addr, and --auth-token-file are required when --control-plane-addr is set");
     }
     config
 }
@@ -81,6 +84,10 @@ fn main() {
     if let (Some(node_id), Some(control_plane_addr), Some(advertise_addr)) =
         (config.node_id.clone(), config.control_plane_addr.clone(), config.advertise_addr.clone())
     {
+        let token = std::fs::read_to_string(&config.auth_token_file.clone().unwrap())
+            .unwrap_or_else(|e| panic!("failed to read auth token file: {e}"))
+            .trim()
+            .to_string();
         let (capacity_cpu, capacity_memory) = keel_agentd::capacity::detect()
             .unwrap_or_else(|e| panic!("failed to detect node capacity via sysctl: {e}"));
         eprintln!(
@@ -93,6 +100,7 @@ fn main() {
             Duration::from_secs(5),
             capacity_cpu,
             capacity_memory,
+            token.clone(),
             commands.clone(),
         );
 
@@ -100,7 +108,8 @@ fn main() {
         let tcp_listener = TcpListener::bind(&advertise_addr)
             .unwrap_or_else(|e| panic!("failed to bind jails-API TCP listener on {advertise_addr}: {e}"));
         let tcp_commands = commands.clone();
-        thread::spawn(move || keel_agentd::http::run_tcp(tcp_listener, tcp_commands));
+        let tcp_token = std::sync::Arc::new(token);
+        thread::spawn(move || keel_agentd::http::run_tcp(tcp_listener, tcp_commands, tcp_token));
     }
 
     let timer_commands = commands.clone();
@@ -146,21 +155,24 @@ mod tests {
             "192.168.64.2:7620",
             "--advertise-addr",
             "192.168.64.2",
+            "--auth-token-file",
+            "/path/to/token",
         ]));
         assert_eq!(config.node_id, Some("node-2".to_string()));
         assert_eq!(config.control_plane_addr, Some("192.168.64.2:7620".to_string()));
         assert_eq!(config.advertise_addr, Some("192.168.64.2".to_string()));
+        assert_eq!(config.auth_token_file, Some(PathBuf::from("/path/to/token")));
     }
 
     #[test]
-    #[should_panic(expected = "--node-id and --advertise-addr are required when --control-plane-addr is set")]
+    #[should_panic(expected = "--node-id, --advertise-addr, and --auth-token-file are required when --control-plane-addr is set")]
     fn control_plane_addr_without_node_id_panics() {
-        parse_args_from(args(&["--control-plane-addr", "192.168.64.2:7620", "--advertise-addr", "192.168.64.2"]));
+        parse_args_from(args(&["--control-plane-addr", "192.168.64.2:7620", "--advertise-addr", "192.168.64.2", "--auth-token-file", "/path/to/token"]));
     }
 
     #[test]
-    #[should_panic(expected = "--node-id and --advertise-addr are required when --control-plane-addr is set")]
+    #[should_panic(expected = "--node-id, --advertise-addr, and --auth-token-file are required when --control-plane-addr is set")]
     fn control_plane_addr_without_advertise_addr_panics() {
-        parse_args_from(args(&["--control-plane-addr", "192.168.64.2:7620", "--node-id", "node-2"]));
+        parse_args_from(args(&["--control-plane-addr", "192.168.64.2:7620", "--node-id", "node-2", "--auth-token-file", "/path/to/token"]));
     }
 }
