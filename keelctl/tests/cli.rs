@@ -7,6 +7,14 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 
+const TEST_TOKEN: &str = "test-token-123";
+
+fn test_token_file() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join("keelctl-test-auth-token");
+    std::fs::write(&path, TEST_TOKEN).unwrap();
+    path
+}
+
 fn start_test_server(name: &str) -> PathBuf {
     let state_dir = std::env::temp_dir().join(format!("keelctl-test-state-{name}"));
     let _ = std::fs::remove_dir_all(&state_dir);
@@ -69,7 +77,8 @@ fn start_test_agentd_tcp(name: &str) -> String {
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    thread::spawn(move || keel_agentd::http::run_tcp(listener, commands));
+    let token = std::sync::Arc::new(TEST_TOKEN.to_string());
+    thread::spawn(move || keel_agentd::http::run_tcp(listener, commands, token));
     addr
 }
 
@@ -91,7 +100,8 @@ fn start_test_control_plane_with_node(node_id: &str, node_addr: &str) -> String 
         .unwrap();
     reg_rx.recv().unwrap();
 
-    thread::spawn(move || keel_controlplane::http::run(listener, commands));
+    let token = std::sync::Arc::new(TEST_TOKEN.to_string());
+    thread::spawn(move || keel_controlplane::http::run(listener, commands, token));
     addr
 }
 
@@ -102,6 +112,8 @@ fn run_keelctl_routed(control_plane_addr: &str, node: &str, args: &[&str]) -> (b
         .arg(control_plane_addr)
         .arg("--node")
         .arg(node)
+        .arg("--auth-token-file")
+        .arg(test_token_file())
         .output()
         .expect("failed to run keelctl binary");
     (
@@ -116,6 +128,8 @@ fn run_keelctl_scheduled(control_plane_addr: &str, args: &[&str]) -> (bool, Stri
         .args(args)
         .arg("--control-plane-addr")
         .arg(control_plane_addr)
+        .arg("--auth-token-file")
+        .arg(test_token_file())
         .output()
         .expect("failed to run keelctl binary");
     (
