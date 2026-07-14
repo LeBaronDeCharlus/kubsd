@@ -6,10 +6,16 @@ Date: 2026-07-14
 ## Context
 
 Milestones 7-10 built the multi-node control plane (`keel-controlplane`'s node
-registry, request forwarding, scheduling, and resource-aware placement) under
-a trust model each of those specs stated explicitly and identically:
-"same-network trust is assumed... hardening this is explicitly deferred."
-Concretely, today, anyone who can reach `keel-controlplane`'s TCP port or a
+registry, request forwarding, scheduling, and resource-aware placement), each
+carrying forward the same undesigned trust boundary without restating it
+identically. Milestone 7's Non-Goals named it in full: "same-network trust is
+assumed for this milestone; hardening this is explicitly deferred." Milestone
+8 reaffirmed it more briefly ("Same-network trust continues to be assumed end
+to end... matching every prior milestone's trust model. Not revisited here."),
+Milestone 9 noted it in one line ("Still unaddressed, same deferral as every
+prior milestone."), and Milestone 10 didn't restate it at all, leaving the
+deferral implicit rather than re-declared. Concretely, today, anyone who can
+reach `keel-controlplane`'s TCP port or a
 `keel-agentd`'s opt-in `--advertise-addr` TCP listener can register a fake
 node, spoof another node's heartbeat, or apply/delete a jail on any node in
 the cluster, with no credential of any kind. This is the one gap identified,
@@ -21,7 +27,7 @@ expansion, not something making the existing system unsafe to run.
 This milestone closes that gap for *authorization* (who is allowed to call
 these endpoints). It deliberately does not close it for *confidentiality*
 (encrypting the wire against an on-path eavesdropper on the same LAN
-segment) — that is real transport security, warrants pulling in an actual
+segment): that is real transport security, warrants pulling in an actual
 TLS implementation rather than hand-rolling one, and is scoped as its own
 separately-designed future milestone. Splitting the two mirrors this
 project's usual milestone size (each of Milestones 7-10 shipped one coherent
@@ -40,7 +46,7 @@ materially bigger, two-mechanism lift.
   carry a matching `Authorization: Bearer <token>` header.
 - `keel-agentd`'s opt-in TCP listener (the `--advertise-addr` one added in
   Milestone 8) gets the identical check. Its Unix socket is completely
-  unaffected — see Non-Goals.
+  unaffected (see Non-Goals).
 - Every outbound network call this project already makes gains the same
   header: `keel-agentd`'s registration/heartbeat calls to the control
   plane, and `keel-controlplane`'s forwarding calls to a node's `keel-agentd`.
@@ -49,7 +55,7 @@ materially bigger, two-mechanism lift.
   required. On `keel-agentd` and `keelctl` it's required exactly when the
   existing control-plane flags (`--control-plane-addr` etc.) are present,
   extending the pairing check Milestone 7 already established for
-  `--node-id`/`--advertise-addr` — plain single-node usage of either binary
+  `--node-id`/`--advertise-addr`; plain single-node usage of either binary
   is entirely unaffected.
 
 ## Non-Goals (Milestone 11)
@@ -136,7 +142,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 `constant_time_eq` is hand-rolled rather than pulling in a crate (e.g.
 `subtle`) for a four-line function, avoiding a timing oracle on the final
-byte-compare without treating "no new dependency" as an absolute rule —
+byte-compare without treating "no new dependency" as an absolute rule:
 contrast with the deferred TLS milestone, where hand-rolling really would be
 a mistake.
 
@@ -169,11 +175,15 @@ fn route(request: &ParsedRequest, commands: &Sender<Command>, token: &str) -> (u
 ```
 
 `run`/`route` gain `token: Arc<String>`, cloned per connection the same way
-`commands` already is. `handle_forward`'s `forward()` and
-`handle_scheduled_apply`'s direct forward call also take `token` and attach
-the `Authorization` header on the outbound call to a node — the control
-plane must present the shared secret to whichever `keel-agentd` it relays
-to, or that node's own check will reject it.
+`commands` already is. The shared `forward()` helper itself gains a `token:
+&str` parameter and attaches the `Authorization` header on every outbound
+call it builds. All four of its call sites pass `token` through:
+`handle_forward` (the named-node forwarding family), `handle_scheduled_apply`,
+`handle_scheduled_read`, and `handle_scheduled_delete` (the scheduled-apply
+family's `PUT`, `GET`, and `DELETE` handlers, each of which resolves a
+placement and then calls `forward()` directly). The control plane must
+present the shared secret to whichever `keel-agentd` it relays to on every
+one of these paths, or that node's own check will reject it.
 
 ### `keel-agentd`: enforcement point
 
@@ -229,7 +239,7 @@ let token = match &target {
   `--auth-token-file` flag; `panic!` at startup if missing or unreadable,
   matching this binary's existing "fail fast on bad config" style.
 - `keel-agentd/main.rs`: `--auth-token-file` joins the existing
-  `--node-id`/`--advertise-addr` pairing check — the current
+  `--node-id`/`--advertise-addr` pairing check: the current
   `panic!("--node-id and --advertise-addr are required when --control-plane-addr is set")`
   becomes a three-flag check with the same message shape.
 - `keelctl/main.rs`: as above, but a graceful `Err` + `ExitCode::FAILURE`
@@ -246,49 +256,53 @@ let token = match &target {
 - The auth check happens before any other validation (malformed YAML,
   unknown node id, path/name mismatch) and before the route match itself.
   An unauthenticated request to a nonexistent path still gets `401`, not
-  `404` — no route information leaks pre-auth.
+  `404`; no route information leaks pre-auth.
 - `constant_time_eq` guards only the final byte-compare; `check`'s
   `strip_prefix`/`Option`-check steps are variable-time, but they depend
   only on the shape of the caller's input, not on the expected token's
   value, so they leak nothing about the secret.
 - A process that fails to load its token file at startup fails loudly and
   immediately (`panic!` for `keel-controlplane`/`keel-agentd`, a graceful
-  `Err`/`ExitCode::FAILURE` for `keelctl`) — never falling back to running
+  `Err`/`ExitCode::FAILURE` for `keelctl`), never falling back to running
   unauthenticated. Same "fail fast on bad config" precedent `parse_args`
   already sets for a missing `--node-id`.
 - A forwarding hop that fails auth at the *target* node (e.g. a stale token
   file on one node after a rotation that missed it) surfaces as a plain
   relayed `401` through `keel-controlplane`'s existing forward-and-relay
-  path — no new error type; `handle_forward`/`forward()` already relay the
-  target's exact status code verbatim.
+  path (no new error type; `handle_forward`/`forward()` already relay the
+  target's exact status code verbatim).
 - No distinct server-side logging for rejected requests beyond what already
   exists: since no logging framework exists anywhere in this project today,
   a `401` is visible to the caller (and to anyone watching `keel-agentd`'s
   existing `eprintln!`-based registration/heartbeat failure messages) but
   not separately logged on the control-plane side. Worth revisiting only if
-  this project ever adds structured logging generally — a pre-existing gap
+  this project ever adds structured logging generally; a pre-existing gap
   this milestone doesn't attempt to fix in passing.
 
 ## Testing Strategy
 
-- `auth::check` / `auth::load_token`: plain unit tests, no networking —
+- `auth::check` / `auth::load_token`: plain unit tests, no networking:
   correct token accepted; wrong token, missing header, empty file, and a
   token file with trailing whitespace (confirming `.trim()`) all handled as
   specified; `constant_time_eq` tested directly for equal, unequal-same-
   length, and unequal-different-length inputs.
 - `keel-controlplane::http`: every existing test's `start_test_server`/
   `send_request` helper threads a token through (server configured with a
-  known value, `send_request` calls send the matching header) — a
+  known value, `send_request` calls send the matching header): a
   mechanical update to existing tests' plumbing, not new behavior for them.
   New tests: a request with no `Authorization` header, and one with a wrong
-  token, both return `401` — checked across at least one route from each
+  token, both return `401`, checked across at least one route from each
   family (`register`, `heartbeat`, `GET /nodes`, a named-node forward, a
   scheduled apply), confirming the single `route()` choke point actually
   covers all of them.
 - `keel-controlplane::http::forward`: `start_fake_remote_agentd` gains an
   assertion that the relayed request carries the expected `Authorization`
   header, confirming the control plane attaches its own token when dialing
-  a node, not just when receiving one.
+  a node, not just when receiving one. Checked from at least two of
+  `forward()`'s four call sites, a named-node forward (`handle_forward`) and
+  a scheduled relay (`handle_scheduled_apply`, `handle_scheduled_read`, or
+  `handle_scheduled_delete`), since all four share the one function but a
+  regression in any single caller's plumbing would otherwise ship silently.
 - `keel-agentd::http`: the same mechanical update to the TCP-listener tests
   (`start_tcp_test_server`/`send_request_tcp`) plus new missing/wrong-token
   → `401` tests. The existing Unix-socket tests in this same file are
@@ -301,7 +315,7 @@ let token = match &target {
   `register_once`/`heartbeat_once` surface the resulting `401` as an
   `Err(String)`, and that `spawn`'s existing "any heartbeat failure →
   re-register" loop treats it identically to any other failure (no
-  special-casing needed — confirming the existing catch-all already covers
+  special-casing needed, confirming the existing catch-all already covers
   this).
 - `keel-agentd/main.rs` and `keelctl/main.rs`: flag-parsing unit tests
   mirroring the existing `--node-id`/`--advertise-addr` pairing tests,
@@ -319,7 +333,7 @@ let token = match &target {
 
 ## Open Questions / Deferred Decisions
 
-- TLS / wire encryption is next, as its own separately-designed milestone —
+- TLS / wire encryption is next, as its own separately-designed milestone;
   this one closes the authorization gap only, not confidentiality.
 - Token rotation has no live-reload story; rotating means regenerating the
   file, redistributing it, and restarting every process. Worth a real
