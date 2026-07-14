@@ -106,24 +106,48 @@ needs. Both are well short of "hand-rolling crypto," the one place in
 this project where pulling in real, audited code is the responsible
 choice rather than a shortcut.
 
+One dependency detail matters enough to state explicitly, since it
+bears directly on the "no FFI" reasoning above: `rustls` 0.23 made its
+crypto backend pluggable, and `aws-lc-rs`, a vendored C/assembly
+library, not Rust, is pulled in by default unless default features are
+turned off. Left as-is, that would quietly undercut this section's own
+argument and add a C-toolchain build requirement this project has never
+had. `Cargo.toml` pins `rustls` with `default-features = false` and the
+`ring` feature instead: `ring` is the backend `rustls` used exclusively
+before 0.23, is Rust plus hand-written assembly with no external C
+library and no `cc`/`cmake` build step, and has years of track record on
+BSDs. Because the crypto provider is no longer installed implicitly,
+`keel-controlplane`, `keel-agentd`, and `keelctl` each call
+`rustls::crypto::ring::default_provider().install_default()` once at
+process startup, before constructing any `ServerConfig` or
+`ClientConfig`; `rustls` panics if one is built with no provider
+installed, so this is a required line in each binary's startup
+sequence, not optional hardening.
+
 ### `scripts/gen-certs.sh`: CA and identity issuance
 
 ```bash
-./scripts/gen-certs.sh init                              # generates ca.crt / ca.key once
-./scripts/gen-certs.sh node node-4 192.168.64.4           # issues node-4.crt/.key, SAN=192.168.64.4
-./scripts/gen-certs.sh node controlplane 192.168.64.2     # issues controlplane.crt/.key, same as a node
-./scripts/gen-certs.sh client alice                       # issues alice.crt/.key
+./scripts/gen-certs.sh init                                   # generates ca.crt / ca.key once
+./scripts/gen-certs.sh node node-4 192.168.64.4                # issues node-4.crt/.key, SAN=192.168.64.4
+./scripts/gen-certs.sh node controlplane 192.168.64.2          # issues controlplane.crt/.key, same as a node
+./scripts/gen-certs.sh client alice                            # issues alice.crt/.key
+./scripts/gen-certs.sh node node-4 192.168.64.4 --days 36500   # optional override, used only for test fixtures
 ```
 
-Every leaf certificate is signed by `ca.key`, issued with a 10-year
-validity, and gets both `serverAuth` and `clientAuth` extended key usage,
-since a node's (and the control plane's own) single identity certificate
-is used both ways: server when accepting an inbound connection, client
-when dialing out. The `node` subcommand issues that dual-use certificate
-for anything that plays both roles, a node or the control plane itself,
-distinguished only by the name and address given to it; `client`
-certificates only ever dial out, so they only exercise the `clientAuth`
-half, but the script does not special-case that.
+Every leaf certificate is signed by `ca.key` and gets both `serverAuth`
+and `clientAuth` extended key usage, since a node's (and the control
+plane's own) single identity certificate is used both ways: server when
+accepting an inbound connection, client when dialing out. Validity
+defaults to 10 years (`--days 3650`, matching `openssl`'s own flag
+name), overridable with a trailing `--days N`; the only caller that
+overrides it is this milestone's own fixture generation (see Testing
+Strategy), which asks for `--days 36500` (~100 years) so `testdata/tls/`
+never needs regenerating as the suite ages. The `node` subcommand issues
+that dual-use certificate for anything that plays both roles, a node or
+the control plane itself, distinguished only by the name and address
+given to it; `client` certificates only ever dial out, so they only
+exercise the `clientAuth` half, but the script does not special-case
+that.
 
 ### Server side: `keel-controlplane::http::run` and `keel-agentd::http::run_tcp`
 
@@ -177,6 +201,21 @@ hand-built HTTP request into it exactly as today. `rustls::ClientConfig`
 verifies the server's presented certificate against `ca.crt` and checks
 its SAN against the dialed address using `rustls`'s own hostname/IP
 verification; no new verification code is needed for that check.
+
+One piece of glue every one of these three call sites needs that none of
+them have today: `ClientConnection::new` takes a
+`rustls::pki_types::ServerName`, not a socket address string, while the
+addresses actually in hand
+(`registration.rs`'s/`keelctl`'s `control_plane_addr`, `forward()`'s
+per-node `addr`) are `host:port` strings, and every certificate's SAN is
+issued against the bare host (`gen-certs.sh`'s own examples pass
+`192.168.64.4`, not `192.168.64.4:7621`). Each call site splits off the
+port and parses the remaining host into a `ServerName::IpAddress`, every
+address in this project is a literal IP, never a DNS name, so no
+resolution path is needed, and passes that alongside the config to
+`ClientConnection::new`. This is a few lines of new plumbing per call
+site, not new verification logic: `rustls` still does the actual SAN
+comparison once it has the right `ServerName` to compare against.
 
 ### What gets removed
 
