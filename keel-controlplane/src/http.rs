@@ -1,19 +1,22 @@
+use crate::auth;
 use crate::wire::{ErrorBody, Heartbeat, NodeRegistration};
 use crate::worker::{Command, ScheduleOrResolveError};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
-pub fn run(listener: TcpListener, commands: Sender<Command>) {
+pub fn run(listener: TcpListener, commands: Sender<Command>, token: Arc<String>) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let commands = commands.clone();
+        let token = Arc::clone(&token);
         thread::spawn(move || {
-            let _ = handle_connection(stream, &commands);
+            let _ = handle_connection(stream, &commands, &token);
         });
     }
 }
@@ -22,14 +25,15 @@ struct ParsedRequest {
     method: String,
     path: String,
     body: Vec<u8>,
+    auth_header: Option<String>,
 }
 
-fn handle_connection(mut stream: TcpStream, commands: &Sender<Command>) -> io::Result<()> {
+fn handle_connection(mut stream: TcpStream, commands: &Sender<Command>, token: &str) -> io::Result<()> {
     let request = match read_request(&mut stream)? {
         Some(r) => r,
         None => return Ok(()),
     };
-    let (status, body) = route(&request, commands);
+    let (status, body) = route(&request, commands, token);
     write_response(&mut stream, status, &body)
 }
 
@@ -37,7 +41,7 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Option<ParsedRequest>> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
 
-    let (method, path, header_len, content_length) = loop {
+    let (method, path, header_len, content_length, auth_header) = loop {
         let mut headers = [httparse::EMPTY_HEADER; 16];
         let mut req = httparse::Request::new(&mut headers);
         match req.parse(&buf) {
@@ -49,9 +53,15 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Option<ParsedRequest>> {
                     .and_then(|h| std::str::from_utf8(h.value).ok())
                     .and_then(|v| v.trim().parse::<usize>().ok())
                     .unwrap_or(0);
+                let auth_header = req
+                    .headers
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case("authorization"))
+                    .and_then(|h| std::str::from_utf8(h.value).ok())
+                    .map(|v| v.trim().to_string());
                 let method = req.method.unwrap_or("").to_string();
                 let path = req.path.unwrap_or("").to_string();
-                break (method, path, header_len, content_length);
+                break (method, path, header_len, content_length, auth_header);
             }
             Ok(httparse::Status::Partial) => {
                 if buf.len() >= MAX_MESSAGE_BYTES {
@@ -79,7 +89,7 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Option<ParsedRequest>> {
         buf.extend_from_slice(&chunk[..n]);
     }
     let body = buf[header_len..total_len].to_vec();
-    Ok(Some(ParsedRequest { method, path, body }))
+    Ok(Some(ParsedRequest { method, path, body, auth_header }))
 }
 
 fn write_response(stream: &mut TcpStream, status: u16, body: &[u8]) -> io::Result<()> {
@@ -97,6 +107,7 @@ fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         404 => "Not Found",
         409 => "Conflict",
         500 => "Internal Server Error",
@@ -105,7 +116,10 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-fn route(request: &ParsedRequest, commands: &Sender<Command>) -> (u16, Vec<u8>) {
+fn route(request: &ParsedRequest, commands: &Sender<Command>, token: &str) -> (u16, Vec<u8>) {
+    if !auth::check(request.auth_header.as_deref(), token) {
+        return error_response(401, "missing or invalid auth token".to_string());
+    }
     let segments: Vec<&str> =
         request.path.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
     match (request.method.as_str(), segments.as_slice()) {
@@ -331,18 +345,23 @@ mod tests {
     use crate::registry::Registry;
     use crate::worker;
 
+    const TEST_TOKEN: &str = "test-token-123";
+
     fn start_test_server() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let (_worker_handle, commands) = worker::spawn(Registry::new(), Placements::new());
-        thread::spawn(move || run(listener, commands));
+        let token = Arc::new(TEST_TOKEN.to_string());
+        thread::spawn(move || run(listener, commands, token));
         addr
     }
 
     fn send_request(addr: &str, method: &str, path: &str, body: &str) -> (u16, String) {
         let mut stream = TcpStream::connect(addr).unwrap();
-        let request =
-            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TEST_TOKEN}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
         stream.write_all(request.as_bytes()).unwrap();
         if let Err(e) = stream.shutdown(std::net::Shutdown::Write) {
             assert_eq!(e.kind(), std::io::ErrorKind::NotConnected, "unexpected shutdown error: {e}");
@@ -360,6 +379,92 @@ mod tests {
         let status = parsed.code.unwrap();
         let body = String::from_utf8(response[header_len..].to_vec()).unwrap();
         (status, body)
+    }
+
+    fn send_request_raw(
+        addr: &str,
+        method: &str,
+        path: &str,
+        body: &str,
+        auth_header: Option<&str>,
+    ) -> (u16, String) {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let auth_line = match auth_header {
+            Some(h) => format!("Authorization: {h}\r\n"),
+            None => String::new(),
+        };
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{auth_line}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        if let Err(e) = stream.shutdown(std::net::Shutdown::Write) {
+            assert_eq!(e.kind(), std::io::ErrorKind::NotConnected, "unexpected shutdown error: {e}");
+        }
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        let mut headers = [httparse::EMPTY_HEADER; 16];
+        let mut parsed = httparse::Response::new(&mut headers);
+        let header_len = match parsed.parse(&response).unwrap() {
+            httparse::Status::Complete(len) => len,
+            httparse::Status::Partial => panic!("incomplete response: {response:?}"),
+        };
+        let status = parsed.code.unwrap();
+        let body = String::from_utf8(response[header_len..].to_vec()).unwrap();
+        (status, body)
+    }
+
+    #[test]
+    fn register_without_auth_header_returns_401() {
+        let addr = start_test_server();
+        let (status, _) = send_request_raw(
+            &addr,
+            "POST",
+            "/nodes/register",
+            "id: node-1\naddr: 10.0.0.1\ncapacity_cpu: 4.0\ncapacity_memory: 8589934592\n",
+            None,
+        );
+        assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn heartbeat_with_wrong_auth_token_returns_401() {
+        let addr = start_test_server();
+        send_request(
+            &addr,
+            "POST",
+            "/nodes/register",
+            "id: node-1\naddr: 10.0.0.1\ncapacity_cpu: 4.0\ncapacity_memory: 8589934592\n",
+        );
+        let (status, _) = send_request_raw(
+            &addr,
+            "POST",
+            "/nodes/node-1/heartbeat",
+            "committed_cpu: 0\ncommitted_memory: 0\n",
+            Some("Bearer wrong-token"),
+        );
+        assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn get_nodes_without_auth_header_returns_401() {
+        let addr = start_test_server();
+        let (status, _) = send_request_raw(&addr, "GET", "/nodes", "", None);
+        assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn named_node_forward_without_auth_header_returns_401_even_for_an_unknown_node() {
+        let addr = start_test_server();
+        let (status, body) = send_request_raw(&addr, "GET", "/nodes/missing/jails", "", None);
+        assert_eq!(status, 401, "auth must be checked before route dispatch, got body: {body}");
+    }
+
+    #[test]
+    fn scheduled_apply_without_auth_header_returns_401() {
+        let addr = start_test_server();
+        let (status, _) = send_request_raw(&addr, "PUT", "/jails/web-1", "apiVersion: keel/v1\n", None);
+        assert_eq!(status, 401);
     }
 
     #[test]
