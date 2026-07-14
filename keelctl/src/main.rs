@@ -75,6 +75,9 @@ fn resolve_target(
                 .map_err(|e| format!("failed to read {path}: {e}"))?
                 .trim()
                 .to_string();
+            if token.is_empty() {
+                return Err(format!("auth token file {path} is empty"));
+            }
             Ok(Target::ControlPlane { addr, node, token })
         }
         (Some(_), _, None) => Err("--auth-token-file is required with --control-plane-addr".to_string()),
@@ -219,5 +222,22 @@ mod tests {
                 token: "secret123".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn control_plane_addr_with_an_empty_auth_token_file_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("keelctl-resolve-target-test-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let token_path = dir.join("token");
+        std::fs::write(&token_path, "").unwrap();
+
+        let err = resolve_target(
+            PathBuf::from("/var/run/keel-agentd.sock"),
+            Some("10.0.0.1:7620".to_string()),
+            Some("node-1".to_string()),
+            Some(token_path.to_str().unwrap().to_string()),
+        )
+        .unwrap_err();
+        assert!(err.contains("is empty"), "expected an empty-token error, got: {err}");
     }
 }

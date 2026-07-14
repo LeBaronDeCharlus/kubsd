@@ -1,9 +1,13 @@
 use std::path::Path;
 
 pub fn load_token(path: &Path) -> Result<String, String> {
-    std::fs::read_to_string(path)
+    let token = std::fs::read_to_string(path)
         .map(|s| s.trim().to_string())
-        .map_err(|e| format!("failed to read auth token file {}: {e}", path.display()))
+        .map_err(|e| format!("failed to read auth token file {}: {e}", path.display()))?;
+    if token.is_empty() {
+        return Err(format!("auth token file {} is empty", path.display()));
+    }
+    Ok(token)
 }
 
 pub fn check(provided: Option<&str>, expected: &str) -> bool {
@@ -53,12 +57,21 @@ mod tests {
     }
 
     #[test]
-    fn load_token_on_an_empty_file_returns_an_empty_token() {
+    fn load_token_on_an_empty_file_returns_an_error() {
         let dir = std::env::temp_dir().join(format!("keel-agentd-auth-test-empty-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("token");
         std::fs::write(&path, "").unwrap();
-        assert_eq!(load_token(&path).unwrap(), "");
+        assert!(load_token(&path).is_err());
+    }
+
+    #[test]
+    fn load_token_on_a_whitespace_only_file_returns_an_error() {
+        let dir = std::env::temp_dir().join(format!("keel-agentd-auth-test-whitespace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token");
+        std::fs::write(&path, "   \n\t\n").unwrap();
+        assert!(load_token(&path).is_err());
     }
 
     #[test]
