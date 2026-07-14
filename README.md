@@ -436,6 +436,49 @@ on the other node, the one with more headroom fraction rather than fewer
 jails; sticky re-apply and named-node routing stayed completely
 unaffected throughout.
 
+### Milestone 11: control-plane shared-secret authentication
+
+Milestones 7-10 built the multi-node control plane under a trust model each
+of those milestones' specs stated explicitly: same-network trust assumed,
+hardening deferred. Concretely, anyone who could reach
+`keel-controlplane`'s TCP port or a `keel-agentd`'s opt-in
+`--advertise-addr` listener could register a fake node, spoof another
+node's heartbeat, or apply/delete a jail on any node, with no credential
+of any kind. This milestone closes that gap for authorization, not yet
+for confidentiality: a single shared cluster secret, generated once by the
+operator and distributed as a file to every host, is now required on
+every request `keel-controlplane` and `keel-agentd`'s TCP listener serve,
+checked via a hand-rolled constant-time comparison (no new dependency) at
+a single choke point in each crate's `route()`. Every outbound call this
+project already makes, `keel-agentd`'s registration/heartbeat, and
+`keel-controlplane`'s forwarding to a node, attaches the same token.
+`keel-agentd`'s Unix socket keeps its original, unwrapped `route()` and is
+completely untouched: its `0600`-permission trust boundary was never the
+gap this milestone exists to close. TLS/wire encryption is deliberately
+out of scope here, a separate future milestone; this one stops an
+unauthenticated actor from issuing commands, not a sophisticated on-path
+eavesdropper from reading the wire.
+
+`keel-controlplane`, `keel-agentd`, and `keelctl` each gained a new
+`--auth-token-file <path>` flag: unconditionally required on
+`keel-controlplane` (it has no non-networked mode at all), and required
+alongside the existing control-plane flags on `keel-agentd`/`keelctl`
+(extending the pairing check Milestone 7 already established for
+`--node-id`/`--advertise-addr`), plain single-node usage of either
+binary is entirely unaffected.
+
+Milestone 11 finished at 208 tests on macOS (191 inherited, 17 new across
+both crates' `auth` modules and the HTTP/registration/CLI wiring), and
+full VM verification across three real nodes: all three registered
+`Alive` against an authenticated `GET /nodes`; a scheduled apply/get/delete
+round trip succeeded end-to-end with auth in place; a `keelctl` call with
+a missing token file failed locally without ever reaching the network,
+and one with a wrong-but-present token reached the control plane and got
+a generic `401`; a node restarted with a stale, mismatched token repeated
+`registration failed: control plane returned status 401` every heartbeat
+and never appeared `Alive` until its token file was corrected; clean
+teardown confirmed on all three VMs afterward.
+
 ## Roadmap
 
 **Sub-project 1: single-node jail reconciliation daemon (complete)**
@@ -452,10 +495,15 @@ unaffected throughout.
 7. ~~Node registry: `keel-controlplane`, register/heartbeat/list over TCP, self-healing membership~~ done
 8. ~~Routing jail specs to a specific node through the control plane~~ done
 
-**Sub-project 3: scheduling and cluster growth (in progress)**
+**Sub-project 3: scheduling and cluster growth (complete)**
 
 9. ~~Scheduler: automatic node placement by jail count, sticky on re-apply~~ done
 10. ~~Resource-aware bin-packing: node-reported CPU/memory capacity and committed load, headroom-based placement~~ done
+
+**Sub-project 4: control-plane hardening (in progress)**
+
+11. ~~Shared-secret authentication on every control-plane and node TCP route~~ done
+12. TLS / wire encryption between client, control plane, and nodes (not yet designed)
 
 **Not yet designed** (future sub-projects, each will get its own spec):
 
