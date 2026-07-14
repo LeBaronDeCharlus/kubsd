@@ -57,8 +57,13 @@ issue_leaf() {
 case "$cmd" in
     init)
         [ -f "$OUT_DIR/ca.key" ] && fail "$OUT_DIR/ca.key already exists, refusing to overwrite"
+        days="$DEFAULT_DAYS"
+        if [ "${1:-}" = "--days" ]; then
+            days="${2:-}"
+            [ -n "$days" ] || fail "--days requires a value"
+        fi
         openssl genrsa -out "$OUT_DIR/ca.key" 4096
-        openssl req -x509 -new -nodes -key "$OUT_DIR/ca.key" -sha256 -days "$DEFAULT_DAYS" \
+        openssl req -x509 -new -nodes -key "$OUT_DIR/ca.key" -sha256 -days "$days" \
             -subj "/CN=keel-cluster-ca" -out "$OUT_DIR/ca.crt"
         echo "gen-certs: wrote $OUT_DIR/ca.crt and $OUT_DIR/ca.key"
         ;;
