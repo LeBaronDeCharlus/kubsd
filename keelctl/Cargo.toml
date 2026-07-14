@@ -8,6 +8,8 @@ keel-agentd = { path = "../keel-agentd" }
 keel-spec = { path = "../keel-spec" }
 serde_yaml = "0.9"
 httparse = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
 
 [dev-dependencies]
 keel-jail = { path = "../keel-jail" }

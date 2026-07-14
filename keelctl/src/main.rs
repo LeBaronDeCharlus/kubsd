@@ -6,6 +6,8 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod tls;
+
 const DEFAULT_SOCKET: &str = "/var/run/keel-agentd.sock";
 
 #[derive(Debug, PartialEq)]
