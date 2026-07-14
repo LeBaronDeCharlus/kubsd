@@ -81,13 +81,11 @@ fn main() {
 
     let (_worker_handle, commands) = worker::spawn(reconciler);
 
-    if let (Some(node_id), Some(control_plane_addr), Some(advertise_addr)) =
-        (config.node_id.clone(), config.control_plane_addr.clone(), config.advertise_addr.clone())
+    if let (Some(node_id), Some(control_plane_addr), Some(advertise_addr), Some(auth_token_file)) =
+        (config.node_id.clone(), config.control_plane_addr.clone(), config.advertise_addr.clone(), config.auth_token_file.clone())
     {
-        let token = std::fs::read_to_string(&config.auth_token_file.clone().unwrap())
-            .unwrap_or_else(|e| panic!("failed to read auth token file: {e}"))
-            .trim()
-            .to_string();
+        let token = keel_agentd::auth::load_token(&auth_token_file)
+            .unwrap_or_else(|e| panic!("failed to load auth token: {e}"));
         let (capacity_cpu, capacity_memory) = keel_agentd::capacity::detect()
             .unwrap_or_else(|e| panic!("failed to detect node capacity via sysctl: {e}"));
         eprintln!(
@@ -144,10 +142,11 @@ mod tests {
         assert_eq!(config.node_id, None);
         assert_eq!(config.control_plane_addr, None);
         assert_eq!(config.advertise_addr, None);
+        assert_eq!(config.auth_token_file, None);
     }
 
     #[test]
-    fn parses_all_three_new_flags() {
+    fn parses_all_four_new_flags() {
         let config = parse_args_from(args(&[
             "--node-id",
             "node-2",
@@ -174,5 +173,11 @@ mod tests {
     #[should_panic(expected = "--node-id, --advertise-addr, and --auth-token-file are required when --control-plane-addr is set")]
     fn control_plane_addr_without_advertise_addr_panics() {
         parse_args_from(args(&["--control-plane-addr", "192.168.64.2:7620", "--node-id", "node-2", "--auth-token-file", "/path/to/token"]));
+    }
+
+    #[test]
+    #[should_panic(expected = "--node-id, --advertise-addr, and --auth-token-file are required when --control-plane-addr is set")]
+    fn control_plane_addr_without_auth_token_file_panics() {
+        parse_args_from(args(&["--control-plane-addr", "192.168.64.2:7620", "--node-id", "node-2", "--advertise-addr", "192.168.64.2"]));
     }
 }
