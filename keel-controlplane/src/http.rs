@@ -127,31 +127,32 @@ fn route(request: &ParsedRequest, commands: &Sender<Command>, token: &str) -> (u
         ("POST", ["nodes", id, "heartbeat"]) => handle_heartbeat(id, &request.body, commands),
         ("GET", ["nodes"]) => handle_list(commands),
         ("PUT", ["nodes", id, "jails", name]) => {
-            let (status, body) = handle_forward(id, "PUT", &format!("/jails/{name}"), &request.body, commands);
+            let (status, body) =
+                handle_forward(id, "PUT", &format!("/jails/{name}"), &request.body, commands, token);
             if (200..300).contains(&status) {
                 send_record_placement(name, id, commands);
             }
             (status, body)
         }
-        ("GET", ["nodes", id, "jails"]) => handle_forward(id, "GET", "/jails", &[], commands),
+        ("GET", ["nodes", id, "jails"]) => handle_forward(id, "GET", "/jails", &[], commands, token),
         ("GET", ["nodes", id, "jails", name]) => {
-            handle_forward(id, "GET", &format!("/jails/{name}"), &[], commands)
+            handle_forward(id, "GET", &format!("/jails/{name}"), &[], commands, token)
         }
         ("DELETE", ["nodes", id, "jails", name]) => {
-            let (status, body) = handle_forward(id, "DELETE", &format!("/jails/{name}"), &[], commands);
+            let (status, body) = handle_forward(id, "DELETE", &format!("/jails/{name}"), &[], commands, token);
             if (200..300).contains(&status) {
                 send_remove_placement(name, commands);
             }
             (status, body)
         }
-        ("PUT", ["jails", name]) => handle_scheduled_apply(name, &request.body, commands),
-        ("GET", ["jails", name]) => handle_scheduled_read(name, commands),
-        ("DELETE", ["jails", name]) => handle_scheduled_delete(name, commands),
+        ("PUT", ["jails", name]) => handle_scheduled_apply(name, &request.body, commands, token),
+        ("GET", ["jails", name]) => handle_scheduled_read(name, commands, token),
+        ("DELETE", ["jails", name]) => handle_scheduled_delete(name, commands, token),
         _ => error_response(404, format!("no route for {} {}", request.method, request.path)),
     }
 }
 
-fn handle_scheduled_apply(name: &str, body: &[u8], commands: &Sender<Command>) -> (u16, Vec<u8>) {
+fn handle_scheduled_apply(name: &str, body: &[u8], commands: &Sender<Command>, token: &str) -> (u16, Vec<u8>) {
     let (reply_tx, reply_rx) = mpsc::channel();
     if commands.send(Command::ResolveOrSchedule(name.to_string(), reply_tx)).is_err() {
         return error_response(500, "control plane worker is not running".to_string());
@@ -162,7 +163,7 @@ fn handle_scheduled_apply(name: &str, body: &[u8], commands: &Sender<Command>) -
         Ok(Err(ScheduleOrResolveError::Resolve(e))) => return error_response(404, e.to_string()),
         Err(_) => return error_response(500, "control plane worker did not respond".to_string()),
     };
-    match forward(&addr, "PUT", &format!("/jails/{name}"), body) {
+    match forward(&addr, "PUT", &format!("/jails/{name}"), body, token) {
         Ok((status, response_body)) => {
             if (200..300).contains(&status) {
                 send_record_placement(name, &node_id, commands);
@@ -173,23 +174,23 @@ fn handle_scheduled_apply(name: &str, body: &[u8], commands: &Sender<Command>) -
     }
 }
 
-fn handle_scheduled_read(name: &str, commands: &Sender<Command>) -> (u16, Vec<u8>) {
+fn handle_scheduled_read(name: &str, commands: &Sender<Command>, token: &str) -> (u16, Vec<u8>) {
     let (node_id, addr) = match resolve_placement(name, commands) {
         Ok(pair) => pair,
         Err(response) => return response,
     };
-    match forward(&addr, "GET", &format!("/jails/{name}"), &[]) {
+    match forward(&addr, "GET", &format!("/jails/{name}"), &[], token) {
         Ok((status, response_body)) => (status, response_body),
         Err(e) => error_response(500, format!("failed to reach node '{node_id}' at {addr}: {e}")),
     }
 }
 
-fn handle_scheduled_delete(name: &str, commands: &Sender<Command>) -> (u16, Vec<u8>) {
+fn handle_scheduled_delete(name: &str, commands: &Sender<Command>, token: &str) -> (u16, Vec<u8>) {
     let (node_id, addr) = match resolve_placement(name, commands) {
         Ok(pair) => pair,
         Err(response) => return response,
     };
-    match forward(&addr, "DELETE", &format!("/jails/{name}"), &[]) {
+    match forward(&addr, "DELETE", &format!("/jails/{name}"), &[], token) {
         Ok((status, response_body)) => {
             if (200..300).contains(&status) {
                 send_remove_placement(name, commands);
@@ -283,7 +284,14 @@ fn handle_list(commands: &Sender<Command>) -> (u16, Vec<u8>) {
 const FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const FORWARD_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn handle_forward(id: &str, method: &str, path: &str, body: &[u8], commands: &Sender<Command>) -> (u16, Vec<u8>) {
+fn handle_forward(
+    id: &str,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    commands: &Sender<Command>,
+    token: &str,
+) -> (u16, Vec<u8>) {
     let (reply_tx, reply_rx) = mpsc::channel();
     if commands.send(Command::Resolve(id.to_string(), reply_tx)).is_err() {
         return error_response(500, "control plane worker is not running".to_string());
@@ -293,13 +301,13 @@ fn handle_forward(id: &str, method: &str, path: &str, body: &[u8], commands: &Se
         Ok(Err(e)) => return error_response(404, e.to_string()),
         Err(_) => return error_response(500, "control plane worker did not respond".to_string()),
     };
-    match forward(&addr, method, path, body) {
+    match forward(&addr, method, path, body, token) {
         Ok((status, response_body)) => (status, response_body),
         Err(e) => error_response(500, format!("failed to reach node '{id}' at {addr}: {e}")),
     }
 }
 
-fn forward(addr: &str, method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
+fn forward(addr: &str, method: &str, path: &str, body: &[u8], token: &str) -> Result<(u16, Vec<u8>), String> {
     let socket_addr = addr
         .to_socket_addrs()
         .map_err(|e| e.to_string())?
@@ -309,7 +317,10 @@ fn forward(addr: &str, method: &str, path: &str, body: &[u8]) -> Result<(u16, Ve
         TcpStream::connect_timeout(&socket_addr, FORWARD_CONNECT_TIMEOUT).map_err(|e| e.to_string())?;
     stream.set_read_timeout(Some(FORWARD_READ_TIMEOUT)).ok();
 
-    let request = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n", body.len());
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
     stream.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
     stream.write_all(body).map_err(|e| e.to_string())?;
     stream.shutdown(std::net::Shutdown::Write).ok();
@@ -344,6 +355,7 @@ mod tests {
     use crate::placements::Placements;
     use crate::registry::Registry;
     use crate::worker;
+    use std::sync::Mutex;
 
     const TEST_TOKEN: &str = "test-token-123";
 
@@ -621,6 +633,64 @@ mod tests {
             "POST",
             "/nodes/register",
             &format!("id: {id}\naddr: {node_addr}\ncapacity_cpu: 4.0\ncapacity_memory: 8589934592\n"),
+        );
+    }
+
+    fn start_fake_remote_agentd_capturing(status: u16, body: &'static str) -> (String, Arc<Mutex<Vec<u8>>>) {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let mut received = Vec::new();
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => received.extend_from_slice(&buf[..n]),
+                    }
+                }
+                *captured_clone.lock().unwrap() = received;
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nContent-Type: application/yaml\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (addr, captured)
+    }
+
+    #[test]
+    fn named_node_forward_attaches_the_control_planes_auth_token_to_the_outbound_request() {
+        let cp_addr = start_test_server();
+        let (node_addr, captured) = start_fake_remote_agentd_capturing(200, "running: true\n");
+        register_node(&cp_addr, "node-1", &node_addr);
+
+        send_request(&cp_addr, "PUT", "/nodes/node-1/jails/web-1", "apiVersion: keel/v1\n");
+
+        let received = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+        assert!(
+            received.contains(&format!("Authorization: Bearer {TEST_TOKEN}")),
+            "expected relayed request to carry the control plane's own auth token, got: {received}"
+        );
+    }
+
+    #[test]
+    fn scheduled_apply_attaches_the_control_planes_auth_token_to_the_outbound_request() {
+        let cp_addr = start_test_server();
+        let (node_addr, captured) = start_fake_remote_agentd_capturing(200, "node: node-a\n");
+        register_node(&cp_addr, "node-a", &node_addr);
+
+        send_request(&cp_addr, "PUT", "/jails/web-1", "apiVersion: keel/v1\n");
+
+        let received = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+        assert!(
+            received.contains(&format!("Authorization: Bearer {TEST_TOKEN}")),
+            "expected relayed request to carry the control plane's own auth token, got: {received}"
         );
     }
 
