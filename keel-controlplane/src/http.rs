@@ -1,6 +1,6 @@
-use crate::auth;
 use crate::wire::{ErrorBody, Heartbeat, NodeRegistration};
 use crate::worker::{Command, ScheduleOrResolveError};
+use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{self, Sender};
@@ -10,13 +10,19 @@ use std::time::Duration;
 
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
-pub fn run(listener: TcpListener, commands: Sender<Command>, token: Arc<String>) {
+type TlsStream = StreamOwned<ServerConnection, TcpStream>;
+
+pub fn run(listener: TcpListener, commands: Sender<Command>, tls_config: Arc<ServerConfig>) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let commands = commands.clone();
-        let token = Arc::clone(&token);
+        let tls_config = Arc::clone(&tls_config);
         thread::spawn(move || {
-            let _ = handle_connection(stream, &commands, &token);
+            let Ok(conn) = ServerConnection::new(tls_config) else { return };
+            let mut tls_stream = TlsStream::new(conn, stream);
+            if handle_connection(&mut tls_stream, &commands).is_err() {
+                eprintln!("keel-controlplane: TLS handshake or request handling failed for a connection");
+            }
         });
     }
 }
@@ -25,23 +31,22 @@ struct ParsedRequest {
     method: String,
     path: String,
     body: Vec<u8>,
-    auth_header: Option<String>,
 }
 
-fn handle_connection(mut stream: TcpStream, commands: &Sender<Command>, token: &str) -> io::Result<()> {
-    let request = match read_request(&mut stream)? {
+fn handle_connection(stream: &mut TlsStream, commands: &Sender<Command>) -> io::Result<()> {
+    let request = match read_request(stream)? {
         Some(r) => r,
         None => return Ok(()),
     };
-    let (status, body) = route(&request, commands, token);
-    write_response(&mut stream, status, &body)
+    let (status, body) = route(&request, commands);
+    write_response(stream, status, &body)
 }
 
-fn read_request(stream: &mut TcpStream) -> io::Result<Option<ParsedRequest>> {
+fn read_request(stream: &mut TlsStream) -> io::Result<Option<ParsedRequest>> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
 
-    let (method, path, header_len, content_length, auth_header) = loop {
+    let (method, path, header_len, content_length) = loop {
         let mut headers = [httparse::EMPTY_HEADER; 16];
         let mut req = httparse::Request::new(&mut headers);
         match req.parse(&buf) {
@@ -53,15 +58,9 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Option<ParsedRequest>> {
                     .and_then(|h| std::str::from_utf8(h.value).ok())
                     .and_then(|v| v.trim().parse::<usize>().ok())
                     .unwrap_or(0);
-                let auth_header = req
-                    .headers
-                    .iter()
-                    .find(|h| h.name.eq_ignore_ascii_case("authorization"))
-                    .and_then(|h| std::str::from_utf8(h.value).ok())
-                    .map(|v| v.trim().to_string());
                 let method = req.method.unwrap_or("").to_string();
                 let path = req.path.unwrap_or("").to_string();
-                break (method, path, header_len, content_length, auth_header);
+                break (method, path, header_len, content_length);
             }
             Ok(httparse::Status::Partial) => {
                 if buf.len() >= MAX_MESSAGE_BYTES {
@@ -89,10 +88,10 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Option<ParsedRequest>> {
         buf.extend_from_slice(&chunk[..n]);
     }
     let body = buf[header_len..total_len].to_vec();
-    Ok(Some(ParsedRequest { method, path, body, auth_header }))
+    Ok(Some(ParsedRequest { method, path, body }))
 }
 
-fn write_response(stream: &mut TcpStream, status: u16, body: &[u8]) -> io::Result<()> {
+fn write_response(stream: &mut TlsStream, status: u16, body: &[u8]) -> io::Result<()> {
     let header = format!(
         "HTTP/1.1 {status} {}\r\nContent-Length: {}\r\nContent-Type: application/yaml\r\nConnection: close\r\n\r\n",
         reason_phrase(status),
@@ -116,10 +115,7 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-fn route(request: &ParsedRequest, commands: &Sender<Command>, token: &str) -> (u16, Vec<u8>) {
-    if !auth::check(request.auth_header.as_deref(), token) {
-        return error_response(401, "missing or invalid auth token".to_string());
-    }
+fn route(request: &ParsedRequest, commands: &Sender<Command>) -> (u16, Vec<u8>) {
     let segments: Vec<&str> =
         request.path.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
     match (request.method.as_str(), segments.as_slice()) {
@@ -127,27 +123,34 @@ fn route(request: &ParsedRequest, commands: &Sender<Command>, token: &str) -> (u
         ("POST", ["nodes", id, "heartbeat"]) => handle_heartbeat(id, &request.body, commands),
         ("GET", ["nodes"]) => handle_list(commands),
         ("PUT", ["nodes", id, "jails", name]) => {
+            // stopgap "" token, Task 7 replaces forward()'s auth entirely with TLS
             let (status, body) =
-                handle_forward(id, "PUT", &format!("/jails/{name}"), &request.body, commands, token);
+                handle_forward(id, "PUT", &format!("/jails/{name}"), &request.body, commands, "");
             if (200..300).contains(&status) {
                 send_record_placement(name, id, commands);
             }
             (status, body)
         }
-        ("GET", ["nodes", id, "jails"]) => handle_forward(id, "GET", "/jails", &[], commands, token),
+        // stopgap "" token, Task 7 replaces forward()'s auth entirely with TLS
+        ("GET", ["nodes", id, "jails"]) => handle_forward(id, "GET", "/jails", &[], commands, ""),
         ("GET", ["nodes", id, "jails", name]) => {
-            handle_forward(id, "GET", &format!("/jails/{name}"), &[], commands, token)
+            // stopgap "" token, Task 7 replaces forward()'s auth entirely with TLS
+            handle_forward(id, "GET", &format!("/jails/{name}"), &[], commands, "")
         }
         ("DELETE", ["nodes", id, "jails", name]) => {
-            let (status, body) = handle_forward(id, "DELETE", &format!("/jails/{name}"), &[], commands, token);
+            // stopgap "" token, Task 7 replaces forward()'s auth entirely with TLS
+            let (status, body) = handle_forward(id, "DELETE", &format!("/jails/{name}"), &[], commands, "");
             if (200..300).contains(&status) {
                 send_remove_placement(name, commands);
             }
             (status, body)
         }
-        ("PUT", ["jails", name]) => handle_scheduled_apply(name, &request.body, commands, token),
-        ("GET", ["jails", name]) => handle_scheduled_read(name, commands, token),
-        ("DELETE", ["jails", name]) => handle_scheduled_delete(name, commands, token),
+        // stopgap "" token, Task 7 replaces forward()'s auth entirely with TLS
+        ("PUT", ["jails", name]) => handle_scheduled_apply(name, &request.body, commands, ""),
+        // stopgap "" token, Task 7 replaces forward()'s auth entirely with TLS
+        ("GET", ["jails", name]) => handle_scheduled_read(name, commands, ""),
+        // stopgap "" token, Task 7 replaces forward()'s auth entirely with TLS
+        ("DELETE", ["jails", name]) => handle_scheduled_delete(name, commands, ""),
         _ => error_response(404, format!("no route for {} {}", request.method, request.path)),
     }
 }
@@ -354,67 +357,70 @@ mod tests {
     use super::*;
     use crate::placements::Placements;
     use crate::registry::Registry;
+    use crate::tls;
     use crate::worker;
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     const TEST_TOKEN: &str = "test-token-123";
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../testdata/tls")).join(name)
+    }
 
     fn start_test_server() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let (_worker_handle, commands) = worker::spawn(Registry::new(), Placements::new());
-        let token = Arc::new(TEST_TOKEN.to_string());
-        thread::spawn(move || run(listener, commands, token));
+        let tls_config = Arc::new(
+            tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
+                .unwrap(),
+        );
+        thread::spawn(move || run(listener, commands, tls_config));
         addr
     }
 
-    fn send_request(addr: &str, method: &str, path: &str, body: &str) -> (u16, String) {
-        let mut stream = TcpStream::connect(addr).unwrap();
-        let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TEST_TOKEN}\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(request.as_bytes()).unwrap();
-        if let Err(e) = stream.shutdown(std::net::Shutdown::Write) {
-            assert_eq!(e.kind(), std::io::ErrorKind::NotConnected, "unexpected shutdown error: {e}");
-        }
-
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).unwrap();
-
-        let mut headers = [httparse::EMPTY_HEADER; 16];
-        let mut parsed = httparse::Response::new(&mut headers);
-        let header_len = match parsed.parse(&response).unwrap() {
-            httparse::Status::Complete(len) => len,
-            httparse::Status::Partial => panic!("incomplete response: {response:?}"),
-        };
-        let status = parsed.code.unwrap();
-        let body = String::from_utf8(response[header_len..].to_vec()).unwrap();
-        (status, body)
+    fn client_tls_config() -> Arc<rustls::ClientConfig> {
+        Arc::new(
+            tls::load_client_config(
+                &fixture("fixture-client.crt"),
+                &fixture("fixture-client.key"),
+                &fixture("ca.crt"),
+            )
+            .unwrap(),
+        )
     }
 
-    fn send_request_raw(
+    fn wrong_ca_tls_config() -> Arc<rustls::ClientConfig> {
+        Arc::new(
+            tls::load_client_config(&fixture("wrong-ca-node.crt"), &fixture("wrong-ca-node.key"), &fixture("ca.crt"))
+                .unwrap(),
+        )
+    }
+
+    fn send_request(addr: &str, method: &str, path: &str, body: &str) -> (u16, String) {
+        send_request_with(addr, method, path, body, &client_tls_config())
+    }
+
+    fn send_request_with(
         addr: &str,
         method: &str,
         path: &str,
         body: &str,
-        auth_header: Option<&str>,
+        client_config: &Arc<rustls::ClientConfig>,
     ) -> (u16, String) {
-        let mut stream = TcpStream::connect(addr).unwrap();
-        let auth_line = match auth_header {
-            Some(h) => format!("Authorization: {h}\r\n"),
-            None => String::new(),
-        };
+        let server_name = tls::server_name_from_addr(addr).unwrap();
+        let tcp_stream = TcpStream::connect(addr).unwrap();
+        let conn = rustls::ClientConnection::new(Arc::clone(client_config), server_name).unwrap();
+        let mut stream = rustls::StreamOwned::new(conn, tcp_stream);
         let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{auth_line}Content-Length: {}\r\n\r\n{body}",
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(request.as_bytes()).unwrap();
-        if let Err(e) = stream.shutdown(std::net::Shutdown::Write) {
-            assert_eq!(e.kind(), std::io::ErrorKind::NotConnected, "unexpected shutdown error: {e}");
-        }
+        stream.sock.shutdown(std::net::Shutdown::Write).ok();
         let mut response = Vec::new();
-        stream.read_to_end(&mut response).unwrap();
+        let _ = stream.read_to_end(&mut response);
         let mut headers = [httparse::EMPTY_HEADER; 16];
         let mut parsed = httparse::Response::new(&mut headers);
         let header_len = match parsed.parse(&response).unwrap() {
@@ -427,56 +433,44 @@ mod tests {
     }
 
     #[test]
-    fn register_without_auth_header_returns_401() {
+    fn a_client_with_no_certificate_cannot_complete_the_handshake() {
         let addr = start_test_server();
-        let (status, _) = send_request_raw(
-            &addr,
-            "POST",
-            "/nodes/register",
-            "id: node-1\naddr: 10.0.0.1\ncapacity_cpu: 4.0\ncapacity_memory: 8589934592\n",
-            None,
+        let tcp_stream = TcpStream::connect(&addr).unwrap();
+        // A ClientConfig built with no client cert at all: connects, but the
+        // server requires one, so the handshake itself must fail.
+        let roots = {
+            let mut roots = rustls::RootCertStore::empty();
+            let cert = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(fixture("ca.crt")).unwrap()))
+                .next()
+                .unwrap()
+                .unwrap();
+            roots.add(cert).unwrap();
+            roots
+        };
+        let bare_config = Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+        let server_name = tls::server_name_from_addr(&addr).unwrap();
+        let conn = rustls::ClientConnection::new(bare_config, server_name).unwrap();
+        let mut stream = rustls::StreamOwned::new(conn, tcp_stream);
+        // Under TLS 1.3, a client can finish its own side of the handshake
+        // (and thus have write_all succeed) before it has read the server's
+        // rejection alert, since the client doesn't wait for the server's
+        // acknowledgement before considering itself done. So the failure
+        // must be observed across the full write+read round trip, not the
+        // write alone.
+        let write_result = stream.write_all(b"GET /nodes HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+        let mut response = Vec::new();
+        let read_result = stream.read_to_end(&mut response);
+        assert!(
+            write_result.is_err() || read_result.is_err(),
+            "expected the handshake to fail with no client certificate presented"
         );
-        assert_eq!(status, 401);
     }
 
     #[test]
-    fn heartbeat_with_wrong_auth_token_returns_401() {
+    fn a_client_with_a_wrong_ca_certificate_cannot_complete_the_handshake() {
         let addr = start_test_server();
-        send_request(
-            &addr,
-            "POST",
-            "/nodes/register",
-            "id: node-1\naddr: 10.0.0.1\ncapacity_cpu: 4.0\ncapacity_memory: 8589934592\n",
-        );
-        let (status, _) = send_request_raw(
-            &addr,
-            "POST",
-            "/nodes/node-1/heartbeat",
-            "committed_cpu: 0\ncommitted_memory: 0\n",
-            Some("Bearer wrong-token"),
-        );
-        assert_eq!(status, 401);
-    }
-
-    #[test]
-    fn get_nodes_without_auth_header_returns_401() {
-        let addr = start_test_server();
-        let (status, _) = send_request_raw(&addr, "GET", "/nodes", "", None);
-        assert_eq!(status, 401);
-    }
-
-    #[test]
-    fn named_node_forward_without_auth_header_returns_401_even_for_an_unknown_node() {
-        let addr = start_test_server();
-        let (status, body) = send_request_raw(&addr, "GET", "/nodes/missing/jails", "", None);
-        assert_eq!(status, 401, "auth must be checked before route dispatch, got body: {body}");
-    }
-
-    #[test]
-    fn scheduled_apply_without_auth_header_returns_401() {
-        let addr = start_test_server();
-        let (status, _) = send_request_raw(&addr, "PUT", "/jails/web-1", "apiVersion: keel/v1\n", None);
-        assert_eq!(status, 401);
+        let result = std::panic::catch_unwind(|| send_request_with(&addr, "GET", "/nodes", "", &wrong_ca_tls_config()));
+        assert!(result.is_err() || result.unwrap().0 != 200, "expected the handshake to fail for a wrong-CA client certificate");
     }
 
     #[test]
