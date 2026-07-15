@@ -15,12 +15,13 @@ pub fn spawn(
     heartbeat_interval: Duration,
     capacity_cpu: f64,
     capacity_memory: u64,
-    client_config: Arc<rustls::ClientConfig>,
+    reloading_tls: Arc<tls::ReloadingTls>,
     commands: Sender<crate::worker::Command>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut registered = false;
         loop {
+            let client_config = reloading_tls.client_config();
             if !registered {
                 match register_once(&control_plane_addr, &node_id, &advertise_addr, capacity_cpu, capacity_memory, &client_config) {
                     Ok(()) => registered = true,
@@ -139,15 +140,15 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let (_worker_handle, commands) = worker::spawn(Registry::new(), Placements::new());
-        let tls_config = std::sync::Arc::new(
-            crate::tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
-                .unwrap(),
-        );
-        let client_config = std::sync::Arc::new(
-            crate::tls::load_client_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
-                .unwrap(),
-        );
-        thread::spawn(move || keel_controlplane::http::run(listener, commands, tls_config, client_config));
+        let reloading_tls = keel_controlplane::tls::ReloadingTls::spawn(
+            fixture("fixture-node.crt"),
+            fixture("fixture-node.key"),
+            fixture("ca.crt"),
+            fixture("crl.pem"),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        thread::spawn(move || keel_controlplane::http::run(listener, commands, reloading_tls));
         addr
     }
 
@@ -158,11 +159,26 @@ mod tests {
         )
     }
 
-    fn wrong_ca_client_config() -> std::sync::Arc<rustls::ClientConfig> {
-        std::sync::Arc::new(
-            crate::tls::load_client_config(&fixture("wrong-ca-node.crt"), &fixture("wrong-ca-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
-                .unwrap(),
+    fn node_reloading_tls() -> std::sync::Arc<crate::tls::ReloadingTls> {
+        crate::tls::ReloadingTls::spawn(
+            fixture("fixture-node.crt"),
+            fixture("fixture-node.key"),
+            fixture("ca.crt"),
+            fixture("crl.pem"),
+            Duration::from_secs(3600),
         )
+        .unwrap()
+    }
+
+    fn wrong_ca_reloading_tls() -> std::sync::Arc<crate::tls::ReloadingTls> {
+        crate::tls::ReloadingTls::spawn(
+            fixture("wrong-ca-node.crt"),
+            fixture("wrong-ca-node.key"),
+            fixture("ca.crt"),
+            fixture("crl.pem"),
+            Duration::from_secs(3600),
+        )
+        .unwrap()
     }
 
     fn get_nodes(control_plane_addr: &str) -> String {
@@ -264,7 +280,7 @@ mod tests {
             Duration::from_millis(50),
             4.0,
             8 * 1024 * 1024 * 1024,
-            node_client_config(),
+            node_reloading_tls(),
             commands,
         );
 
@@ -322,7 +338,7 @@ mod tests {
             Duration::from_millis(50),
             4.0,
             8 * 1024 * 1024 * 1024,
-            node_client_config(),
+            node_reloading_tls(),
             commands,
         );
 
@@ -369,7 +385,7 @@ mod tests {
             Duration::from_millis(50),
             4.0,
             8 * 1024 * 1024 * 1024,
-            wrong_ca_client_config(),
+            wrong_ca_reloading_tls(),
             commands,
         );
 

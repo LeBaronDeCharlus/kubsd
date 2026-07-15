@@ -2,7 +2,7 @@ use crate::reconciler::ReconcileError;
 use crate::wire::ErrorBody;
 use crate::worker::Command;
 use keel_spec::JailSpec;
-use rustls::{ServerConfig, ServerConnection, StreamOwned};
+use rustls::{ServerConnection, StreamOwned};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -24,11 +24,11 @@ pub fn run(listener: UnixListener, commands: Sender<Command>) {
     }
 }
 
-pub fn run_tls(listener: TcpListener, commands: Sender<Command>, tls_config: Arc<ServerConfig>) {
+pub fn run_tls(listener: TcpListener, commands: Sender<Command>, reloading_tls: Arc<crate::tls::ReloadingTls>) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let commands = commands.clone();
-        let tls_config = Arc::clone(&tls_config);
+        let tls_config = reloading_tls.server_config();
         thread::spawn(move || {
             let Ok(conn) = ServerConnection::new(tls_config) else { return };
             let mut tls_stream = TlsStream::new(conn, stream);
@@ -289,6 +289,7 @@ mod tests {
     use keel_net::FakeNetManager;
     use keel_zfs::FakeZfsManager;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     fn sample_spec_yaml(name: &str) -> String {
         format!(
@@ -464,11 +465,15 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let tls_config = Arc::new(
-            tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
-                .unwrap(),
-        );
-        thread::spawn(move || run_tls(listener, commands, tls_config));
+        let reloading_tls = tls::ReloadingTls::spawn(
+            fixture("fixture-node.crt"),
+            fixture("fixture-node.key"),
+            fixture("ca.crt"),
+            fixture("crl.pem"),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        thread::spawn(move || run_tls(listener, commands, reloading_tls));
         addr
     }
 
@@ -618,6 +623,51 @@ mod tests {
         assert!(
             write_result.is_err() || read_result.is_err(),
             "expected the handshake to fail for a revoked client certificate"
+        );
+    }
+
+    #[test]
+    fn reloading_tls_server_config_picks_up_a_replaced_certificate_without_restart() {
+        let cert_dir = std::env::temp_dir().join(format!("keel-agentd-reload-test-{}", std::process::id()));
+        std::fs::create_dir_all(&cert_dir).unwrap();
+        let cert_path = cert_dir.join("node.crt");
+        let key_path = cert_dir.join("node.key");
+        std::fs::copy(fixture("fixture-node.crt"), &cert_path).unwrap();
+        std::fs::copy(fixture("fixture-node.key"), &key_path).unwrap();
+
+        let reloading = tls::ReloadingTls::spawn(
+            cert_path.clone(),
+            key_path.clone(),
+            fixture("ca.crt"),
+            fixture("crl.pem"),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("keel-agentd-reload-test-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        let zfs = FakeZfsManager::new();
+        zfs.seed_dataset("zroot/keel/base/14.2-web");
+        let reconciler =
+            Reconciler::new(FakeJailRuntime::new(), zfs, FakeNetManager::new(), "zroot".to_string(), state_dir).unwrap();
+        let (_worker_handle, commands) = worker::spawn(reconciler);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || run_tls(listener, commands, reloading));
+
+        let (status, _) = send_request_tcp(&addr, "GET", "/jails", "");
+        assert_eq!(status, 200, "expected the initial fixture-node certificate to be served");
+
+        std::fs::copy(fixture("wrong-ca-node.crt"), &cert_path).unwrap();
+        std::fs::copy(fixture("wrong-ca-node.key"), &key_path).unwrap();
+        thread::sleep(Duration::from_millis(200));
+
+        let result = std::panic::catch_unwind(|| send_request_tcp(&addr, "GET", "/jails", ""));
+        assert!(
+            result.is_err() || result.unwrap().0 != 200,
+            "expected the server's replaced certificate to be rejected by the client after reload"
         );
     }
 }

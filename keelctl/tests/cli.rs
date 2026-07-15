@@ -74,11 +74,15 @@ fn start_test_agentd_tcp(name: &str) -> String {
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let tls_config = std::sync::Arc::new(
-        keel_agentd::tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
-            .unwrap(),
-    );
-    thread::spawn(move || keel_agentd::http::run_tls(listener, commands, tls_config));
+    let reloading_tls = keel_agentd::tls::ReloadingTls::spawn(
+        fixture("fixture-node.crt"),
+        fixture("fixture-node.key"),
+        fixture("ca.crt"),
+        fixture("crl.pem"),
+        std::time::Duration::from_secs(3600),
+    )
+    .unwrap();
+    thread::spawn(move || keel_agentd::http::run_tls(listener, commands, reloading_tls));
     addr
 }
 

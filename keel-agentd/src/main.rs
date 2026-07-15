@@ -118,10 +118,14 @@ fn main() {
     ) {
         let (capacity_cpu, capacity_memory) = keel_agentd::capacity::detect()
             .unwrap_or_else(|e| panic!("failed to detect node capacity via sysctl: {e}"));
-        let tls_server_config = keel_agentd::tls::load_server_config(&cert_file, &key_file, &ca_file, &crl_file)
-            .unwrap_or_else(|e| panic!("failed to load TLS server config: {e}"));
-        let tls_client_config = keel_agentd::tls::load_client_config(&cert_file, &key_file, &ca_file, &crl_file)
-            .unwrap_or_else(|e| panic!("failed to load TLS client config: {e}"));
+        let reloading_tls = keel_agentd::tls::ReloadingTls::spawn(
+            cert_file,
+            key_file,
+            ca_file,
+            crl_file,
+            Duration::from_secs(30),
+        )
+        .unwrap_or_else(|e| panic!("failed to load TLS configuration: {e}"));
         eprintln!(
             "keel-agentd: registering with control plane at {control_plane_addr} as node '{node_id}' ({advertise_addr}), capacity {capacity_cpu} cores / {capacity_memory} bytes"
         );
@@ -132,7 +136,7 @@ fn main() {
             Duration::from_secs(5),
             capacity_cpu,
             capacity_memory,
-            std::sync::Arc::new(tls_client_config),
+            std::sync::Arc::clone(&reloading_tls),
             commands.clone(),
         );
 
@@ -140,7 +144,7 @@ fn main() {
         let tcp_listener = TcpListener::bind(&advertise_addr)
             .unwrap_or_else(|e| panic!("failed to bind jails-API TCP listener on {advertise_addr}: {e}"));
         let tcp_commands = commands.clone();
-        thread::spawn(move || keel_agentd::http::run_tls(tcp_listener, tcp_commands, std::sync::Arc::new(tls_server_config)));
+        thread::spawn(move || keel_agentd::http::run_tls(tcp_listener, tcp_commands, reloading_tls));
     }
 
     let timer_commands = commands.clone();

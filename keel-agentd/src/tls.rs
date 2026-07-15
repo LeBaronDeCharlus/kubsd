@@ -5,7 +5,11 @@ use rustls::RootCertStore;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, Once};
+use std::sync::RwLock;
+use std::thread;
+use std::time::Duration;
 
 static CRYPTO_PROVIDER_INIT: Once = Once::new();
 
@@ -56,6 +60,61 @@ pub fn load_client_config(
         .with_custom_certificate_verifier(server_verifier)
         .with_client_auth_cert(certs, key)
         .map_err(|e| format!("failed to build TLS client config: {e}"))
+}
+
+pub struct ReloadingTls {
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    ca_path: PathBuf,
+    crl_path: PathBuf,
+    server: RwLock<Arc<rustls::ServerConfig>>,
+    client: RwLock<Arc<rustls::ClientConfig>>,
+}
+
+impl ReloadingTls {
+    pub fn spawn(
+        cert_path: PathBuf,
+        key_path: PathBuf,
+        ca_path: PathBuf,
+        crl_path: PathBuf,
+        reload_interval: Duration,
+    ) -> Result<Arc<Self>, String> {
+        let server = load_server_config(&cert_path, &key_path, &ca_path, &crl_path)?;
+        let client = load_client_config(&cert_path, &key_path, &ca_path, &crl_path)?;
+        let this = Arc::new(Self {
+            cert_path,
+            key_path,
+            ca_path,
+            crl_path,
+            server: RwLock::new(Arc::new(server)),
+            client: RwLock::new(Arc::new(client)),
+        });
+        let reload_target = Arc::clone(&this);
+        thread::spawn(move || loop {
+            thread::sleep(reload_interval);
+            reload_target.reload_once();
+        });
+        Ok(this)
+    }
+
+    fn reload_once(&self) {
+        match load_server_config(&self.cert_path, &self.key_path, &self.ca_path, &self.crl_path) {
+            Ok(cfg) => *self.server.write().unwrap() = Arc::new(cfg),
+            Err(e) => eprintln!("keel-agentd: TLS reload failed (server config): {e}"),
+        }
+        match load_client_config(&self.cert_path, &self.key_path, &self.ca_path, &self.crl_path) {
+            Ok(cfg) => *self.client.write().unwrap() = Arc::new(cfg),
+            Err(e) => eprintln!("keel-agentd: TLS reload failed (client config): {e}"),
+        }
+    }
+
+    pub fn server_config(&self) -> Arc<rustls::ServerConfig> {
+        Arc::clone(&self.server.read().unwrap())
+    }
+
+    pub fn client_config(&self) -> Arc<rustls::ClientConfig> {
+        Arc::clone(&self.client.read().unwrap())
+    }
 }
 
 pub fn server_name_from_addr(addr: &str) -> Result<ServerName<'static>, String> {
