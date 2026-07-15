@@ -1,4 +1,3 @@
-pub mod auth;
 pub mod http;
 pub mod placements;
 pub mod registry;
