@@ -13,7 +13,14 @@ const DEFAULT_SOCKET: &str = "/var/run/keel-agentd.sock";
 #[derive(Debug, PartialEq)]
 enum Target {
     Socket(PathBuf),
-    ControlPlane { addr: String, node: Option<String>, tls_ca_file: PathBuf, tls_cert_file: PathBuf, tls_key_file: PathBuf },
+    ControlPlane {
+        addr: String,
+        node: Option<String>,
+        tls_ca_file: PathBuf,
+        tls_cert_file: PathBuf,
+        tls_key_file: PathBuf,
+        tls_crl_file: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -24,8 +31,17 @@ fn main() -> ExitCode {
     let tls_ca_file = extract_flag(&mut args, "--tls-ca-file");
     let tls_cert_file = extract_flag(&mut args, "--tls-cert-file");
     let tls_key_file = extract_flag(&mut args, "--tls-key-file");
+    let tls_crl_file = extract_flag(&mut args, "--tls-crl-file");
 
-    let target = match resolve_target(socket, control_plane_addr, node, tls_ca_file, tls_cert_file, tls_key_file) {
+    let target = match resolve_target(
+        socket,
+        control_plane_addr,
+        node,
+        tls_ca_file,
+        tls_cert_file,
+        tls_key_file,
+        tls_crl_file,
+    ) {
         Ok(target) => target,
         Err(message) => {
             eprintln!("error: {message}");
@@ -74,20 +90,23 @@ fn resolve_target(
     tls_ca_file: Option<String>,
     tls_cert_file: Option<String>,
     tls_key_file: Option<String>,
+    tls_crl_file: Option<String>,
 ) -> Result<Target, String> {
-    match (control_plane_addr, node, tls_ca_file, tls_cert_file, tls_key_file) {
-        (Some(addr), node, Some(ca), Some(cert), Some(key)) => Ok(Target::ControlPlane {
+    match (control_plane_addr, node, tls_ca_file, tls_cert_file, tls_key_file, tls_crl_file) {
+        (Some(addr), node, Some(ca), Some(cert), Some(key), Some(crl)) => Ok(Target::ControlPlane {
             addr,
             node,
             tls_ca_file: PathBuf::from(ca),
             tls_cert_file: PathBuf::from(cert),
             tls_key_file: PathBuf::from(key),
+            tls_crl_file: PathBuf::from(crl),
         }),
-        (Some(_), _, _, _, _) => {
-            Err("--tls-ca-file, --tls-cert-file, and --tls-key-file are all required with --control-plane-addr".to_string())
-        }
-        (None, Some(_), _, _, _) => Err("--node requires --control-plane-addr".to_string()),
-        (None, None, _, _, _) => Ok(Target::Socket(socket)),
+        (Some(_), _, _, _, _, _) => Err(
+            "--tls-ca-file, --tls-cert-file, --tls-key-file, and --tls-crl-file are all required with --control-plane-addr"
+                .to_string(),
+        ),
+        (None, Some(_), _, _, _, _) => Err("--node requires --control-plane-addr".to_string()),
+        (None, None, _, _, _, _) => Ok(Target::Socket(socket)),
     }
 }
 
@@ -102,8 +121,8 @@ fn jails_path(target: &Target, suffix: &str) -> String {
 fn dispatch(target: &Target, method: &str, path: &str, body: &str) -> Result<String, String> {
     match target {
         Target::Socket(socket) => send_request(socket, method, path, body),
-        Target::ControlPlane { addr, tls_ca_file, tls_cert_file, tls_key_file, .. } => {
-            send_request_tcp(addr, method, path, body, tls_ca_file, tls_cert_file, tls_key_file)
+        Target::ControlPlane { addr, tls_ca_file, tls_cert_file, tls_key_file, tls_crl_file, .. } => {
+            send_request_tcp(addr, method, path, body, tls_ca_file, tls_cert_file, tls_key_file, tls_crl_file)
         }
     }
 }
@@ -153,9 +172,10 @@ fn send_request_tcp(
     tls_ca_file: &PathBuf,
     tls_cert_file: &PathBuf,
     tls_key_file: &PathBuf,
+    tls_crl_file: &PathBuf,
 ) -> Result<String, String> {
     let client_config = std::sync::Arc::new(
-        tls::load_client_config(tls_cert_file, tls_key_file, tls_ca_file)
+        tls::load_client_config(tls_cert_file, tls_key_file, tls_ca_file, tls_crl_file)
             .map_err(|e| format!("failed to load TLS client config: {e}"))?,
     );
     let server_name = tls::server_name_from_addr(addr).map_err(|e| e.to_string())?;
@@ -226,7 +246,7 @@ mod tests {
 
     #[test]
     fn no_control_plane_flags_yields_socket_target() {
-        let target = resolve_target(PathBuf::from("/var/run/keel-agentd.sock"), None, None, None, None, None).unwrap();
+        let target = resolve_target(PathBuf::from("/var/run/keel-agentd.sock"), None, None, None, None, None, None).unwrap();
         assert_eq!(target, Target::Socket(PathBuf::from("/var/run/keel-agentd.sock")));
     }
 
@@ -236,6 +256,7 @@ mod tests {
             PathBuf::from("/var/run/keel-agentd.sock"),
             None,
             Some("node-1".to_string()),
+            None,
             None,
             None,
             None,
@@ -253,9 +274,13 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap_err();
-        assert_eq!(err, "--tls-ca-file, --tls-cert-file, and --tls-key-file are all required with --control-plane-addr");
+        assert_eq!(
+            err,
+            "--tls-ca-file, --tls-cert-file, --tls-key-file, and --tls-crl-file are all required with --control-plane-addr"
+        );
     }
 
     #[test]
@@ -267,6 +292,7 @@ mod tests {
             Some("/etc/keel/ca.crt".to_string()),
             Some("/etc/keel/alice.crt".to_string()),
             Some("/etc/keel/alice.key".to_string()),
+            Some("/etc/keel/crl.pem".to_string()),
         )
         .unwrap();
         assert_eq!(
@@ -277,6 +303,7 @@ mod tests {
                 tls_ca_file: PathBuf::from("/etc/keel/ca.crt"),
                 tls_cert_file: PathBuf::from("/etc/keel/alice.crt"),
                 tls_key_file: PathBuf::from("/etc/keel/alice.key"),
+                tls_crl_file: PathBuf::from("/etc/keel/crl.pem"),
             }
         );
     }

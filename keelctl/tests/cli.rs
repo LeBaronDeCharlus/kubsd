@@ -75,7 +75,7 @@ fn start_test_agentd_tcp(name: &str) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let tls_config = std::sync::Arc::new(
-        keel_agentd::tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
+        keel_agentd::tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
             .unwrap(),
     );
     thread::spawn(move || keel_agentd::http::run_tls(listener, commands, tls_config));
@@ -101,11 +101,11 @@ fn start_test_control_plane_with_node(node_id: &str, node_addr: &str) -> String 
     reg_rx.recv().unwrap();
 
     let tls_config = std::sync::Arc::new(
-        keel_controlplane::tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
+        keel_controlplane::tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
             .unwrap(),
     );
     let client_config = std::sync::Arc::new(
-        keel_controlplane::tls::load_client_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
+        keel_controlplane::tls::load_client_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
             .unwrap(),
     );
     thread::spawn(move || keel_controlplane::http::run(listener, commands, tls_config, client_config));
@@ -125,6 +125,8 @@ fn run_keelctl_routed(control_plane_addr: &str, node: &str, args: &[&str]) -> (b
         .arg(fixture("fixture-client.crt"))
         .arg("--tls-key-file")
         .arg(fixture("fixture-client.key"))
+        .arg("--tls-crl-file")
+        .arg(fixture("crl.pem"))
         .output()
         .expect("failed to run keelctl binary");
     (
@@ -146,7 +148,7 @@ fn start_fake_control_plane_with_truncated_body(claimed_body: &'static str, actu
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let server_config = std::sync::Arc::new(
-        keel_controlplane::tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
+        keel_controlplane::tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
             .unwrap(),
     );
     thread::spawn(move || {
@@ -205,6 +207,8 @@ fn run_keelctl_scheduled(control_plane_addr: &str, args: &[&str]) -> (bool, Stri
         .arg(fixture("fixture-client.crt"))
         .arg("--tls-key-file")
         .arg(fixture("fixture-client.key"))
+        .arg("--tls-crl-file")
+        .arg(fixture("crl.pem"))
         .output()
         .expect("failed to run keelctl binary");
     (

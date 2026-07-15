@@ -1,30 +1,37 @@
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::client::WebPkiServerVerifier;
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName};
 use rustls::RootCertStore;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
-use std::sync::Once;
+use std::sync::{Arc, Once};
 
 static CRYPTO_PROVIDER_INIT: Once = Once::new();
 
 pub fn ensure_crypto_provider() {
     CRYPTO_PROVIDER_INIT.call_once(|| {
-        // Ignore the error: it only occurs if some other crate (e.g. another
-        // `keel-*` crate linked into the same process, as happens in this
-        // binary's own integration tests) already installed a default
-        // provider first. Either way, a process-wide default is now in
-        // place, which is all this function promises.
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
 }
 
-pub fn load_client_config(cert_path: &Path, key_path: &Path, ca_path: &Path) -> Result<rustls::ClientConfig, String> {
+pub fn load_client_config(
+    cert_path: &Path,
+    key_path: &Path,
+    ca_path: &Path,
+    crl_path: &Path,
+) -> Result<rustls::ClientConfig, String> {
     ensure_crypto_provider();
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
     let roots = load_root_store(ca_path)?;
+    let crls = load_crls(crl_path)?;
+    let server_verifier = WebPkiServerVerifier::builder(Arc::new(roots))
+        .with_crls(crls)
+        .build()
+        .map_err(|e| format!("failed to build server certificate verifier: {e}"))?;
     rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
+        .dangerous()
+        .with_custom_certificate_verifier(server_verifier)
         .with_client_auth_cert(certs, key)
         .map_err(|e| format!("failed to build TLS client config: {e}"))
 }
@@ -63,6 +70,17 @@ fn load_root_store(ca_path: &Path) -> Result<RootCertStore, String> {
     Ok(roots)
 }
 
+fn load_crls(path: &Path) -> Result<Vec<CertificateRevocationListDer<'static>>, String> {
+    let file = File::open(path).map_err(|e| format!("failed to open CRL file {}: {e}", path.display()))?;
+    let crls: Vec<_> = rustls_pemfile::crls(&mut BufReader::new(file))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("failed to parse CRL file {}: {e}", path.display()))?;
+    if crls.is_empty() {
+        return Err(format!("no CRL found in {}", path.display()));
+    }
+    Ok(crls)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,16 +92,37 @@ mod tests {
 
     #[test]
     fn load_client_config_succeeds_with_valid_fixtures() {
-        load_client_config(&fixture("fixture-client.crt"), &fixture("fixture-client.key"), &fixture("ca.crt"))
-            .expect("expected a valid client config");
+        load_client_config(
+            &fixture("fixture-client.crt"),
+            &fixture("fixture-client.key"),
+            &fixture("ca.crt"),
+            &fixture("crl.pem"),
+        )
+        .expect("expected a valid client config");
     }
 
     #[test]
     fn load_client_config_fails_on_a_missing_key_file() {
-        let err =
-            load_client_config(&fixture("fixture-client.crt"), &fixture("does-not-exist.key"), &fixture("ca.crt"))
-                .unwrap_err();
+        let err = load_client_config(
+            &fixture("fixture-client.crt"),
+            &fixture("does-not-exist.key"),
+            &fixture("ca.crt"),
+            &fixture("crl.pem"),
+        )
+        .unwrap_err();
         assert!(err.contains("does-not-exist.key"), "got: {err}");
+    }
+
+    #[test]
+    fn load_client_config_fails_on_a_missing_crl_file() {
+        let err = load_client_config(
+            &fixture("fixture-client.crt"),
+            &fixture("fixture-client.key"),
+            &fixture("ca.crt"),
+            &fixture("does-not-exist-crl.pem"),
+        )
+        .unwrap_err();
+        assert!(err.contains("does-not-exist-crl.pem"), "got: {err}");
     }
 
     #[test]
