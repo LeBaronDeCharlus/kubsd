@@ -17,7 +17,9 @@ struct Config {
     node_id: Option<String>,
     control_plane_addr: Option<String>,
     advertise_addr: Option<String>,
-    auth_token_file: Option<PathBuf>,
+    tls_ca_file: Option<PathBuf>,
+    tls_cert_file: Option<PathBuf>,
+    tls_key_file: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -29,7 +31,9 @@ impl Default for Config {
             node_id: None,
             control_plane_addr: None,
             advertise_addr: None,
-            auth_token_file: None,
+            tls_ca_file: None,
+            tls_cert_file: None,
+            tls_key_file: None,
         }
     }
 }
@@ -50,12 +54,22 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Config {
             "--node-id" => config.node_id = Some(value),
             "--control-plane-addr" => config.control_plane_addr = Some(value),
             "--advertise-addr" => config.advertise_addr = Some(value),
-            "--auth-token-file" => config.auth_token_file = Some(PathBuf::from(value)),
+            "--tls-ca-file" => config.tls_ca_file = Some(PathBuf::from(value)),
+            "--tls-cert-file" => config.tls_cert_file = Some(PathBuf::from(value)),
+            "--tls-key-file" => config.tls_key_file = Some(PathBuf::from(value)),
             other => panic!("unknown flag: {other}"),
         }
     }
-    if config.control_plane_addr.is_some() && (config.node_id.is_none() || config.advertise_addr.is_none() || config.auth_token_file.is_none()) {
-        panic!("--node-id, --advertise-addr, and --auth-token-file are required when --control-plane-addr is set");
+    if config.control_plane_addr.is_some()
+        && (config.node_id.is_none()
+            || config.advertise_addr.is_none()
+            || config.tls_ca_file.is_none()
+            || config.tls_cert_file.is_none()
+            || config.tls_key_file.is_none())
+    {
+        panic!(
+            "--node-id, --advertise-addr, --tls-ca-file, --tls-cert-file, and --tls-key-file are all required when --control-plane-addr is set"
+        );
     }
     config
 }
@@ -81,13 +95,20 @@ fn main() {
 
     let (_worker_handle, commands) = worker::spawn(reconciler);
 
-    if let (Some(node_id), Some(control_plane_addr), Some(advertise_addr), Some(auth_token_file)) =
-        (config.node_id.clone(), config.control_plane_addr.clone(), config.advertise_addr.clone(), config.auth_token_file.clone())
-    {
-        let token = keel_agentd::auth::load_token(&auth_token_file)
-            .unwrap_or_else(|e| panic!("failed to load auth token: {e}"));
+    if let (Some(node_id), Some(control_plane_addr), Some(advertise_addr), Some(ca_file), Some(cert_file), Some(key_file)) = (
+        config.node_id.clone(),
+        config.control_plane_addr.clone(),
+        config.advertise_addr.clone(),
+        config.tls_ca_file.clone(),
+        config.tls_cert_file.clone(),
+        config.tls_key_file.clone(),
+    ) {
         let (capacity_cpu, capacity_memory) = keel_agentd::capacity::detect()
             .unwrap_or_else(|e| panic!("failed to detect node capacity via sysctl: {e}"));
+        let tls_server_config = keel_agentd::tls::load_server_config(&cert_file, &key_file, &ca_file)
+            .unwrap_or_else(|e| panic!("failed to load TLS server config: {e}"));
+        let tls_client_config = keel_agentd::tls::load_client_config(&cert_file, &key_file, &ca_file)
+            .unwrap_or_else(|e| panic!("failed to load TLS client config: {e}"));
         eprintln!(
             "keel-agentd: registering with control plane at {control_plane_addr} as node '{node_id}' ({advertise_addr}), capacity {capacity_cpu} cores / {capacity_memory} bytes"
         );
@@ -98,16 +119,15 @@ fn main() {
             Duration::from_secs(5),
             capacity_cpu,
             capacity_memory,
-            token.clone(),
+            std::sync::Arc::new(tls_client_config),
             commands.clone(),
         );
 
-        eprintln!("keel-agentd: serving jails API over TCP on {advertise_addr}");
+        eprintln!("keel-agentd: serving jails API over TLS on {advertise_addr}");
         let tcp_listener = TcpListener::bind(&advertise_addr)
             .unwrap_or_else(|e| panic!("failed to bind jails-API TCP listener on {advertise_addr}: {e}"));
         let tcp_commands = commands.clone();
-        let tcp_token = std::sync::Arc::new(token);
-        thread::spawn(move || keel_agentd::http::run_tcp(tcp_listener, tcp_commands, tcp_token));
+        thread::spawn(move || keel_agentd::http::run_tls(tcp_listener, tcp_commands, std::sync::Arc::new(tls_server_config)));
     }
 
     let timer_commands = commands.clone();
@@ -142,42 +162,62 @@ mod tests {
         assert_eq!(config.node_id, None);
         assert_eq!(config.control_plane_addr, None);
         assert_eq!(config.advertise_addr, None);
-        assert_eq!(config.auth_token_file, None);
+        assert_eq!(config.tls_ca_file, None);
+        assert_eq!(config.tls_cert_file, None);
+        assert_eq!(config.tls_key_file, None);
     }
 
     #[test]
-    fn parses_all_four_new_flags() {
+    fn parses_all_six_control_plane_flags() {
         let config = parse_args_from(args(&[
-            "--node-id",
-            "node-2",
-            "--control-plane-addr",
-            "192.168.64.2:7620",
-            "--advertise-addr",
-            "192.168.64.2",
-            "--auth-token-file",
-            "/path/to/token",
+            "--node-id", "node-2",
+            "--control-plane-addr", "192.168.64.2:7620",
+            "--advertise-addr", "192.168.64.2",
+            "--tls-ca-file", "/etc/keel/ca.crt",
+            "--tls-cert-file", "/etc/keel/node-2.crt",
+            "--tls-key-file", "/etc/keel/node-2.key",
         ]));
         assert_eq!(config.node_id, Some("node-2".to_string()));
         assert_eq!(config.control_plane_addr, Some("192.168.64.2:7620".to_string()));
         assert_eq!(config.advertise_addr, Some("192.168.64.2".to_string()));
-        assert_eq!(config.auth_token_file, Some(PathBuf::from("/path/to/token")));
+        assert_eq!(config.tls_ca_file, Some(PathBuf::from("/etc/keel/ca.crt")));
+        assert_eq!(config.tls_cert_file, Some(PathBuf::from("/etc/keel/node-2.crt")));
+        assert_eq!(config.tls_key_file, Some(PathBuf::from("/etc/keel/node-2.key")));
     }
 
     #[test]
-    #[should_panic(expected = "--node-id, --advertise-addr, and --auth-token-file are required when --control-plane-addr is set")]
+    #[should_panic(expected = "--node-id, --advertise-addr, --tls-ca-file, --tls-cert-file, and --tls-key-file are all required when --control-plane-addr is set")]
     fn control_plane_addr_without_node_id_panics() {
-        parse_args_from(args(&["--control-plane-addr", "192.168.64.2:7620", "--advertise-addr", "192.168.64.2", "--auth-token-file", "/path/to/token"]));
+        parse_args_from(args(&[
+            "--control-plane-addr", "192.168.64.2:7620",
+            "--advertise-addr", "192.168.64.2",
+            "--tls-ca-file", "/etc/keel/ca.crt",
+            "--tls-cert-file", "/etc/keel/node-2.crt",
+            "--tls-key-file", "/etc/keel/node-2.key",
+        ]));
     }
 
     #[test]
-    #[should_panic(expected = "--node-id, --advertise-addr, and --auth-token-file are required when --control-plane-addr is set")]
+    #[should_panic(expected = "--node-id, --advertise-addr, --tls-ca-file, --tls-cert-file, and --tls-key-file are all required when --control-plane-addr is set")]
     fn control_plane_addr_without_advertise_addr_panics() {
-        parse_args_from(args(&["--control-plane-addr", "192.168.64.2:7620", "--node-id", "node-2", "--auth-token-file", "/path/to/token"]));
+        parse_args_from(args(&[
+            "--control-plane-addr", "192.168.64.2:7620",
+            "--node-id", "node-2",
+            "--tls-ca-file", "/etc/keel/ca.crt",
+            "--tls-cert-file", "/etc/keel/node-2.crt",
+            "--tls-key-file", "/etc/keel/node-2.key",
+        ]));
     }
 
     #[test]
-    #[should_panic(expected = "--node-id, --advertise-addr, and --auth-token-file are required when --control-plane-addr is set")]
-    fn control_plane_addr_without_auth_token_file_panics() {
-        parse_args_from(args(&["--control-plane-addr", "192.168.64.2:7620", "--node-id", "node-2", "--advertise-addr", "192.168.64.2"]));
+    #[should_panic(expected = "--node-id, --advertise-addr, --tls-ca-file, --tls-cert-file, and --tls-key-file are all required when --control-plane-addr is set")]
+    fn control_plane_addr_without_tls_key_file_panics() {
+        parse_args_from(args(&[
+            "--control-plane-addr", "192.168.64.2:7620",
+            "--node-id", "node-2",
+            "--advertise-addr", "192.168.64.2",
+            "--tls-ca-file", "/etc/keel/ca.crt",
+            "--tls-cert-file", "/etc/keel/node-2.crt",
+        ]));
     }
 }
