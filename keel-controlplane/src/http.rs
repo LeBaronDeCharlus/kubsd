@@ -1,3 +1,4 @@
+use crate::tls;
 use crate::wire::{ErrorBody, Heartbeat, NodeRegistration};
 use crate::worker::{Command, ScheduleOrResolveError};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
@@ -12,15 +13,21 @@ const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
 type TlsStream = StreamOwned<ServerConnection, TcpStream>;
 
-pub fn run(listener: TcpListener, commands: Sender<Command>, tls_config: Arc<ServerConfig>) {
+pub fn run(
+    listener: TcpListener,
+    commands: Sender<Command>,
+    tls_config: Arc<ServerConfig>,
+    client_config: Arc<rustls::ClientConfig>,
+) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let commands = commands.clone();
         let tls_config = Arc::clone(&tls_config);
+        let client_config = Arc::clone(&client_config);
         thread::spawn(move || {
             let Ok(conn) = ServerConnection::new(tls_config) else { return };
             let mut tls_stream = TlsStream::new(conn, stream);
-            if handle_connection(&mut tls_stream, &commands).is_err() {
+            if handle_connection(&mut tls_stream, &commands, &client_config).is_err() {
                 eprintln!("keel-controlplane: TLS handshake or request handling failed for a connection");
             }
         });
@@ -33,12 +40,16 @@ struct ParsedRequest {
     body: Vec<u8>,
 }
 
-fn handle_connection(stream: &mut TlsStream, commands: &Sender<Command>) -> io::Result<()> {
+fn handle_connection(
+    stream: &mut TlsStream,
+    commands: &Sender<Command>,
+    client_config: &Arc<rustls::ClientConfig>,
+) -> io::Result<()> {
     let request = match read_request(stream)? {
         Some(r) => r,
         None => return Ok(()),
     };
-    let (status, body) = route(&request, commands);
+    let (status, body) = route(&request, commands, client_config);
     write_response(stream, status, &body)
 }
 
@@ -115,7 +126,11 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-fn route(request: &ParsedRequest, commands: &Sender<Command>) -> (u16, Vec<u8>) {
+fn route(
+    request: &ParsedRequest,
+    commands: &Sender<Command>,
+    client_config: &Arc<rustls::ClientConfig>,
+) -> (u16, Vec<u8>) {
     let segments: Vec<&str> =
         request.path.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
     match (request.method.as_str(), segments.as_slice()) {
@@ -123,39 +138,37 @@ fn route(request: &ParsedRequest, commands: &Sender<Command>) -> (u16, Vec<u8>) 
         ("POST", ["nodes", id, "heartbeat"]) => handle_heartbeat(id, &request.body, commands),
         ("GET", ["nodes"]) => handle_list(commands),
         ("PUT", ["nodes", id, "jails", name]) => {
-            // stopgap "" token, Task 7 replaces forward()'s auth entirely with TLS
             let (status, body) =
-                handle_forward(id, "PUT", &format!("/jails/{name}"), &request.body, commands, "");
+                handle_forward(id, "PUT", &format!("/jails/{name}"), &request.body, commands, client_config);
             if (200..300).contains(&status) {
                 send_record_placement(name, id, commands);
             }
             (status, body)
         }
-        // stopgap "" token, Task 7 replaces forward()'s auth entirely with TLS
-        ("GET", ["nodes", id, "jails"]) => handle_forward(id, "GET", "/jails", &[], commands, ""),
+        ("GET", ["nodes", id, "jails"]) => handle_forward(id, "GET", "/jails", &[], commands, client_config),
         ("GET", ["nodes", id, "jails", name]) => {
-            // stopgap "" token, Task 7 replaces forward()'s auth entirely with TLS
-            handle_forward(id, "GET", &format!("/jails/{name}"), &[], commands, "")
+            handle_forward(id, "GET", &format!("/jails/{name}"), &[], commands, client_config)
         }
         ("DELETE", ["nodes", id, "jails", name]) => {
-            // stopgap "" token, Task 7 replaces forward()'s auth entirely with TLS
-            let (status, body) = handle_forward(id, "DELETE", &format!("/jails/{name}"), &[], commands, "");
+            let (status, body) = handle_forward(id, "DELETE", &format!("/jails/{name}"), &[], commands, client_config);
             if (200..300).contains(&status) {
                 send_remove_placement(name, commands);
             }
             (status, body)
         }
-        // stopgap "" token, Task 7 replaces forward()'s auth entirely with TLS
-        ("PUT", ["jails", name]) => handle_scheduled_apply(name, &request.body, commands, ""),
-        // stopgap "" token, Task 7 replaces forward()'s auth entirely with TLS
-        ("GET", ["jails", name]) => handle_scheduled_read(name, commands, ""),
-        // stopgap "" token, Task 7 replaces forward()'s auth entirely with TLS
-        ("DELETE", ["jails", name]) => handle_scheduled_delete(name, commands, ""),
+        ("PUT", ["jails", name]) => handle_scheduled_apply(name, &request.body, commands, client_config),
+        ("GET", ["jails", name]) => handle_scheduled_read(name, commands, client_config),
+        ("DELETE", ["jails", name]) => handle_scheduled_delete(name, commands, client_config),
         _ => error_response(404, format!("no route for {} {}", request.method, request.path)),
     }
 }
 
-fn handle_scheduled_apply(name: &str, body: &[u8], commands: &Sender<Command>, token: &str) -> (u16, Vec<u8>) {
+fn handle_scheduled_apply(
+    name: &str,
+    body: &[u8],
+    commands: &Sender<Command>,
+    client_config: &Arc<rustls::ClientConfig>,
+) -> (u16, Vec<u8>) {
     let (reply_tx, reply_rx) = mpsc::channel();
     if commands.send(Command::ResolveOrSchedule(name.to_string(), reply_tx)).is_err() {
         return error_response(500, "control plane worker is not running".to_string());
@@ -166,7 +179,7 @@ fn handle_scheduled_apply(name: &str, body: &[u8], commands: &Sender<Command>, t
         Ok(Err(ScheduleOrResolveError::Resolve(e))) => return error_response(404, e.to_string()),
         Err(_) => return error_response(500, "control plane worker did not respond".to_string()),
     };
-    match forward(&addr, "PUT", &format!("/jails/{name}"), body, token) {
+    match forward(&addr, "PUT", &format!("/jails/{name}"), body, client_config) {
         Ok((status, response_body)) => {
             if (200..300).contains(&status) {
                 send_record_placement(name, &node_id, commands);
@@ -177,23 +190,31 @@ fn handle_scheduled_apply(name: &str, body: &[u8], commands: &Sender<Command>, t
     }
 }
 
-fn handle_scheduled_read(name: &str, commands: &Sender<Command>, token: &str) -> (u16, Vec<u8>) {
+fn handle_scheduled_read(
+    name: &str,
+    commands: &Sender<Command>,
+    client_config: &Arc<rustls::ClientConfig>,
+) -> (u16, Vec<u8>) {
     let (node_id, addr) = match resolve_placement(name, commands) {
         Ok(pair) => pair,
         Err(response) => return response,
     };
-    match forward(&addr, "GET", &format!("/jails/{name}"), &[], token) {
+    match forward(&addr, "GET", &format!("/jails/{name}"), &[], client_config) {
         Ok((status, response_body)) => (status, response_body),
         Err(e) => error_response(500, format!("failed to reach node '{node_id}' at {addr}: {e}")),
     }
 }
 
-fn handle_scheduled_delete(name: &str, commands: &Sender<Command>, token: &str) -> (u16, Vec<u8>) {
+fn handle_scheduled_delete(
+    name: &str,
+    commands: &Sender<Command>,
+    client_config: &Arc<rustls::ClientConfig>,
+) -> (u16, Vec<u8>) {
     let (node_id, addr) = match resolve_placement(name, commands) {
         Ok(pair) => pair,
         Err(response) => return response,
     };
-    match forward(&addr, "DELETE", &format!("/jails/{name}"), &[], token) {
+    match forward(&addr, "DELETE", &format!("/jails/{name}"), &[], client_config) {
         Ok((status, response_body)) => {
             if (200..300).contains(&status) {
                 send_remove_placement(name, commands);
@@ -293,7 +314,7 @@ fn handle_forward(
     path: &str,
     body: &[u8],
     commands: &Sender<Command>,
-    token: &str,
+    client_config: &Arc<rustls::ClientConfig>,
 ) -> (u16, Vec<u8>) {
     let (reply_tx, reply_rx) = mpsc::channel();
     if commands.send(Command::Resolve(id.to_string(), reply_tx)).is_err() {
@@ -304,32 +325,53 @@ fn handle_forward(
         Ok(Err(e)) => return error_response(404, e.to_string()),
         Err(_) => return error_response(500, "control plane worker did not respond".to_string()),
     };
-    match forward(&addr, method, path, body, token) {
+    match forward(&addr, method, path, body, client_config) {
         Ok((status, response_body)) => (status, response_body),
         Err(e) => error_response(500, format!("failed to reach node '{id}' at {addr}: {e}")),
     }
 }
 
-fn forward(addr: &str, method: &str, path: &str, body: &[u8], token: &str) -> Result<(u16, Vec<u8>), String> {
+fn forward(
+    addr: &str,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    client_config: &Arc<rustls::ClientConfig>,
+) -> Result<(u16, Vec<u8>), String> {
     let socket_addr = addr
         .to_socket_addrs()
         .map_err(|e| e.to_string())?
         .next()
         .ok_or_else(|| "could not resolve address".to_string())?;
-    let mut stream =
+    let tcp_stream =
         TcpStream::connect_timeout(&socket_addr, FORWARD_CONNECT_TIMEOUT).map_err(|e| e.to_string())?;
-    stream.set_read_timeout(Some(FORWARD_READ_TIMEOUT)).ok();
+    tcp_stream.set_read_timeout(Some(FORWARD_READ_TIMEOUT)).ok();
+    let server_name = tls::server_name_from_addr(addr)?;
+    let conn = rustls::ClientConnection::new(Arc::clone(client_config), server_name).map_err(|e| e.to_string())?;
+    let mut stream = rustls::StreamOwned::new(conn, tcp_stream);
 
-    let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n",
-        body.len()
-    );
+    let request = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n", body.len());
     stream.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
     stream.write_all(body).map_err(|e| e.to_string())?;
-    stream.shutdown(std::net::Shutdown::Write).ok();
+    stream.sock.shutdown(std::net::Shutdown::Write).ok();
 
+    // Read until the peer closes the connection. rustls surfaces a plain TCP
+    // close that lacks a TLS `close_notify` alert as `ErrorKind::UnexpectedEof`
+    // rather than `Ok(0)`, to guard against truncation attacks in general; for
+    // a request/response protocol that already frames its body with
+    // Content-Length, and against peers (like agentd) that simply drop the
+    // connection once they're done writing, that distinction doesn't matter
+    // here, so treat it the same as a clean close.
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).map_err(|e| e.to_string())?;
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
 
     let mut headers = [httparse::EMPTY_HEADER; 16];
     let mut parsed = httparse::Response::new(&mut headers);
@@ -360,9 +402,6 @@ mod tests {
     use crate::tls;
     use crate::worker;
     use std::path::PathBuf;
-    use std::sync::Mutex;
-
-    const TEST_TOKEN: &str = "test-token-123";
 
     fn fixture(name: &str) -> PathBuf {
         PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../testdata/tls")).join(name)
@@ -376,7 +415,8 @@ mod tests {
             tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
                 .unwrap(),
         );
-        thread::spawn(move || run(listener, commands, tls_config));
+        let client_config = client_tls_config();
+        thread::spawn(move || run(listener, commands, tls_config, client_config));
         addr
     }
 
@@ -589,12 +629,18 @@ mod tests {
         assert_eq!(status, 400);
     }
 
-    fn start_fake_remote_agentd(status: u16, body: &'static str) -> String {
+    fn start_fake_remote_tls_agentd(status: u16, body: &'static str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
+        let server_config = Arc::new(
+            tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
+                .unwrap(),
+        );
         thread::spawn(move || {
             for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
+                let Ok(stream) = stream else { continue };
+                let Ok(conn) = rustls::ServerConnection::new(Arc::clone(&server_config)) else { continue };
+                let mut tls_stream = rustls::StreamOwned::new(conn, stream);
                 // Drain the whole request (forward() sends it as two
                 // separate write_all calls, headers then body, followed by
                 // shutdown(Write)) before responding. Reading only once can
@@ -605,7 +651,7 @@ mod tests {
                 // client then sees as a spurious connection reset.
                 let mut buf = [0u8; 4096];
                 loop {
-                    match stream.read(&mut buf) {
+                    match tls_stream.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(_) => continue,
                     }
@@ -614,8 +660,8 @@ mod tests {
                     "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nContent-Type: application/yaml\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
+                let _ = tls_stream.write_all(response.as_bytes());
+                let _ = tls_stream.flush();
             }
         });
         addr
@@ -630,68 +676,10 @@ mod tests {
         );
     }
 
-    fn start_fake_remote_agentd_capturing(status: u16, body: &'static str) -> (String, Arc<Mutex<Vec<u8>>>) {
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let captured_clone = Arc::clone(&captured);
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                let mut buf = [0u8; 4096];
-                let mut received = Vec::new();
-                loop {
-                    match stream.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => received.extend_from_slice(&buf[..n]),
-                    }
-                }
-                *captured_clone.lock().unwrap() = received;
-                let response = format!(
-                    "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nContent-Type: application/yaml\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
-            }
-        });
-        (addr, captured)
-    }
-
     #[test]
-    fn named_node_forward_attaches_the_control_planes_auth_token_to_the_outbound_request() {
+    fn forward_over_tls_relays_status_and_body_from_the_target_node() {
         let cp_addr = start_test_server();
-        let (node_addr, captured) = start_fake_remote_agentd_capturing(200, "running: true\n");
-        register_node(&cp_addr, "node-1", &node_addr);
-
-        send_request(&cp_addr, "PUT", "/nodes/node-1/jails/web-1", "apiVersion: keel/v1\n");
-
-        let received = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
-        assert!(
-            received.contains(&format!("Authorization: Bearer {TEST_TOKEN}")),
-            "expected relayed request to carry the control plane's own auth token, got: {received}"
-        );
-    }
-
-    #[test]
-    fn scheduled_apply_attaches_the_control_planes_auth_token_to_the_outbound_request() {
-        let cp_addr = start_test_server();
-        let (node_addr, captured) = start_fake_remote_agentd_capturing(200, "node: node-a\n");
-        register_node(&cp_addr, "node-a", &node_addr);
-
-        send_request(&cp_addr, "PUT", "/jails/web-1", "apiVersion: keel/v1\n");
-
-        let received = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
-        assert!(
-            received.contains(&format!("Authorization: Bearer {TEST_TOKEN}")),
-            "expected relayed request to carry the control plane's own auth token, got: {received}"
-        );
-    }
-
-    #[test]
-    fn forward_put_relays_status_and_body_from_the_target_node() {
-        let cp_addr = start_test_server();
-        let node_addr = start_fake_remote_agentd(200, "running: true\n");
+        let node_addr = start_fake_remote_tls_agentd(200, "running: true\n");
         register_node(&cp_addr, "node-1", &node_addr);
 
         let (status, body) = send_request(&cp_addr, "PUT", "/nodes/node-1/jails/web-1", "apiVersion: keel/v1\n");
@@ -700,9 +688,36 @@ mod tests {
     }
 
     #[test]
+    fn forward_to_a_node_presenting_a_wrong_ca_certificate_fails() {
+        let cp_addr = start_test_server();
+        // A "node" whose server certificate is signed by a CA the control
+        // plane's own client config does not trust.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let node_addr = listener.local_addr().unwrap().to_string();
+        let wrong_server_config = Arc::new(
+            tls::load_server_config(&fixture("wrong-ca-node.crt"), &fixture("wrong-ca-node.key"), &fixture("ca.crt"))
+                .unwrap(),
+        );
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let Ok(conn) = rustls::ServerConnection::new(Arc::clone(&wrong_server_config)) else { continue };
+                let mut tls_stream = rustls::StreamOwned::new(conn, stream);
+                let mut buf = [0u8; 4096];
+                let _ = tls_stream.read(&mut buf);
+            }
+        });
+        register_node(&cp_addr, "node-1", &node_addr);
+
+        let (status, body) = send_request(&cp_addr, "GET", "/nodes/node-1/jails", "");
+        assert_eq!(status, 500);
+        assert!(body.contains("failed to reach node"), "expected a forwarding failure, got: {body}");
+    }
+
+    #[test]
     fn forward_get_relays_status_and_body_from_the_target_node() {
         let cp_addr = start_test_server();
-        let node_addr = start_fake_remote_agentd(200, "jails: fake-list\n");
+        let node_addr = start_fake_remote_tls_agentd(200, "jails: fake-list\n");
         register_node(&cp_addr, "node-1", &node_addr);
 
         let (status, body) = send_request(&cp_addr, "GET", "/nodes/node-1/jails", "");
@@ -713,7 +728,7 @@ mod tests {
     #[test]
     fn forward_delete_relays_status_from_the_target_node() {
         let cp_addr = start_test_server();
-        let node_addr = start_fake_remote_agentd(200, "");
+        let node_addr = start_fake_remote_tls_agentd(200, "");
         register_node(&cp_addr, "node-1", &node_addr);
 
         let (status, _) = send_request(&cp_addr, "DELETE", "/nodes/node-1/jails/web-1", "");
@@ -741,8 +756,8 @@ mod tests {
     #[test]
     fn scheduled_put_lands_on_the_lower_id_node_when_headroom_is_equal() {
         let cp_addr = start_test_server();
-        let node_a_addr = start_fake_remote_agentd(200, "node: node-a\n");
-        let node_b_addr = start_fake_remote_agentd(200, "node: node-b\n");
+        let node_a_addr = start_fake_remote_tls_agentd(200, "node: node-a\n");
+        let node_b_addr = start_fake_remote_tls_agentd(200, "node: node-b\n");
         register_node(&cp_addr, "node-b", &node_b_addr);
         register_node(&cp_addr, "node-a", &node_a_addr);
 
@@ -754,7 +769,7 @@ mod tests {
     #[test]
     fn scheduled_put_is_sticky_across_repeated_apply() {
         let cp_addr = start_test_server();
-        let node_a_addr = start_fake_remote_agentd(200, "node: node-a\n");
+        let node_a_addr = start_fake_remote_tls_agentd(200, "node: node-a\n");
         register_node(&cp_addr, "node-a", &node_a_addr);
 
         let (status, body) = send_request(&cp_addr, "PUT", "/jails/web-1", "apiVersion: keel/v1\n");
@@ -764,7 +779,7 @@ mod tests {
         // node-0 joins with a lower id and full headroom, and would win a
         // fresh scheduling decision -- but web-1 is already placed, so it
         // must stay put.
-        let node_0_addr = start_fake_remote_agentd(200, "node: node-0\n");
+        let node_0_addr = start_fake_remote_tls_agentd(200, "node: node-0\n");
         register_node(&cp_addr, "node-0", &node_0_addr);
 
         let (status, body) = send_request(&cp_addr, "PUT", "/jails/web-1", "apiVersion: keel/v1\n");
@@ -788,7 +803,7 @@ mod tests {
     #[test]
     fn scheduled_delete_removes_the_placement_so_a_later_get_returns_404() {
         let cp_addr = start_test_server();
-        let node_addr = start_fake_remote_agentd(200, "node: node-a\n");
+        let node_addr = start_fake_remote_tls_agentd(200, "node: node-a\n");
         register_node(&cp_addr, "node-a", &node_addr);
 
         send_request(&cp_addr, "PUT", "/jails/web-1", "apiVersion: keel/v1\n");
@@ -811,7 +826,7 @@ mod tests {
     #[test]
     fn named_route_apply_and_scheduled_route_share_the_same_placement_table() {
         let cp_addr = start_test_server();
-        let node_addr = start_fake_remote_agentd(200, "running: true\n");
+        let node_addr = start_fake_remote_tls_agentd(200, "running: true\n");
         register_node(&cp_addr, "node-1", &node_addr);
 
         let (status, _) = send_request(&cp_addr, "PUT", "/nodes/node-1/jails/web-1", "apiVersion: keel/v1\n");
