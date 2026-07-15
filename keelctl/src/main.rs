@@ -164,6 +164,8 @@ fn send_request(socket: &PathBuf, method: &str, path: &str, body: &str) -> Resul
     parse_response(&response)
 }
 
+// each parameter is independently needed to dial and authenticate the outbound TLS connection; bundling into a struct would be over-engineering for this single call site
+#[allow(clippy::too_many_arguments)]
 fn send_request_tcp(
     addr: &str,
     method: &str,

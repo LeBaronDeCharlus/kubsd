@@ -670,4 +670,42 @@ mod tests {
             "expected the server's replaced certificate to be rejected by the client after reload"
         );
     }
+
+    #[test]
+    fn reloading_tls_keeps_serving_the_last_good_config_if_the_replacement_is_malformed() {
+        let cert_dir = std::env::temp_dir().join(format!("keel-agentd-reload-bad-test-{}", std::process::id()));
+        std::fs::create_dir_all(&cert_dir).unwrap();
+        let cert_path = cert_dir.join("node.crt");
+        let key_path = cert_dir.join("node.key");
+        std::fs::copy(fixture("fixture-node.crt"), &cert_path).unwrap();
+        std::fs::copy(fixture("fixture-node.key"), &key_path).unwrap();
+
+        let reloading = tls::ReloadingTls::spawn(
+            cert_path.clone(),
+            key_path.clone(),
+            fixture("ca.crt"),
+            fixture("crl.pem"),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("keel-agentd-reload-bad-test-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        let zfs = FakeZfsManager::new();
+        zfs.seed_dataset("zroot/keel/base/14.2-web");
+        let reconciler =
+            Reconciler::new(FakeJailRuntime::new(), zfs, FakeNetManager::new(), "zroot".to_string(), state_dir).unwrap();
+        let (_worker_handle, commands) = worker::spawn(reconciler);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || run_tls(listener, commands, reloading));
+
+        std::fs::write(&cert_path, "not a certificate").unwrap();
+        thread::sleep(Duration::from_millis(200));
+
+        let (status, _) = send_request_tcp(&addr, "GET", "/jails", "");
+        assert_eq!(status, 200, "expected the last-known-good certificate to keep being served after a malformed reload");
+    }
 }

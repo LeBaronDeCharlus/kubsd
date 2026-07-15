@@ -2,3 +2,4 @@
 /.superpowers
 /Cargo.lock
 /certs
+testdata/tls/ca-db/*.old

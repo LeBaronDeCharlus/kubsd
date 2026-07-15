@@ -76,7 +76,7 @@ fn load_crls(path: &Path) -> Result<Vec<CertificateRevocationListDer<'static>>, 
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("failed to parse CRL file {}: {e}", path.display()))?;
     if crls.is_empty() {
-        return Err(format!("no CRL found in {}", path.display()));
+        return Err(format!("failed to find a PEM-encoded CRL in {}", path.display()));
     }
     Ok(crls)
 }
@@ -123,6 +123,15 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("does-not-exist-crl.pem"), "got: {err}");
+    }
+
+    #[test]
+    fn load_client_config_fails_on_a_malformed_crl_file() {
+        let bad_crl = std::env::temp_dir().join(format!("keelctl-tls-test-bad-crl-{}", std::process::id()));
+        std::fs::write(&bad_crl, "not a crl").unwrap();
+        let err = load_client_config(&fixture("fixture-client.crt"), &fixture("fixture-client.key"), &fixture("ca.crt"), &bad_crl)
+            .unwrap_err();
+        assert!(err.contains("failed to"), "got: {err}");
     }
 
     #[test]
