@@ -295,6 +295,8 @@ Run from the repo root. `ca.key` does not exist under `testdata/tls/`, so `init`
 ```bash
 export GEN_CERTS_OUT_DIR=testdata/tls
 rm -f testdata/tls/ca.crt
+rm -f testdata/tls/fixture-node.crt testdata/tls/fixture-node.key
+rm -f testdata/tls/fixture-client.crt testdata/tls/fixture-client.key
 scripts/gen-certs.sh init
 scripts/gen-certs.sh node fixture-node 127.0.0.1 --days 36500
 scripts/gen-certs.sh client fixture-client --days 36500
@@ -303,9 +305,11 @@ scripts/gen-certs.sh revoke revoked-node
 unset GEN_CERTS_OUT_DIR
 ```
 
-(`rm -f testdata/tls/ca.crt` first is a defensive, purely cosmetic step: `init`'s else-branch always runs `openssl req -x509 ... -out "$OUT_DIR/ca.crt"` when `ca.key` is missing, which overwrites `ca.crt` unconditionally regardless of whether it pre-exists — removing it first just makes that overwrite explicit rather than implicit.)
+(`rm -f testdata/tls/ca.crt` first is a defensive, purely cosmetic step: `init`'s else-branch always runs `openssl req -x509 ... -out "$OUT_DIR/ca.crt"` when `ca.key` is missing, which overwrites `ca.crt` unconditionally regardless of whether it pre-exists — removing it first just makes that overwrite explicit rather than implicit.
 
-Expected: `init` generates a fresh `ca.crt`/`ca.key` and `ca-db/` (no "already exists, reusing it" message, since there is no pre-existing key); `node fixture-node ...` and `client fixture-client ...` overwrite the existing `.crt`/`.key` pairs with new ones signed by the new CA; `node revoked-node ...` writes `testdata/tls/revoked-node.crt`/`.key`; `revoke revoked-node` writes a populated `testdata/tls/crl.pem`.
+The `fixture-node`/`fixture-client` removals are NOT cosmetic, and must not be skipped: `gen-certs.sh node`/`client`'s `issue_leaf()` checks whether `$OUT_DIR/$name.crt` already exists to decide between a plain first-ever issuance and a rotate-and-revoke-the-previous-certificate path. `fixture-node.crt`/`fixture-client.crt` already exist on disk, pre-committed, signed by the *old* (about-to-be-replaced) CA. Without removing them first, `issue_leaf` would take the rotate branch and run `openssl ca -revoke` against those old, now-orphaned certificates, permanently adding two unwanted, unrelated revoked-serial entries to the freshly-initialized `crl.pem`/`ca-db/index.txt` alongside the one genuinely intended entry for `revoked-node` — silently violating this task's own "listing one revoked serial" requirement below.)
+
+Expected: `init` generates a fresh `ca.crt`/`ca.key` and `ca-db/` (no "already exists, reusing it" message, since there is no pre-existing key); `node fixture-node ...` and `client fixture-client ...` issue brand-new `.crt`/`.key` pairs signed by the new CA (the *plain first-issuance* branch of `issue_leaf`, not the rotate branch, since the old files were just removed); `node revoked-node ...` writes `testdata/tls/revoked-node.crt`/`.key`; `revoke revoked-node` writes a `crl.pem` containing exactly one revoked serial (`revoked-node`'s).
 
 - [ ] **Step 2: Verify the new fixtures are internally consistent**
 
@@ -317,9 +321,10 @@ openssl verify -crl_check -CAfile <(cat testdata/tls/ca.crt testdata/tls/crl.pem
 openssl verify -crl_check -CAfile <(cat testdata/tls/ca.crt testdata/tls/crl.pem) testdata/tls/fixture-client.crt
 openssl verify -CAfile testdata/tls/ca.crt testdata/tls/wrong-ca-node.crt
 openssl x509 -in testdata/tls/fixture-node.crt -noout -ext subjectAltName,extendedKeyUsage
+openssl crl -in testdata/tls/crl.pem -noout -text | grep -c "Serial Number"
 ```
 
-Expected: `revoked-node.crt` fails with `error 23 at 0 depth lookup: certificate revoked`; `fixture-node.crt` and `fixture-client.crt` both print `: OK`; `wrong-ca-node.crt` fails (it must NOT verify against the regenerated CA — confirming it is still signed by its own separate, unrelated CA, unaffected by this task); the SAN/EKU dump shows `IP Address:127.0.0.1` and both EKUs, matching the pre-existing fixture exactly.
+Expected: `revoked-node.crt` fails with `error 23 at 0 depth lookup: certificate revoked`; `fixture-node.crt` and `fixture-client.crt` both print `: OK`; `wrong-ca-node.crt` fails (it must NOT verify against the regenerated CA — confirming it is still signed by its own separate, unrelated CA, unaffected by this task); the SAN/EKU dump shows `IP Address:127.0.0.1` and both EKUs, matching the pre-existing fixture exactly; the `grep -c "Serial Number"` count is exactly **1** — if it's more than 1, `fixture-node.crt`/`fixture-client.crt` were not removed before reissuing them (see Step 1's note) and picked up a spurious rotate-and-revoke against their own old, pre-task selves; redo Step 1 with the removals included.
 
 - [ ] **Step 3: Run the workspace's existing test suite to confirm nothing broke**
 
