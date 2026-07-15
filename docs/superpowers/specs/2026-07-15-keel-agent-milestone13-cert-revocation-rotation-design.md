@@ -105,21 +105,41 @@ load at first startup even before anything has ever been revoked.
 `node`/`client` issuance moves from `openssl x509 -req -CA ca.crt -CAkey
 ca.key` to `openssl ca -config ca-db/openssl.cnf -in <name>.csr -out
 <name>.crt -days N -batch`, which records the issued serial in
-`index.txt`. Reissuing a name that already has a certificate on record now
-does three things, in this order, the second and third only after the
-first succeeds:
+`index.txt`.
+
+Today's `issue_leaf` writes `$OUT_DIR/$name.key` and `$OUT_DIR/$name.crt`
+directly, in place, starting with `openssl genrsa -out $name.key` as its
+very first step. That's fine for first-time issuance, but reissuing a name
+that already has a live certificate can't reuse that same in-place write:
+if the new keypair or signing step failed partway, `$name.key` would
+already be clobbered by the new (uncertified) key while the *old*,
+still-CA-valid certificate's matching key is gone, stranding the identity
+even though the CA still considers its old serial unrevoked. Reissuance
+therefore generates the new key/CSR/certificate into temporary files
+first, and only after `openssl ca` confirms the new certificate is signed
+does it: copy the about-to-be-replaced `$name.crt` aside to
+`$name.crt.previous` (the input `-revoke` needs), rename the temp key and
+certificate into `$name.key`/`$name.crt`, revoke `$name.crt.previous`'s
+serial, and regenerate the CRL. In order:
 
 ```bash
 ./scripts/gen-certs.sh node node-4 192.168.64.4
-#  1. issue a fresh keypair + certificate for node-4 (new serial)
-#  2. if node-4 already had a certificate on record, revoke its old serial:
+#  1. generate a fresh keypair + CSR + certificate for node-4 into temp
+#     files (new serial); $OUT_DIR/node-4.key and node-4.crt are untouched
+#     so far, so a failure here leaves the existing identity fully intact
+#  2. only once step 1 succeeds: if node-4 already had a certificate on
+#     record, copy it aside to node-4.crt.previous, then rename the temp
+#     key/cert into node-4.key/node-4.crt
+#  3. revoke node-4.crt.previous's serial:
 #     openssl ca -config ca-db/openssl.cnf -revoke node-4.crt.previous
-#  3. regenerate the CRL: openssl ca -config ca-db/openssl.cnf -gencrl -out crl.pem
+#  4. regenerate the CRL: openssl ca -config ca-db/openssl.cnf -gencrl -out crl.pem
 ```
 
-Ordering issuance before revocation means a failed reissue (e.g., a
+Doing the new keypair/CSR/signing work against temp files, before touching
+anything under `$name.key`/`$name.crt`, means a failed reissue (e.g., a
 transient `openssl` error) never leaves an identity with zero valid
-certificates; the old one stays valid until a new one is confirmed good.
+certificates *and no way to use them*: the old key and certificate stay on
+disk, untouched, until the new pair is confirmed good.
 
 New subcommands:
 
@@ -161,7 +181,7 @@ the *peer's* certificate with CRL awareness needs a custom verifier, so
 `ClientConfig::builder().with_root_certificates(roots)` is replaced by:
 
 ```rust
-let server_verifier = rustls::server::WebPkiServerVerifier::builder(Arc::new(roots))
+let server_verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
     .with_crls(crls)
     .build()
     .map_err(|e| format!("failed to build server certificate verifier: {e}"))?;
