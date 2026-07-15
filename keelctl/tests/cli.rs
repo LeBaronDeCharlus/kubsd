@@ -100,15 +100,15 @@ fn start_test_control_plane_with_node(node_id: &str, node_addr: &str) -> String 
         .unwrap();
     reg_rx.recv().unwrap();
 
-    let tls_config = std::sync::Arc::new(
-        keel_controlplane::tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
-            .unwrap(),
-    );
-    let client_config = std::sync::Arc::new(
-        keel_controlplane::tls::load_client_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
-            .unwrap(),
-    );
-    thread::spawn(move || keel_controlplane::http::run(listener, commands, tls_config, client_config));
+    let reloading_tls = keel_controlplane::tls::ReloadingTls::spawn(
+        fixture("fixture-node.crt"),
+        fixture("fixture-node.key"),
+        fixture("ca.crt"),
+        fixture("crl.pem"),
+        std::time::Duration::from_secs(3600),
+    )
+    .unwrap();
+    thread::spawn(move || keel_controlplane::http::run(listener, commands, reloading_tls));
     addr
 }
 

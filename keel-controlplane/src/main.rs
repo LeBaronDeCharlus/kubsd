@@ -3,7 +3,6 @@ use keel_controlplane::registry::Registry;
 use keel_controlplane::worker;
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 struct Config {
     addr: String,
@@ -60,17 +59,21 @@ fn main() {
     let key_file = config.tls_key_file.expect("validated as required in parse_args_from");
     let crl_file = config.tls_crl_file.expect("validated as required in parse_args_from");
 
-    let tls_config = keel_controlplane::tls::load_server_config(&cert_file, &key_file, &ca_file, &crl_file)
-        .unwrap_or_else(|e| panic!("failed to load TLS server config: {e}"));
-    let client_config = keel_controlplane::tls::load_client_config(&cert_file, &key_file, &ca_file, &crl_file)
-        .unwrap_or_else(|e| panic!("failed to load TLS client config: {e}"));
+    let reloading_tls = keel_controlplane::tls::ReloadingTls::spawn(
+        cert_file,
+        key_file,
+        ca_file,
+        crl_file,
+        std::time::Duration::from_secs(30),
+    )
+    .unwrap_or_else(|e| panic!("failed to load TLS configuration: {e}"));
 
     eprintln!("keel-controlplane: starting (addr={})", config.addr);
 
     let (_worker_handle, commands) = worker::spawn(Registry::new(), Placements::new());
 
     let listener = TcpListener::bind(&config.addr).expect("failed to bind TCP listener");
-    keel_controlplane::http::run(listener, commands, Arc::new(tls_config), Arc::new(client_config));
+    keel_controlplane::http::run(listener, commands, reloading_tls);
 }
 
 #[cfg(test)]

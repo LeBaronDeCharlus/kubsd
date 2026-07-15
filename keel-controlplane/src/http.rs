@@ -1,7 +1,7 @@
 use crate::tls;
 use crate::wire::{ErrorBody, Heartbeat, NodeRegistration};
 use crate::worker::{Command, ScheduleOrResolveError};
-use rustls::{ServerConfig, ServerConnection, StreamOwned};
+use rustls::{ServerConnection, StreamOwned};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{self, Sender};
@@ -13,17 +13,12 @@ const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
 type TlsStream = StreamOwned<ServerConnection, TcpStream>;
 
-pub fn run(
-    listener: TcpListener,
-    commands: Sender<Command>,
-    tls_config: Arc<ServerConfig>,
-    client_config: Arc<rustls::ClientConfig>,
-) {
+pub fn run(listener: TcpListener, commands: Sender<Command>, reloading_tls: Arc<tls::ReloadingTls>) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let commands = commands.clone();
-        let tls_config = Arc::clone(&tls_config);
-        let client_config = Arc::clone(&client_config);
+        let tls_config = reloading_tls.server_config();
+        let client_config = reloading_tls.client_config();
         thread::spawn(move || {
             let Ok(conn) = ServerConnection::new(tls_config) else { return };
             let mut tls_stream = TlsStream::new(conn, stream);
@@ -422,12 +417,15 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let (_worker_handle, commands) = worker::spawn(Registry::new(), Placements::new());
-        let tls_config = Arc::new(
-            tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
-                .unwrap(),
-        );
-        let client_config = client_tls_config();
-        thread::spawn(move || run(listener, commands, tls_config, client_config));
+        let reloading_tls = tls::ReloadingTls::spawn(
+            fixture("fixture-node.crt"),
+            fixture("fixture-node.key"),
+            fixture("ca.crt"),
+            fixture("crl.pem"),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        thread::spawn(move || run(listener, commands, reloading_tls));
         addr
     }
 
@@ -955,5 +953,78 @@ mod tests {
         let (status, body) = send_request(&cp_addr, "GET", "/nodes/node-1/jails", "");
         assert_eq!(status, 500);
         assert!(body.contains("failed to reach node"), "expected a forwarding failure, got: {body}");
+    }
+
+    #[test]
+    fn reloading_tls_server_config_picks_up_a_replaced_certificate_without_restart() {
+        let cert_dir = std::env::temp_dir()
+            .join(format!("keel-controlplane-reload-test-{}", std::process::id()));
+        std::fs::create_dir_all(&cert_dir).unwrap();
+        let cert_path = cert_dir.join("node.crt");
+        let key_path = cert_dir.join("node.key");
+        std::fs::copy(fixture("fixture-node.crt"), &cert_path).unwrap();
+        std::fs::copy(fixture("fixture-node.key"), &key_path).unwrap();
+
+        let reloading = tls::ReloadingTls::spawn(
+            cert_path.clone(),
+            key_path.clone(),
+            fixture("ca.crt"),
+            fixture("crl.pem"),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+
+        let (_worker_handle, commands) = worker::spawn(Registry::new(), Placements::new());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || run(listener, commands, reloading));
+
+        let (status, _) = send_request(&addr, "GET", "/nodes", "");
+        assert_eq!(status, 200, "expected the initial fixture-node certificate to be served");
+
+        // wrong-ca-node.crt is signed by a different, untrusted CA, so once
+        // the server starts presenting it, any client trusting only the real
+        // ca.crt must fail the handshake -- this is the observable proof
+        // that the reload thread actually swapped in the replacement file.
+        std::fs::copy(fixture("wrong-ca-node.crt"), &cert_path).unwrap();
+        std::fs::copy(fixture("wrong-ca-node.key"), &key_path).unwrap();
+        thread::sleep(Duration::from_millis(200));
+
+        let result = std::panic::catch_unwind(|| send_request(&addr, "GET", "/nodes", ""));
+        assert!(
+            result.is_err() || result.unwrap().0 != 200,
+            "expected the server's replaced certificate to be rejected by the client after reload"
+        );
+    }
+
+    #[test]
+    fn reloading_tls_keeps_serving_the_last_good_config_if_the_replacement_is_malformed() {
+        let cert_dir = std::env::temp_dir()
+            .join(format!("keel-controlplane-reload-bad-test-{}", std::process::id()));
+        std::fs::create_dir_all(&cert_dir).unwrap();
+        let cert_path = cert_dir.join("node.crt");
+        let key_path = cert_dir.join("node.key");
+        std::fs::copy(fixture("fixture-node.crt"), &cert_path).unwrap();
+        std::fs::copy(fixture("fixture-node.key"), &key_path).unwrap();
+
+        let reloading = tls::ReloadingTls::spawn(
+            cert_path.clone(),
+            key_path.clone(),
+            fixture("ca.crt"),
+            fixture("crl.pem"),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+
+        let (_worker_handle, commands) = worker::spawn(Registry::new(), Placements::new());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || run(listener, commands, reloading));
+
+        std::fs::write(&cert_path, "not a certificate").unwrap();
+        thread::sleep(Duration::from_millis(200));
+
+        let (status, _) = send_request(&addr, "GET", "/nodes", "");
+        assert_eq!(status, 200, "expected the last-known-good certificate to keep being served after a malformed reload");
     }
 }
