@@ -621,11 +621,44 @@ where it should now go through it, and the `ReloadingTls` concurrency
 design (locks never held across blocking I/O, reload always swaps a fresh
 `Arc` rather than mutating a config in place, the background thread never
 dies on a bad reload) was independently verified in both crates.
-**VM verification has not yet been performed for this milestone** — the
-design's own open question, whether FreeBSD 15.1's base `openssl` runs the
+VM verification confirmed the design's own open question directly: FreeBSD
+15.1-RELEASE-p1's `openssl` (3.5.6, installed via `pkg`) runs the
 `openssl ca`/`-gencrl` workflow identically to the development machine,
-remains to be checked directly on the real nodes before this milestone can
-be considered fully closed out.
+with no config-format surprises. A fresh CA and per-identity certificates
+(`node-2`/`node-4`/`node-5`/`controlplane`/`operator`) were generated on
+the control-plane host with the new `gen-certs.sh` and distributed to all
+three real nodes; all three registered `Alive` against an authenticated
+`GET /nodes` over real mTLS, and a scheduled apply/get/delete round trip
+succeeded end-to-end.
+
+Revoking `node-4`'s certificate on the CA host and redistributing only the
+refreshed `crl.pem` got it rejected within one 30-second reload interval,
+confirmed by a real `received fatal alert: CertificateRevoked` in its own
+`keel-agentd` log and the registry correctly flipping it to `Dead` —
+with neither `keel-controlplane`'s nor `node-4`'s own `keel-agentd`
+process ever restarting (PIDs unchanged throughout). The outbound
+direction (the control plane refusing to forward to a node presenting a
+revoked certificate) is covered by already-reviewed automated tests using
+real TLS handshakes; it wasn't independently re-observed live in this run
+because the liveness gate rejects a named-node apply before any
+forwarding is attempted at all once a node is `Dead`, confirmed by
+attempting exactly that and getting "node 'node-4' is dead" rather than a
+TLS-level rejection.
+
+Rotating `node-5`'s certificate (reissuing under its existing name, which
+auto-revoked the old one and refreshed `crl.pem` in the same command) and
+distributing the new cert/key/CRL produced the exact expected
+transient-then-recover behavior, observed live: `node-5`'s heartbeat
+briefly failed with the same `CertificateRevoked` alert (its own reload
+thread hadn't yet swapped in the new certificate while the control
+plane's CRL reload had already fired), then recovered automatically once
+`node-5`'s background reload picked up the new certificate, with no
+process restart and no manual intervention beyond distributing the files.
+A direct `openssl s_client` probe against `node-5`'s live listener
+confirmed it was now presenting the new certificate's serial. `node-2`,
+untouched throughout both the revocation and rotation tests, kept
+completing scheduled apply/get/delete round trips at every stage. Clean
+teardown (no processes, no jails) confirmed on all three VMs afterward.
 
 ## Roadmap
 
@@ -648,11 +681,11 @@ be considered fully closed out.
 9. ~~Scheduler: automatic node placement by jail count, sticky on re-apply~~ done
 10. ~~Resource-aware bin-packing: node-reported CPU/memory capacity and committed load, headroom-based placement~~ done
 
-**Sub-project 4: control-plane hardening (in progress)**
+**Sub-project 4: control-plane hardening (complete)**
 
 11. ~~Shared-secret authentication on every control-plane and node TCP route~~ done
 12. ~~Mutual TLS between client, control plane, and nodes, replacing the shared secret~~ done
-13. Certificate revocation and rotation automation (implemented and tested on macOS; VM verification not yet performed)
+13. ~~Certificate revocation and rotation automation~~ done
 
 **Not yet designed** (future sub-projects, each will get its own spec):
 
