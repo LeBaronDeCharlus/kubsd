@@ -551,6 +551,82 @@ untrusted-issuer reason the test intended to demonstrate, standing
 proof that generating any TLS test fixture across a machine boundary
 carries an inherent, if usually small, clock-skew risk.
 
+### Milestone 13: certificate revocation and rotation automation
+
+Milestone 12's mutual TLS closed the confidentiality and per-identity gaps
+in the control plane's trust model but explicitly deferred two things: no
+revocation (the only way to eject one compromised identity was
+regenerating the CA and redistributing every certificate in the cluster),
+and no rotation story beyond a fully manual procedure with no way for a
+running `keel-controlplane` or `keel-agentd` to pick up a replacement
+certificate without a restart. This milestone closes both: certificate
+revocation lists (CRLs), checked at the TLS handshake itself using support
+already built into `rustls` 0.23 (`WebPkiClientVerifier`/
+`WebPkiServerVerifier::with_crls(...)`, no new Rust dependency), and a
+background reload thread in both long-running daemons so a freshly issued
+certificate or a freshly regenerated CRL takes effect live, with no
+restart and no coordinated fleet-wide redeploy.
+
+`scripts/gen-certs.sh` grew a real `openssl ca` certificate database
+(`index.txt`/`serial`/`crlnumber`), since `openssl ca -gencrl` is the only
+way to produce a CRL; the ad hoc `openssl x509 -req -CAcreateserial`
+issuance from Milestone 12 is gone. Reissuing an existing node/client/
+control-plane name (`gen-certs.sh node <name> <addr>` / `client <name>`)
+now rotates it: the new certificate is issued first, and only once that
+succeeds is the previous certificate under that name revoked and
+`crl.pem` regenerated, so a failed reissue never strands an identity with
+zero valid certificates. New `revoke <name>` and `crl` subcommands let an
+operator eject a compromised identity or refresh the CRL on demand;
+`init` became idempotent, generating a CA keypair only if one is missing,
+so an existing Milestone 12 deployment can adopt the new database around
+its existing CA without regenerating it.
+
+CRL enforcement was wired symmetrically into all three binaries: every
+listener (`keel-controlplane`'s and `keel-agentd`'s TCP accept path)
+verifies an incoming client certificate against the CRL, and every
+outbound caller (`keel-controlplane`'s `forward()`, `keel-agentd`'s
+registration/heartbeat, `keelctl`'s control-plane-routed calls) verifies
+the peer's server certificate against the same CRL via a custom
+`WebPkiServerVerifier`. A new `ReloadingTls` type (duplicated per-crate in
+`keel-controlplane`'s and `keel-agentd`'s `tls.rs`, matching this
+project's existing convention for that file) loads the certificate/key/
+CA/CRL once at startup (still fail-fast on that first load), then polls
+the same four files on a 30-second background timer and hot-swaps the
+active configuration for new connections; a reload failure (a file caught
+mid-copy, a malformed replacement) logs once and keeps serving the
+last-known-good configuration rather than crashing the process.
+
+Development surfaced a real gap in the milestone's own design: the spec
+assumed `testdata/tls/ca.key` was committed alongside `ca.crt` so a
+certificate database could be grown around the existing test CA. It never
+was — only the certificate, needed as a trust root, was ever checked in.
+The fix regenerated the CA plus the `fixture-node`/`fixture-client`
+fixtures from scratch (matching their exact SAN/EKU so every
+already-passing Milestone 12 test kept working unchanged), leaving
+`wrong-ca-node` untouched since it's independently signed by its own
+unrelated throwaway CA. That regeneration itself needed a second fix:
+reissuing `fixture-node`/`fixture-client` without first removing the
+pre-existing files (signed by the old, about-to-be-replaced CA) caused
+`gen-certs.sh`'s rotate-on-reissue logic to revoke those orphaned old
+certificates too, leaving three entries in `crl.pem` instead of the one
+genuinely intended for the new `revoked-node` fixture.
+
+Milestone 13 finished at 215 tests on macOS (213 inherited from Milestone
+12 plus 2 added closing the final review's Minor findings), clippy clean
+relative to the pre-existing baseline, and a final whole-branch review
+with no Critical or Important findings: CRL enforcement confirmed
+symmetric across every one of 33 TLS-config call sites in the tree, no
+leftover Milestone-12 code path builds a TLS config outside `ReloadingTls`
+where it should now go through it, and the `ReloadingTls` concurrency
+design (locks never held across blocking I/O, reload always swaps a fresh
+`Arc` rather than mutating a config in place, the background thread never
+dies on a bad reload) was independently verified in both crates.
+**VM verification has not yet been performed for this milestone** — the
+design's own open question, whether FreeBSD 15.1's base `openssl` runs the
+`openssl ca`/`-gencrl` workflow identically to the development machine,
+remains to be checked directly on the real nodes before this milestone can
+be considered fully closed out.
+
 ## Roadmap
 
 **Sub-project 1: single-node jail reconciliation daemon (complete)**
@@ -576,7 +652,7 @@ carries an inherent, if usually small, clock-skew risk.
 
 11. ~~Shared-secret authentication on every control-plane and node TCP route~~ done
 12. ~~Mutual TLS between client, control plane, and nodes, replacing the shared secret~~ done
-13. Certificate revocation and rotation automation (not yet designed)
+13. Certificate revocation and rotation automation (implemented and tested on macOS; VM verification not yet performed)
 
 **Not yet designed** (future sub-projects, each will get its own spec):
 
