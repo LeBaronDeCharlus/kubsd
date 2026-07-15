@@ -169,11 +169,14 @@ fn send_request_tcp(
 
     // Read until the peer closes the connection. rustls surfaces a plain TCP
     // close that lacks a TLS `close_notify` alert as `ErrorKind::UnexpectedEof`
-    // rather than `Ok(0)`, to guard against truncation attacks in general;
-    // `parse_response` below rejects a partial (truncated) HTTP response on
-    // its own, so it's safe to treat that error the same as a clean close
-    // here. This mirrors `keel_controlplane::http::forward`'s handling of the
-    // same situation on its own TLS client connection to a node.
+    // rather than `Ok(0)`, to guard against truncation attacks in general; we
+    // rely on that being safe below by explicitly checking the received body
+    // length against the response's own Content-Length header in
+    // `parse_response`, so a connection that drops mid-body (an on-path RST,
+    // or a crashing control plane) is caught as a truncated response rather
+    // than silently accepted. This mirrors `keel_controlplane::http::forward`
+    // and `keel_agentd::registration::send_request`'s handling of the same
+    // situation on their own TLS client connections.
     let mut response = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -195,6 +198,17 @@ fn parse_response(response: &[u8]) -> Result<String, String> {
         httparse::Status::Partial => return Err("incomplete response from server".to_string()),
     };
     let status = parsed.code.unwrap_or(0);
+    let content_length = parsed
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("content-length"))
+        .and_then(|h| std::str::from_utf8(h.value).ok())
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .ok_or_else(|| "response missing Content-Length header".to_string())?;
+    let actual = response.len() - header_len;
+    if actual != content_length {
+        return Err(format!("truncated response: expected {content_length} bytes, got {actual}"));
+    }
     let response_body = String::from_utf8_lossy(&response[header_len..]).to_string();
 
     if (200..300).contains(&status) {

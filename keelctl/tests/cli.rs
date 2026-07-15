@@ -2,6 +2,7 @@ use keel_agentd::{worker, Reconciler};
 use keel_jail::FakeJailRuntime;
 use keel_net::FakeNetManager;
 use keel_zfs::FakeZfsManager;
+use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::Command;
@@ -131,6 +132,66 @@ fn run_keelctl_routed(control_plane_addr: &str, node: &str, args: &[&str]) -> (b
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
     )
+}
+
+/// A fake control plane that completes the TLS handshake, drains whatever
+/// request keelctl sends, then responds with a header claiming a
+/// `Content-Length` larger than the body it actually writes before dropping
+/// the raw TCP connection without a clean TLS shutdown (no `close_notify`) --
+/// simulating an on-path RST or a control plane that crashes mid-write.
+/// Matches the pattern of `keel_controlplane::http`'s own
+/// `start_fake_remote_tls_agentd_with_truncated_body` and
+/// `keel_agentd::registration`'s `start_fake_control_plane_with_truncated_body`.
+fn start_fake_control_plane_with_truncated_body(claimed_body: &'static str, actual_body: &'static str) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server_config = std::sync::Arc::new(
+        keel_controlplane::tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
+            .unwrap(),
+    );
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let Ok(conn) = rustls::ServerConnection::new(std::sync::Arc::clone(&server_config)) else { continue };
+            let mut tls_stream = rustls::StreamOwned::new(conn, stream);
+            let mut buf = [0u8; 4096];
+            loop {
+                match tls_stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/yaml\r\nConnection: close\r\n\r\n{actual_body}",
+                claimed_body.len()
+            );
+            let _ = tls_stream.write_all(header.as_bytes());
+            let _ = tls_stream.flush();
+            // Drop the raw TCP connection without sending a TLS close_notify
+            // alert, so keelctl sees an unclean close partway through the
+            // declared body.
+            let _ = tls_stream.sock.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    addr
+}
+
+#[test]
+fn get_against_a_control_plane_that_truncates_mid_body_fails_instead_of_printing_a_partial_response() {
+    // The header claims a much longer body than what actually gets written
+    // before the connection drops uncleanly (no close_notify). Before the
+    // fix, keelctl's UnexpectedEof tolerance let this print the partial body
+    // to the operator as if it were a complete, successful response.
+    let control_plane_addr = start_fake_control_plane_with_truncated_body(
+        "this response claims to be far longer than what is actually sent back\n",
+        "truncat",
+    );
+
+    let (ok, stdout, stderr) = run_keelctl_scheduled(&control_plane_addr, &["get", "web-1"]);
+
+    assert!(!ok, "expected a truncated response to be treated as a failure, got success with stdout: {stdout}");
+    assert!(!stdout.contains("truncat"), "truncated upstream body must not be printed as if it were a complete response, got stdout: {stdout}");
+    assert!(stderr.contains("truncated response"), "expected a truncation error in stderr, got: {stderr}");
 }
 
 fn run_keelctl_scheduled(control_plane_addr: &str, args: &[&str]) -> (bool, String, String) {
