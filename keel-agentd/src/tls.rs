@@ -1,4 +1,5 @@
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::client::WebPkiServerVerifier;
+use rustls::pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer, ServerName};
 use rustls::server::WebPkiClientVerifier;
 use rustls::RootCertStore;
 use std::fs::File;
@@ -10,21 +11,23 @@ static CRYPTO_PROVIDER_INIT: Once = Once::new();
 
 pub fn ensure_crypto_provider() {
     CRYPTO_PROVIDER_INIT.call_once(|| {
-        // Ignore the error: it only occurs if some other crate (e.g. another
-        // `keel-*` crate linked into the same process, as happens in
-        // `keelctl`'s integration tests) already installed a default
-        // provider first. Either way, a process-wide default is now in
-        // place, which is all this function promises.
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
 }
 
-pub fn load_server_config(cert_path: &Path, key_path: &Path, ca_path: &Path) -> Result<rustls::ServerConfig, String> {
+pub fn load_server_config(
+    cert_path: &Path,
+    key_path: &Path,
+    ca_path: &Path,
+    crl_path: &Path,
+) -> Result<rustls::ServerConfig, String> {
     ensure_crypto_provider();
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
     let roots = load_root_store(ca_path)?;
+    let crls = load_crls(crl_path)?;
     let client_verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+        .with_crls(crls)
         .build()
         .map_err(|e| format!("failed to build client certificate verifier: {e}"))?;
     rustls::ServerConfig::builder()
@@ -33,13 +36,24 @@ pub fn load_server_config(cert_path: &Path, key_path: &Path, ca_path: &Path) -> 
         .map_err(|e| format!("failed to build TLS server config: {e}"))
 }
 
-pub fn load_client_config(cert_path: &Path, key_path: &Path, ca_path: &Path) -> Result<rustls::ClientConfig, String> {
+pub fn load_client_config(
+    cert_path: &Path,
+    key_path: &Path,
+    ca_path: &Path,
+    crl_path: &Path,
+) -> Result<rustls::ClientConfig, String> {
     ensure_crypto_provider();
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
     let roots = load_root_store(ca_path)?;
+    let crls = load_crls(crl_path)?;
+    let server_verifier = WebPkiServerVerifier::builder(Arc::new(roots))
+        .with_crls(crls)
+        .build()
+        .map_err(|e| format!("failed to build server certificate verifier: {e}"))?;
     rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
+        .dangerous()
+        .with_custom_certificate_verifier(server_verifier)
         .with_client_auth_cert(certs, key)
         .map_err(|e| format!("failed to build TLS client config: {e}"))
 }
@@ -78,6 +92,17 @@ fn load_root_store(ca_path: &Path) -> Result<RootCertStore, String> {
     Ok(roots)
 }
 
+fn load_crls(path: &Path) -> Result<Vec<CertificateRevocationListDer<'static>>, String> {
+    let file = File::open(path).map_err(|e| format!("failed to open CRL file {}: {e}", path.display()))?;
+    let crls: Vec<_> = rustls_pemfile::crls(&mut BufReader::new(file))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("failed to parse CRL file {}: {e}", path.display()))?;
+    if crls.is_empty() {
+        return Err(format!("failed to find a PEM-encoded CRL in {}", path.display()));
+    }
+    Ok(crls)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,29 +114,57 @@ mod tests {
 
     #[test]
     fn load_server_config_succeeds_with_valid_fixtures() {
-        load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
-            .expect("expected a valid server config");
+        load_server_config(
+            &fixture("fixture-node.crt"),
+            &fixture("fixture-node.key"),
+            &fixture("ca.crt"),
+            &fixture("crl.pem"),
+        )
+        .expect("expected a valid server config");
     }
 
     #[test]
     fn load_server_config_fails_on_a_missing_cert_file() {
-        let err = load_server_config(&fixture("does-not-exist.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
-            .unwrap_err();
+        let err = load_server_config(
+            &fixture("does-not-exist.crt"),
+            &fixture("fixture-node.key"),
+            &fixture("ca.crt"),
+            &fixture("crl.pem"),
+        )
+        .unwrap_err();
         assert!(err.contains("does-not-exist.crt"), "got: {err}");
     }
 
     #[test]
+    fn load_server_config_fails_on_a_missing_crl_file() {
+        let err = load_server_config(
+            &fixture("fixture-node.crt"),
+            &fixture("fixture-node.key"),
+            &fixture("ca.crt"),
+            &fixture("does-not-exist-crl.pem"),
+        )
+        .unwrap_err();
+        assert!(err.contains("does-not-exist-crl.pem"), "got: {err}");
+    }
+
+    #[test]
     fn load_client_config_succeeds_with_valid_fixtures() {
-        load_client_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
-            .expect("expected a valid client config");
+        load_client_config(
+            &fixture("fixture-node.crt"),
+            &fixture("fixture-node.key"),
+            &fixture("ca.crt"),
+            &fixture("crl.pem"),
+        )
+        .expect("expected a valid client config");
     }
 
     #[test]
     fn load_client_config_fails_on_a_malformed_ca_file() {
         let bad_ca = std::env::temp_dir().join(format!("keel-agentd-tls-test-bad-ca-{}", std::process::id()));
         std::fs::write(&bad_ca, "not a certificate").unwrap();
-        let err = load_client_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &bad_ca)
-            .unwrap_err();
+        let err =
+            load_client_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &bad_ca, &fixture("crl.pem"))
+                .unwrap_err();
         assert!(err.contains("failed to"), "got: {err}");
     }
 

@@ -465,7 +465,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let tls_config = Arc::new(
-            tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
+            tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
                 .unwrap(),
         );
         thread::spawn(move || run_tls(listener, commands, tls_config));
@@ -474,7 +474,7 @@ mod tests {
 
     fn client_tls_config() -> Arc<rustls::ClientConfig> {
         Arc::new(
-            tls::load_client_config(&fixture("fixture-client.crt"), &fixture("fixture-client.key"), &fixture("ca.crt"))
+            tls::load_client_config(&fixture("fixture-client.crt"), &fixture("fixture-client.key"), &fixture("ca.crt"), &fixture("crl.pem"))
                 .unwrap(),
         )
     }
@@ -576,7 +576,7 @@ mod tests {
     fn a_client_with_a_wrong_ca_certificate_cannot_complete_the_tcp_handshake() {
         let addr = start_tcp_test_server("a_client_with_a_wrong_ca_certificate_cannot_complete_the_tcp_handshake");
         let wrong_config = Arc::new(
-            tls::load_client_config(&fixture("wrong-ca-node.crt"), &fixture("wrong-ca-node.key"), &fixture("ca.crt"))
+            tls::load_client_config(&fixture("wrong-ca-node.crt"), &fixture("wrong-ca-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
                 .unwrap(),
         );
         let server_name = tls::server_name_from_addr(&addr).unwrap();
@@ -593,6 +593,31 @@ mod tests {
         assert!(
             write_result.is_err() || read_result.is_err(),
             "expected the handshake to fail for a wrong-CA client certificate"
+        );
+    }
+
+    #[test]
+    fn a_client_with_a_revoked_certificate_cannot_complete_the_tcp_handshake() {
+        let addr = start_tcp_test_server("a_client_with_a_revoked_certificate_cannot_complete_the_tcp_handshake");
+        let revoked_config = Arc::new(
+            tls::load_client_config(
+                &fixture("revoked-node.crt"),
+                &fixture("revoked-node.key"),
+                &fixture("ca.crt"),
+                &fixture("crl.pem"),
+            )
+            .unwrap(),
+        );
+        let server_name = tls::server_name_from_addr(&addr).unwrap();
+        let tcp_stream = TcpStream::connect(&addr).unwrap();
+        let conn = rustls::ClientConnection::new(revoked_config, server_name).unwrap();
+        let mut stream = rustls::StreamOwned::new(conn, tcp_stream);
+        let write_result = stream.write_all(b"GET /jails HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+        let mut response = Vec::new();
+        let read_result = stream.read_to_end(&mut response);
+        assert!(
+            write_result.is_err() || read_result.is_err(),
+            "expected the handshake to fail for a revoked client certificate"
         );
     }
 }

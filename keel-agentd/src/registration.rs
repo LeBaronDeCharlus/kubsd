@@ -140,11 +140,11 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         let (_worker_handle, commands) = worker::spawn(Registry::new(), Placements::new());
         let tls_config = std::sync::Arc::new(
-            crate::tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
+            crate::tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
                 .unwrap(),
         );
         let client_config = std::sync::Arc::new(
-            crate::tls::load_client_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
+            crate::tls::load_client_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
                 .unwrap(),
         );
         thread::spawn(move || keel_controlplane::http::run(listener, commands, tls_config, client_config));
@@ -153,14 +153,14 @@ mod tests {
 
     fn node_client_config() -> std::sync::Arc<rustls::ClientConfig> {
         std::sync::Arc::new(
-            crate::tls::load_client_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
+            crate::tls::load_client_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
                 .unwrap(),
         )
     }
 
     fn wrong_ca_client_config() -> std::sync::Arc<rustls::ClientConfig> {
         std::sync::Arc::new(
-            crate::tls::load_client_config(&fixture("wrong-ca-node.crt"), &fixture("wrong-ca-node.key"), &fixture("ca.crt"))
+            crate::tls::load_client_config(&fixture("wrong-ca-node.crt"), &fixture("wrong-ca-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
                 .unwrap(),
         )
     }
@@ -214,7 +214,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let server_config = std::sync::Arc::new(
-            crate::tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
+            crate::tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
                 .unwrap(),
         );
         thread::spawn(move || {
@@ -376,5 +376,36 @@ mod tests {
         thread::sleep(Duration::from_millis(200));
         let body = get_nodes(&control_plane_addr);
         assert!(!body.contains("node-1"), "expected node-1 to never register with a wrong-CA certificate, got: {body}");
+    }
+
+    fn start_fake_control_plane_with_revoked_cert() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server_config = std::sync::Arc::new(
+            crate::tls::load_server_config(
+                &fixture("revoked-node.crt"),
+                &fixture("revoked-node.key"),
+                &fixture("ca.crt"),
+                &fixture("crl.pem"),
+            )
+            .unwrap(),
+        );
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let Ok(conn) = rustls::ServerConnection::new(std::sync::Arc::clone(&server_config)) else { continue };
+                let mut tls_stream = rustls::StreamOwned::new(conn, stream);
+                let mut buf = [0u8; 4096];
+                let _ = tls_stream.read(&mut buf);
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn send_request_to_a_peer_presenting_a_revoked_certificate_fails() {
+        let addr = start_fake_control_plane_with_revoked_cert();
+        let result = send_request(&addr, "GET", "/nodes", "", &node_client_config());
+        assert!(result.is_err(), "expected a revoked peer certificate to fail the connection, got: {result:?}");
     }
 }
