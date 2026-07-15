@@ -479,6 +479,78 @@ a generic `401`; a node restarted with a stale, mismatched token repeated
 and never appeared `Alive` until its token file was corrected; clean
 teardown confirmed on all three VMs afterward.
 
+### Milestone 12: mutual TLS for the control plane
+
+Milestone 11's shared-secret token closed the authorization gap but left
+two things on record as its own stated limitations: no confidentiality
+(an eavesdropper on the LAN could still read the token and every spec
+body in flight), and no per-identity credential (one leaked token
+compromised the whole cluster, with no way to revoke just one node's or
+operator's access). This milestone replaces the token entirely with
+mutual TLS: every connection, client to control plane, node to control
+plane, control plane to node, is encrypted, and identity is proven by a
+certificate signed by a private CA the operator generates once, not by a
+string copied to every host. It is this project's first genuinely new
+runtime dependency, `rustls` pinned to its `ring` crypto backend
+(`default-features = false, features = ["ring"]`) rather than the
+default `aws-lc-rs`, since the latter is C/assembly and would add a
+build-toolchain requirement this project has never had; certificate
+*generation* itself stays entirely in a new `scripts/gen-certs.sh`
+shelling out to `openssl`, not a new Rust dependency.
+
+Every accepted connection is wrapped in a real TLS handshake requiring
+and verifying a client certificate before any HTTP request is parsed,
+which let Milestone 11's `auth::check` calls, and `keel-agentd`'s
+`route`/`route_authenticated` split, disappear entirely: identity is now
+proven at the transport layer, so `route()` itself needs no
+auth-awareness at all, on either the Unix-socket or TLS-wrapped path.
+`keel-agentd`'s Unix socket keeps calling that same, now-simpler
+`route()` unwrapped, exactly as it always has. One certificate per node
+(and one for the control plane itself, issued the identical way) doubles
+as both a TLS server certificate, when it's dialed, and a client
+certificate, when it dials out, matching the "one identity, no
+artificial split" principle `node-id` already embodied everywhere else.
+
+Milestone 12 finished at 202 tests on macOS (191 inherited from
+Milestone 11, minus the deleted `auth` modules' tests, plus new coverage
+across three `tls` modules and the HTTP/registration/CLI TLS wiring), and
+full VM verification across three real nodes: all three registered
+`Alive` against an authenticated `GET /nodes` over real mTLS; a scheduled
+apply/get/delete round trip succeeded end-to-end with real client
+certificates; a `keelctl` call with a missing certificate file failed
+locally without ever reaching the network; clean teardown confirmed on
+all three VMs afterward.
+
+Three real bugs surfaced only once the whole pipeline was exercised
+together, none caught by any single crate's own test suite in isolation.
+Twice, a read loop added to tolerate `rustls`'s `UnexpectedEof` (its
+documented behavior for a TLS peer that closes without a `close_notify`
+alert) was copied without the accompanying `Content-Length` cross-check
+that makes the tolerance safe, letting a connection cut short be
+silently accepted as a complete response instead of erroring; one
+instance (`keel-controlplane`'s own node-forwarding path) was genuinely
+exploitable, the other (`keelctl`'s own response to the operator's
+terminal) was worse, since the truncated body is exactly what a human
+would see as if it were correct. Third, a cross-crate crypto-provider
+conflict: `keel-controlplane::tls` and `keel-agentd::tls` each guard
+`rustls`'s one-time crypto-provider install with their own crate-local
+`Once`, and linking both into one test binary (Milestone 12's own
+integration tests do exactly this) meant the second crate's first-ever
+call saw `rustls`'s ordinary "already installed" `Err` and turned it into
+a panic instead of ignoring it, the same "ignore the outcome of losing
+the race" idiom `rustls`'s own internal helper already uses for this
+exact case.
+
+VM verification also turned up a real, if mundane, testing artifact: a
+committed test fixture certificate, generated on a different machine
+than the one it was later checked against, carried a `notBefore` field
+set relative to its own clock, which the verifying VM's clock hadn't
+reached yet, since VMs and their build hosts don't share a clock. `rustls`
+correctly rejected the not-yet-valid certificate, just not for the
+untrusted-issuer reason the test intended to demonstrate, standing
+proof that generating any TLS test fixture across a machine boundary
+carries an inherent, if usually small, clock-skew risk.
+
 ## Roadmap
 
 **Sub-project 1: single-node jail reconciliation daemon (complete)**
@@ -503,7 +575,8 @@ teardown confirmed on all three VMs afterward.
 **Sub-project 4: control-plane hardening (in progress)**
 
 11. ~~Shared-secret authentication on every control-plane and node TCP route~~ done
-12. TLS / wire encryption between client, control plane, and nodes (not yet designed)
+12. ~~Mutual TLS between client, control plane, and nodes, replacing the shared secret~~ done
+13. Certificate revocation and rotation automation (not yet designed)
 
 **Not yet designed** (future sub-projects, each will get its own spec):
 
