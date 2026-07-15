@@ -357,11 +357,11 @@ fn forward(
 
     // Read until the peer closes the connection. rustls surfaces a plain TCP
     // close that lacks a TLS `close_notify` alert as `ErrorKind::UnexpectedEof`
-    // rather than `Ok(0)`, to guard against truncation attacks in general; for
-    // a request/response protocol that already frames its body with
-    // Content-Length, and against peers (like agentd) that simply drop the
-    // connection once they're done writing, that distinction doesn't matter
-    // here, so treat it the same as a clean close.
+    // rather than `Ok(0)`, to guard against truncation attacks in general; we
+    // rely on that being safe below by explicitly checking the received body
+    // length against the response's own Content-Length header, so a
+    // connection that drops mid-body (an on-path RST, or a crashing node)
+    // is caught as a truncated response rather than silently accepted.
     let mut response = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -380,6 +380,17 @@ fn forward(
         httparse::Status::Partial => return Err("incomplete response".to_string()),
     };
     let status = parsed.code.ok_or_else(|| "missing status code".to_string())?;
+    let content_length = parsed
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("content-length"))
+        .and_then(|h| std::str::from_utf8(h.value).ok())
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .ok_or_else(|| "response missing Content-Length header".to_string())?;
+    let actual = response.len() - header_len;
+    if actual != content_length {
+        return Err(format!("truncated response: expected {content_length} bytes, got {actual}"));
+    }
     Ok((status, response[header_len..].to_vec()))
 }
 
@@ -667,6 +678,45 @@ mod tests {
         addr
     }
 
+    /// Like `start_fake_remote_tls_agentd`, but the response header declares
+    /// a `Content-Length` larger than the body actually written, and the
+    /// connection is then dropped without a clean TLS shutdown (no
+    /// `close_notify`) — simulating an on-path RST or a node that crashes
+    /// mid-write.
+    fn start_fake_remote_tls_agentd_with_truncated_body(status: u16, claimed_body: &'static str, actual_body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server_config = Arc::new(
+            tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
+                .unwrap(),
+        );
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let Ok(conn) = rustls::ServerConnection::new(Arc::clone(&server_config)) else { continue };
+                let mut tls_stream = rustls::StreamOwned::new(conn, stream);
+                let mut buf = [0u8; 4096];
+                loop {
+                    match tls_stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => continue,
+                    }
+                }
+                let header = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nContent-Type: application/yaml\r\nConnection: close\r\n\r\n{actual_body}",
+                    claimed_body.len()
+                );
+                let _ = tls_stream.write_all(header.as_bytes());
+                let _ = tls_stream.flush();
+                // Drop the raw TCP connection without sending a TLS
+                // close_notify alert, so the client sees an unclean close
+                // partway through the declared body.
+                let _ = tls_stream.sock.shutdown(std::net::Shutdown::Both);
+            }
+        });
+        addr
+    }
+
     fn register_node(cp_addr: &str, id: &str, node_addr: &str) {
         send_request(
             cp_addr,
@@ -751,6 +801,26 @@ mod tests {
         let (status, body) = send_request(&cp_addr, "GET", "/nodes/node-1/jails", "");
         assert_eq!(status, 500);
         assert!(body.contains("failed to reach node"), "expected forwarding failure in body: {body}");
+    }
+
+    #[test]
+    fn forward_to_a_node_that_closes_mid_body_returns_500_instead_of_a_truncated_body() {
+        let cp_addr = start_test_server();
+        // The header claims a 40-byte body, but the node only ever writes 10
+        // bytes before dropping the connection uncleanly (no close_notify).
+        let node_addr = start_fake_remote_tls_agentd_with_truncated_body(
+            200,
+            "running: true, this claims forty bytes\n",
+            "running: t",
+        );
+        register_node(&cp_addr, "node-1", &node_addr);
+
+        let (status, body) = send_request(&cp_addr, "GET", "/nodes/node-1/jails", "");
+        assert_eq!(status, 500, "expected a forwarding failure, got status {status} with body: {body}");
+        assert!(
+            !body.contains("running: t"),
+            "truncated upstream body must not be relayed to the caller, got: {body}"
+        );
     }
 
     #[test]
