@@ -1,0 +1,25 @@
+[ ca ]
+default_ca = CA_default
+
+[ CA_default ]
+database         = testdata/tls/ca-db/index.txt
+serial           = testdata/tls/ca-db/serial
+crlnumber        = testdata/tls/ca-db/crlnumber
+new_certs_dir    = testdata/tls/ca-db/newcerts
+certificate      = testdata/tls/ca.crt
+private_key      = testdata/tls/ca.key
+default_md       = sha256
+default_days     = 3650
+default_crl_days = 3650
+policy           = policy_anything
+email_in_dn      = no
+unique_subject   = no
+copy_extensions  = none
+
+[ policy_anything ]
+countryName            = optional
+stateOrProvinceName    = optional
+organizationName       = optional
+organizationalUnitName = optional
+commonName             = supplied
+emailAddress           = optional
