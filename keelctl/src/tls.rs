@@ -9,9 +9,12 @@ static CRYPTO_PROVIDER_INIT: Once = Once::new();
 
 pub fn ensure_crypto_provider() {
     CRYPTO_PROVIDER_INIT.call_once(|| {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .expect("failed to install rustls ring crypto provider");
+        // Ignore the error: it only occurs if some other crate (e.g. another
+        // `keel-*` crate linked into the same process, as happens in this
+        // binary's own integration tests) already installed a default
+        // provider first. Either way, a process-wide default is now in
+        // place, which is all this function promises.
+        let _ = rustls::crypto::ring::default_provider().install_default();
     });
 }
 

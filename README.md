@@ -492,7 +492,7 @@ plane, control plane to node, is encrypted, and identity is proven by a
 certificate signed by a private CA the operator generates once, not by a
 string copied to every host. It is this project's first genuinely new
 runtime dependency, `rustls` pinned to its `ring` crypto backend
-(`default-features = false, features = ["ring"]`) rather than the
+(`default-features = false, features = ["ring", "std"]`) rather than the
 default `aws-lc-rs`, since the latter is C/assembly and would add a
 build-toolchain requirement this project has never had; certificate
 *generation* itself stays entirely in a new `scripts/gen-certs.sh`
