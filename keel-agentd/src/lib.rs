@@ -1,4 +1,3 @@
-pub mod auth;
 pub mod backoff;
 pub mod capacity;
 pub mod http;
