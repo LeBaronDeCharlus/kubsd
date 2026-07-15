@@ -13,7 +13,7 @@ const DEFAULT_SOCKET: &str = "/var/run/keel-agentd.sock";
 #[derive(Debug, PartialEq)]
 enum Target {
     Socket(PathBuf),
-    ControlPlane { addr: String, node: Option<String>, token: String },
+    ControlPlane { addr: String, node: Option<String>, tls_ca_file: PathBuf, tls_cert_file: PathBuf, tls_key_file: PathBuf },
 }
 
 fn main() -> ExitCode {
@@ -21,9 +21,11 @@ fn main() -> ExitCode {
     let socket = extract_socket_flag(&mut args).unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET));
     let control_plane_addr = extract_flag(&mut args, "--control-plane-addr");
     let node = extract_flag(&mut args, "--node");
-    let auth_token_file = extract_flag(&mut args, "--auth-token-file");
+    let tls_ca_file = extract_flag(&mut args, "--tls-ca-file");
+    let tls_cert_file = extract_flag(&mut args, "--tls-cert-file");
+    let tls_key_file = extract_flag(&mut args, "--tls-key-file");
 
-    let target = match resolve_target(socket, control_plane_addr, node, auth_token_file) {
+    let target = match resolve_target(socket, control_plane_addr, node, tls_ca_file, tls_cert_file, tls_key_file) {
         Ok(target) => target,
         Err(message) => {
             eprintln!("error: {message}");
@@ -69,22 +71,23 @@ fn resolve_target(
     socket: PathBuf,
     control_plane_addr: Option<String>,
     node: Option<String>,
-    auth_token_file: Option<String>,
+    tls_ca_file: Option<String>,
+    tls_cert_file: Option<String>,
+    tls_key_file: Option<String>,
 ) -> Result<Target, String> {
-    match (control_plane_addr, node, auth_token_file) {
-        (Some(addr), node, Some(path)) => {
-            let token = std::fs::read_to_string(&path)
-                .map_err(|e| format!("failed to read {path}: {e}"))?
-                .trim()
-                .to_string();
-            if token.is_empty() {
-                return Err(format!("auth token file {path} is empty"));
-            }
-            Ok(Target::ControlPlane { addr, node, token })
+    match (control_plane_addr, node, tls_ca_file, tls_cert_file, tls_key_file) {
+        (Some(addr), node, Some(ca), Some(cert), Some(key)) => Ok(Target::ControlPlane {
+            addr,
+            node,
+            tls_ca_file: PathBuf::from(ca),
+            tls_cert_file: PathBuf::from(cert),
+            tls_key_file: PathBuf::from(key),
+        }),
+        (Some(_), _, _, _, _) => {
+            Err("--tls-ca-file, --tls-cert-file, and --tls-key-file are all required with --control-plane-addr".to_string())
         }
-        (Some(_), _, None) => Err("--auth-token-file is required with --control-plane-addr".to_string()),
-        (None, Some(_), _) => Err("--node requires --control-plane-addr".to_string()),
-        (None, None, _) => Ok(Target::Socket(socket)),
+        (None, Some(_), _, _, _) => Err("--node requires --control-plane-addr".to_string()),
+        (None, None, _, _, _) => Ok(Target::Socket(socket)),
     }
 }
 
@@ -99,7 +102,9 @@ fn jails_path(target: &Target, suffix: &str) -> String {
 fn dispatch(target: &Target, method: &str, path: &str, body: &str) -> Result<String, String> {
     match target {
         Target::Socket(socket) => send_request(socket, method, path, body),
-        Target::ControlPlane { addr, token, .. } => send_request_tcp(addr, method, path, body, token),
+        Target::ControlPlane { addr, tls_ca_file, tls_cert_file, tls_key_file, .. } => {
+            send_request_tcp(addr, method, path, body, tls_ca_file, tls_cert_file, tls_key_file)
+        }
     }
 }
 
@@ -140,14 +145,27 @@ fn send_request(socket: &PathBuf, method: &str, path: &str, body: &str) -> Resul
     parse_response(&response)
 }
 
-fn send_request_tcp(addr: &str, method: &str, path: &str, body: &str, token: &str) -> Result<String, String> {
-    let mut stream = TcpStream::connect(addr).map_err(|e| format!("failed to connect to {addr}: {e}"))?;
-    let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
+fn send_request_tcp(
+    addr: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+    tls_ca_file: &PathBuf,
+    tls_cert_file: &PathBuf,
+    tls_key_file: &PathBuf,
+) -> Result<String, String> {
+    let client_config = std::sync::Arc::new(
+        tls::load_client_config(tls_cert_file, tls_key_file, tls_ca_file)
+            .map_err(|e| format!("failed to load TLS client config: {e}"))?,
     );
+    let server_name = tls::server_name_from_addr(addr).map_err(|e| e.to_string())?;
+    let tcp_stream = TcpStream::connect(addr).map_err(|e| format!("failed to connect to {addr}: {e}"))?;
+    let conn = rustls::ClientConnection::new(client_config, server_name).map_err(|e| e.to_string())?;
+    let mut stream = rustls::StreamOwned::new(conn, tcp_stream);
+
+    let request = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}", body.len());
     stream.write_all(request.as_bytes()).map_err(|e| format!("failed to send request: {e}"))?;
-    stream.shutdown(std::net::Shutdown::Write).ok();
+    stream.sock.shutdown(std::net::Shutdown::Write).ok();
 
     let mut response = Vec::new();
     stream.read_to_end(&mut response).map_err(|e| format!("failed to read response: {e}"))?;
@@ -179,41 +197,47 @@ mod tests {
 
     #[test]
     fn no_control_plane_flags_yields_socket_target() {
-        let target = resolve_target(PathBuf::from("/var/run/keel-agentd.sock"), None, None, None).unwrap();
+        let target = resolve_target(PathBuf::from("/var/run/keel-agentd.sock"), None, None, None, None, None).unwrap();
         assert_eq!(target, Target::Socket(PathBuf::from("/var/run/keel-agentd.sock")));
     }
 
     #[test]
     fn node_without_control_plane_addr_is_an_error() {
-        let err = resolve_target(PathBuf::from("/var/run/keel-agentd.sock"), None, Some("node-1".to_string()), None)
-            .unwrap_err();
+        let err = resolve_target(
+            PathBuf::from("/var/run/keel-agentd.sock"),
+            None,
+            Some("node-1".to_string()),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err, "--node requires --control-plane-addr");
     }
 
     #[test]
-    fn control_plane_addr_without_auth_token_file_is_an_error() {
+    fn control_plane_addr_without_tls_flags_is_an_error() {
         let err = resolve_target(
             PathBuf::from("/var/run/keel-agentd.sock"),
             Some("10.0.0.1:7620".to_string()),
             None,
             None,
+            None,
+            None,
         )
         .unwrap_err();
-        assert_eq!(err, "--auth-token-file is required with --control-plane-addr");
+        assert_eq!(err, "--tls-ca-file, --tls-cert-file, and --tls-key-file are all required with --control-plane-addr");
     }
 
     #[test]
-    fn control_plane_addr_with_auth_token_file_reads_the_token() {
-        let dir = std::env::temp_dir().join(format!("keelctl-resolve-target-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let token_path = dir.join("token");
-        std::fs::write(&token_path, "secret123\n").unwrap();
-
+    fn control_plane_addr_with_all_tls_flags_builds_a_control_plane_target() {
         let target = resolve_target(
             PathBuf::from("/var/run/keel-agentd.sock"),
             Some("10.0.0.1:7620".to_string()),
             Some("node-1".to_string()),
-            Some(token_path.to_str().unwrap().to_string()),
+            Some("/etc/keel/ca.crt".to_string()),
+            Some("/etc/keel/alice.crt".to_string()),
+            Some("/etc/keel/alice.key".to_string()),
         )
         .unwrap();
         assert_eq!(
@@ -221,25 +245,10 @@ mod tests {
             Target::ControlPlane {
                 addr: "10.0.0.1:7620".to_string(),
                 node: Some("node-1".to_string()),
-                token: "secret123".to_string(),
+                tls_ca_file: PathBuf::from("/etc/keel/ca.crt"),
+                tls_cert_file: PathBuf::from("/etc/keel/alice.crt"),
+                tls_key_file: PathBuf::from("/etc/keel/alice.key"),
             }
         );
-    }
-
-    #[test]
-    fn control_plane_addr_with_an_empty_auth_token_file_is_an_error() {
-        let dir = std::env::temp_dir().join(format!("keelctl-resolve-target-test-empty-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let token_path = dir.join("token");
-        std::fs::write(&token_path, "").unwrap();
-
-        let err = resolve_target(
-            PathBuf::from("/var/run/keel-agentd.sock"),
-            Some("10.0.0.1:7620".to_string()),
-            Some("node-1".to_string()),
-            Some(token_path.to_str().unwrap().to_string()),
-        )
-        .unwrap_err();
-        assert!(err.contains("is empty"), "expected an empty-token error, got: {err}");
     }
 }
