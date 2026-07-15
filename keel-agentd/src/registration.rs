@@ -81,7 +81,11 @@ fn send_request(addr: &str, method: &str, path: &str, body: &str, client_config:
 
     // Read until the peer closes the connection. rustls surfaces a plain TCP
     // close that lacks a TLS `close_notify` alert as `ErrorKind::UnexpectedEof`
-    // rather than `Ok(0)`, matching keel-controlplane's own `forward()`.
+    // rather than `Ok(0)`, matching keel-controlplane's own `forward()`; we
+    // rely on that being safe below by explicitly checking the received body
+    // length against the response's own Content-Length header, so a
+    // connection that drops mid-body (an on-path RST, or a crashing control
+    // plane) is caught as a truncated response rather than silently accepted.
     let mut response = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -95,11 +99,22 @@ fn send_request(addr: &str, method: &str, path: &str, body: &str, client_config:
 
     let mut headers = [httparse::EMPTY_HEADER; 16];
     let mut parsed = httparse::Response::new(&mut headers);
-    match parsed.parse(&response).map_err(|e| format!("malformed response: {e}"))? {
-        httparse::Status::Complete(_) => {}
+    let header_len = match parsed.parse(&response).map_err(|e| format!("malformed response: {e}"))? {
+        httparse::Status::Complete(len) => len,
         httparse::Status::Partial => return Err("incomplete response from control plane".to_string()),
     };
     let status = parsed.code.unwrap_or(0);
+    let content_length = parsed
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("content-length"))
+        .and_then(|h| std::str::from_utf8(h.value).ok())
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .ok_or_else(|| "response missing Content-Length header".to_string())?;
+    let actual = response.len() - header_len;
+    if actual != content_length {
+        return Err(format!("truncated response: expected {content_length} bytes, got {actual}"));
+    }
     if (200..300).contains(&status) {
         Ok(())
     } else {
@@ -169,7 +184,64 @@ mod tests {
                 Err(e) => panic!("failed to read response: {e}"),
             }
         }
+        // Same Content-Length cross-check as `send_request`: an unclean close
+        // (UnexpectedEof) is only safe to tolerate if the received body
+        // actually matches what the response header claims.
+        let mut headers = [httparse::EMPTY_HEADER; 16];
+        let mut parsed = httparse::Response::new(&mut headers);
+        let header_len = match parsed.parse(&response).unwrap() {
+            httparse::Status::Complete(len) => len,
+            httparse::Status::Partial => panic!("incomplete response: {response:?}"),
+        };
+        let content_length = parsed
+            .headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("content-length"))
+            .and_then(|h| std::str::from_utf8(h.value).ok())
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .expect("response missing Content-Length header");
+        let actual = response.len() - header_len;
+        assert_eq!(actual, content_length, "truncated response: expected {content_length} bytes, got {actual}");
         String::from_utf8_lossy(&response).to_string()
+    }
+
+    /// A fake control plane that accepts the TLS handshake, drains the
+    /// request, then sends a response header declaring a `Content-Length`
+    /// larger than the body it actually writes before dropping the raw TCP
+    /// connection without a clean TLS shutdown (no `close_notify`) --
+    /// simulating an on-path RST or a control plane that crashes mid-write.
+    fn start_fake_control_plane_with_truncated_body(claimed_body: &'static str, actual_body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server_config = std::sync::Arc::new(
+            crate::tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
+                .unwrap(),
+        );
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let Ok(conn) = rustls::ServerConnection::new(std::sync::Arc::clone(&server_config)) else { continue };
+                let mut tls_stream = rustls::StreamOwned::new(conn, stream);
+                let mut buf = [0u8; 4096];
+                loop {
+                    match tls_stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => continue,
+                    }
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/yaml\r\nConnection: close\r\n\r\n{actual_body}",
+                    claimed_body.len()
+                );
+                let _ = tls_stream.write_all(header.as_bytes());
+                let _ = tls_stream.flush();
+                // Drop the raw TCP connection without sending a TLS
+                // close_notify alert, so the client sees an unclean close
+                // partway through the declared body.
+                let _ = tls_stream.sock.shutdown(std::net::Shutdown::Both);
+            }
+        });
+        addr
     }
 
     #[test]
@@ -258,6 +330,23 @@ mod tests {
         let body = get_nodes(&control_plane_addr);
         assert!(body.contains("committed_cpu: 2"), "expected committed_cpu from the applied jail, got: {body}");
         assert!(body.contains("committed_memory: 536870912"), "expected committed_memory from the applied jail, got: {body}");
+    }
+
+    #[test]
+    fn send_request_to_a_peer_that_closes_mid_body_returns_err_not_a_silent_ok() {
+        // The header claims a much larger body than what actually gets
+        // written before the connection drops uncleanly (no close_notify).
+        let addr = start_fake_control_plane_with_truncated_body(
+            "this response claims to be far longer than what is actually sent back\n",
+            "truncat",
+        );
+
+        let result = send_request(&addr, "GET", "/nodes", "", &node_client_config());
+
+        assert!(
+            result.is_err(),
+            "expected a truncated response to be treated as a failure, got: {result:?}"
+        );
     }
 
     #[test]
