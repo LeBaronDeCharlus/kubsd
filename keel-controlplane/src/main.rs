@@ -10,6 +10,7 @@ struct Config {
     tls_ca_file: Option<PathBuf>,
     tls_cert_file: Option<PathBuf>,
     tls_key_file: Option<PathBuf>,
+    tls_crl_file: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -19,6 +20,7 @@ impl Default for Config {
             tls_ca_file: None,
             tls_cert_file: None,
             tls_key_file: None,
+            tls_crl_file: None,
         }
     }
 }
@@ -37,11 +39,16 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Config {
             "--tls-ca-file" => config.tls_ca_file = Some(PathBuf::from(value)),
             "--tls-cert-file" => config.tls_cert_file = Some(PathBuf::from(value)),
             "--tls-key-file" => config.tls_key_file = Some(PathBuf::from(value)),
+            "--tls-crl-file" => config.tls_crl_file = Some(PathBuf::from(value)),
             other => panic!("unknown flag: {other}"),
         }
     }
-    if config.tls_ca_file.is_none() || config.tls_cert_file.is_none() || config.tls_key_file.is_none() {
-        panic!("--tls-ca-file, --tls-cert-file, and --tls-key-file are all required");
+    if config.tls_ca_file.is_none()
+        || config.tls_cert_file.is_none()
+        || config.tls_key_file.is_none()
+        || config.tls_crl_file.is_none()
+    {
+        panic!("--tls-ca-file, --tls-cert-file, --tls-key-file, and --tls-crl-file are all required");
     }
     config
 }
@@ -51,10 +58,11 @@ fn main() {
     let ca_file = config.tls_ca_file.expect("validated as required in parse_args_from");
     let cert_file = config.tls_cert_file.expect("validated as required in parse_args_from");
     let key_file = config.tls_key_file.expect("validated as required in parse_args_from");
+    let crl_file = config.tls_crl_file.expect("validated as required in parse_args_from");
 
-    let tls_config = keel_controlplane::tls::load_server_config(&cert_file, &key_file, &ca_file)
+    let tls_config = keel_controlplane::tls::load_server_config(&cert_file, &key_file, &ca_file, &crl_file)
         .unwrap_or_else(|e| panic!("failed to load TLS server config: {e}"));
-    let client_config = keel_controlplane::tls::load_client_config(&cert_file, &key_file, &ca_file)
+    let client_config = keel_controlplane::tls::load_client_config(&cert_file, &key_file, &ca_file, &crl_file)
         .unwrap_or_else(|e| panic!("failed to load TLS client config: {e}"));
 
     eprintln!("keel-controlplane: starting (addr={})", config.addr);
@@ -79,14 +87,16 @@ mod tests {
             "--tls-ca-file", "/etc/keel/ca.crt",
             "--tls-cert-file", "/etc/keel/controlplane.crt",
             "--tls-key-file", "/etc/keel/controlplane.key",
+            "--tls-crl-file", "/etc/keel/crl.pem",
         ]));
         assert_eq!(config.tls_ca_file, Some(PathBuf::from("/etc/keel/ca.crt")));
         assert_eq!(config.tls_cert_file, Some(PathBuf::from("/etc/keel/controlplane.crt")));
         assert_eq!(config.tls_key_file, Some(PathBuf::from("/etc/keel/controlplane.key")));
+        assert_eq!(config.tls_crl_file, Some(PathBuf::from("/etc/keel/crl.pem")));
     }
 
     #[test]
-    #[should_panic(expected = "--tls-ca-file, --tls-cert-file, and --tls-key-file are all required")]
+    #[should_panic(expected = "--tls-ca-file, --tls-cert-file, --tls-key-file, and --tls-crl-file are all required")]
     fn missing_any_tls_flag_panics() {
         parse_args_from(args(&["--tls-ca-file", "/etc/keel/ca.crt"]));
     }

@@ -423,7 +423,7 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         let (_worker_handle, commands) = worker::spawn(Registry::new(), Placements::new());
         let tls_config = Arc::new(
-            tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
+            tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
                 .unwrap(),
         );
         let client_config = client_tls_config();
@@ -437,6 +437,7 @@ mod tests {
                 &fixture("fixture-client.crt"),
                 &fixture("fixture-client.key"),
                 &fixture("ca.crt"),
+                &fixture("crl.pem"),
             )
             .unwrap(),
         )
@@ -444,7 +445,7 @@ mod tests {
 
     fn wrong_ca_tls_config() -> Arc<rustls::ClientConfig> {
         Arc::new(
-            tls::load_client_config(&fixture("wrong-ca-node.crt"), &fixture("wrong-ca-node.key"), &fixture("ca.crt"))
+            tls::load_client_config(&fixture("wrong-ca-node.crt"), &fixture("wrong-ca-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
                 .unwrap(),
         )
     }
@@ -644,7 +645,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let server_config = Arc::new(
-            tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
+            tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
                 .unwrap(),
         );
         thread::spawn(move || {
@@ -687,7 +688,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let server_config = Arc::new(
-            tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
+            tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
                 .unwrap(),
         );
         thread::spawn(move || {
@@ -745,7 +746,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let node_addr = listener.local_addr().unwrap().to_string();
         let wrong_server_config = Arc::new(
-            tls::load_server_config(&fixture("wrong-ca-node.crt"), &fixture("wrong-ca-node.key"), &fixture("ca.crt"))
+            tls::load_server_config(&fixture("wrong-ca-node.crt"), &fixture("wrong-ca-node.key"), &fixture("ca.crt"), &fixture("crl.pem"))
                 .unwrap(),
         );
         thread::spawn(move || {
@@ -905,5 +906,54 @@ mod tests {
         let (status, body) = send_request(&cp_addr, "GET", "/jails/web-1", "");
         assert_eq!(status, 200, "expected the scheduled GET to find the placement recorded by the named-node PUT");
         assert!(body.contains("running: true"), "got: {body}");
+    }
+
+    #[test]
+    fn a_client_with_a_revoked_certificate_cannot_complete_the_handshake() {
+        let addr = start_test_server();
+        let revoked_config = Arc::new(
+            tls::load_client_config(
+                &fixture("revoked-node.crt"),
+                &fixture("revoked-node.key"),
+                &fixture("ca.crt"),
+                &fixture("crl.pem"),
+            )
+            .unwrap(),
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| send_request_with(&addr, "GET", "/nodes", "", &revoked_config)));
+        assert!(
+            result.is_err() || result.unwrap().0 != 200,
+            "expected the handshake to fail for a revoked client certificate"
+        );
+    }
+
+    #[test]
+    fn forward_to_a_node_presenting_a_revoked_certificate_fails() {
+        let cp_addr = start_test_server();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let node_addr = listener.local_addr().unwrap().to_string();
+        let revoked_server_config = Arc::new(
+            tls::load_server_config(
+                &fixture("revoked-node.crt"),
+                &fixture("revoked-node.key"),
+                &fixture("ca.crt"),
+                &fixture("crl.pem"),
+            )
+            .unwrap(),
+        );
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let Ok(conn) = rustls::ServerConnection::new(Arc::clone(&revoked_server_config)) else { continue };
+                let mut tls_stream = rustls::StreamOwned::new(conn, stream);
+                let mut buf = [0u8; 4096];
+                let _ = tls_stream.read(&mut buf);
+            }
+        });
+        register_node(&cp_addr, "node-1", &node_addr);
+
+        let (status, body) = send_request(&cp_addr, "GET", "/nodes/node-1/jails", "");
+        assert_eq!(status, 500);
+        assert!(body.contains("failed to reach node"), "expected a forwarding failure, got: {body}");
     }
 }
