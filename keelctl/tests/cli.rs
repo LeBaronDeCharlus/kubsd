@@ -7,12 +7,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 
-const TEST_TOKEN: &str = "test-token-123";
-
-fn test_token_file() -> std::path::PathBuf {
-    let path = std::env::temp_dir().join("keelctl-test-auth-token");
-    std::fs::write(&path, TEST_TOKEN).unwrap();
-    path
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../testdata/tls")).join(name)
 }
 
 fn start_test_server(name: &str) -> PathBuf {
@@ -77,8 +73,11 @@ fn start_test_agentd_tcp(name: &str) -> String {
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let token = std::sync::Arc::new(TEST_TOKEN.to_string());
-    thread::spawn(move || keel_agentd::http::run_tcp(listener, commands, token));
+    let tls_config = std::sync::Arc::new(
+        keel_agentd::tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
+            .unwrap(),
+    );
+    thread::spawn(move || keel_agentd::http::run_tls(listener, commands, tls_config));
     addr
 }
 
@@ -100,8 +99,15 @@ fn start_test_control_plane_with_node(node_id: &str, node_addr: &str) -> String 
         .unwrap();
     reg_rx.recv().unwrap();
 
-    let token = std::sync::Arc::new(TEST_TOKEN.to_string());
-    thread::spawn(move || keel_controlplane::http::run(listener, commands, token));
+    let tls_config = std::sync::Arc::new(
+        keel_controlplane::tls::load_server_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
+            .unwrap(),
+    );
+    let client_config = std::sync::Arc::new(
+        keel_controlplane::tls::load_client_config(&fixture("fixture-node.crt"), &fixture("fixture-node.key"), &fixture("ca.crt"))
+            .unwrap(),
+    );
+    thread::spawn(move || keel_controlplane::http::run(listener, commands, tls_config, client_config));
     addr
 }
 
@@ -112,8 +118,12 @@ fn run_keelctl_routed(control_plane_addr: &str, node: &str, args: &[&str]) -> (b
         .arg(control_plane_addr)
         .arg("--node")
         .arg(node)
-        .arg("--auth-token-file")
-        .arg(test_token_file())
+        .arg("--tls-ca-file")
+        .arg(fixture("ca.crt"))
+        .arg("--tls-cert-file")
+        .arg(fixture("fixture-client.crt"))
+        .arg("--tls-key-file")
+        .arg(fixture("fixture-client.key"))
         .output()
         .expect("failed to run keelctl binary");
     (
@@ -128,8 +138,12 @@ fn run_keelctl_scheduled(control_plane_addr: &str, args: &[&str]) -> (bool, Stri
         .args(args)
         .arg("--control-plane-addr")
         .arg(control_plane_addr)
-        .arg("--auth-token-file")
-        .arg(test_token_file())
+        .arg("--tls-ca-file")
+        .arg(fixture("ca.crt"))
+        .arg("--tls-cert-file")
+        .arg(fixture("fixture-client.crt"))
+        .arg("--tls-key-file")
+        .arg(fixture("fixture-client.key"))
         .output()
         .expect("failed to run keelctl binary");
     (

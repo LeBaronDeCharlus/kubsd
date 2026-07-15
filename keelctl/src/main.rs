@@ -167,8 +167,23 @@ fn send_request_tcp(
     stream.write_all(request.as_bytes()).map_err(|e| format!("failed to send request: {e}"))?;
     stream.sock.shutdown(std::net::Shutdown::Write).ok();
 
+    // Read until the peer closes the connection. rustls surfaces a plain TCP
+    // close that lacks a TLS `close_notify` alert as `ErrorKind::UnexpectedEof`
+    // rather than `Ok(0)`, to guard against truncation attacks in general;
+    // `parse_response` below rejects a partial (truncated) HTTP response on
+    // its own, so it's safe to treat that error the same as a clean close
+    // here. This mirrors `keel_controlplane::http::forward`'s handling of the
+    // same situation on its own TLS client connection to a node.
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).map_err(|e| format!("failed to read response: {e}"))?;
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(format!("failed to read response: {e}")),
+        }
+    }
     parse_response(&response)
 }
 
