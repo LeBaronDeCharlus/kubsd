@@ -276,25 +276,36 @@ git commit -m "gen-certs.sh: add CA database, safe rotation, revoke/crl subcomma
 
 ## Task 2: Regenerate `testdata/tls/` fixtures for CRL testing
 
+**Corrected precondition (discovered during implementation, not assumed in the original design):** `testdata/tls/ca.key` was never committed to this repository — only `testdata/tls/ca.crt` (the certificate, needed as a trust root) is tracked in git; `git ls-files testdata/tls/` lists `ca.crt` but no `ca.key`, and `git log --all -- testdata/tls/ca.key` returns nothing. The CA's private key that signed `fixture-node.crt`/`fixture-client.crt` is gone, so it is not possible to grow a `ca-db/` "around the existing CA" as the original plan text assumed — issuing or revoking anything requires the CA's private key. The only viable path is a full regeneration of the CA plus `fixture-node`/`fixture-client` (matching their existing SAN/EKU exactly, so every already-passing Milestone 12 test keeps working unchanged), plus the new `revoked-node` fixture. `wrong-ca-node.crt`/`.key` is unaffected either way: it is already signed by a separate, unrelated throwaway CA (confirmed: its own `issuer`/serial do not match `testdata/tls/ca.crt`'s CA), so regenerating the *real* CA does not change whether `wrong-ca-node` is trusted by it (it still isn't, which is the fixture's entire purpose).
+
+The exact existing SAN/EKU to replicate (verified directly against the current committed files before writing this correction):
+- `fixture-node.crt`: `Subject: CN=fixture-node`, SAN `IP Address:127.0.0.1`, EKU `TLS Web Server Authentication, TLS Web Client Authentication` — i.e. issued via `gen-certs.sh node fixture-node 127.0.0.1 --days 36500`.
+- `fixture-client.crt`: `Subject: CN=fixture-client`, no SAN, same dual EKU — i.e. issued via `gen-certs.sh client fixture-client --days 36500`.
+
 **Files:**
-- Modify: `testdata/tls/` (adds `ca-db/`, `crl.pem`, `revoked-node.crt`, `revoked-node.key`; existing `ca.crt`, `ca.key`, `fixture-node.*`, `fixture-client.*`, `wrong-ca-node.*` are untouched)
+- Modify: `testdata/tls/` (regenerates `ca.crt`, `ca.key` (untracked, stays untracked), `fixture-node.crt`/`.key`, `fixture-client.crt`/`.key`; adds `ca-db/`, `crl.pem`, `revoked-node.crt`, `revoked-node.key`; `wrong-ca-node.crt`/`.key` are untouched)
 
 **Interfaces:**
-- Produces: `testdata/tls/crl.pem` (a CRL, signed by `testdata/tls/ca.crt`'s key, listing one revoked serial), `testdata/tls/revoked-node.crt`/`.key` (a certificate matching that revoked serial, dual-use server+client, ~100-year validity, dummy SAN `192.0.2.99`, an RFC 5737 TEST-NET-1 address reserved for documentation/example use).
+- Produces: `testdata/tls/crl.pem` (a CRL, signed by the regenerated `testdata/tls/ca.crt`'s key, listing one revoked serial), `testdata/tls/revoked-node.crt`/`.key` (a certificate matching that revoked serial, dual-use server+client, ~100-year validity, dummy SAN `192.0.2.99`, an RFC 5737 TEST-NET-1 address reserved for documentation/example use).
 
-- [ ] **Step 1: Bootstrap the CA database around the existing testdata CA, issue and revoke a fixture identity**
+- [ ] **Step 1: Regenerate the CA and its `ca-db`, reissue `fixture-node`/`fixture-client`, issue and revoke `revoked-node`**
 
-Run from the repo root, using Task 1's now-idempotent `init` to grow a `ca-db/` around the CA keypair that's already committed at `testdata/tls/ca.crt`/`ca.key` (this reuses that CA rather than regenerating it, so `fixture-node.*`, `fixture-client.*`, and `wrong-ca-node.*` remain valid and untouched):
+Run from the repo root. `ca.key` does not exist under `testdata/tls/`, so `init` generates a brand-new CA keypair (it does not, and cannot, reuse a prior one) alongside its `ca-db/`:
 
 ```bash
 export GEN_CERTS_OUT_DIR=testdata/tls
+rm -f testdata/tls/ca.crt
 scripts/gen-certs.sh init
+scripts/gen-certs.sh node fixture-node 127.0.0.1 --days 36500
+scripts/gen-certs.sh client fixture-client --days 36500
 scripts/gen-certs.sh node revoked-node 192.0.2.99 --days 36500
 scripts/gen-certs.sh revoke revoked-node
 unset GEN_CERTS_OUT_DIR
 ```
 
-Expected: `init` prints `testdata/tls/ca.key already exists, reusing it`; `node revoked-node ...` writes `testdata/tls/revoked-node.crt`/`.key`; `revoke revoked-node` writes a populated `testdata/tls/crl.pem`.
+(`rm -f testdata/tls/ca.crt` first is a defensive, purely cosmetic step: `init`'s else-branch always runs `openssl req -x509 ... -out "$OUT_DIR/ca.crt"` when `ca.key` is missing, which overwrites `ca.crt` unconditionally regardless of whether it pre-exists — removing it first just makes that overwrite explicit rather than implicit.)
+
+Expected: `init` generates a fresh `ca.crt`/`ca.key` and `ca-db/` (no "already exists, reusing it" message, since there is no pre-existing key); `node fixture-node ...` and `client fixture-client ...` overwrite the existing `.crt`/`.key` pairs with new ones signed by the new CA; `node revoked-node ...` writes `testdata/tls/revoked-node.crt`/`.key`; `revoke revoked-node` writes a populated `testdata/tls/crl.pem`.
 
 - [ ] **Step 2: Verify the new fixtures are internally consistent**
 
@@ -303,15 +314,34 @@ Run:
 ```bash
 openssl verify -crl_check -CAfile <(cat testdata/tls/ca.crt testdata/tls/crl.pem) testdata/tls/revoked-node.crt
 openssl verify -crl_check -CAfile <(cat testdata/tls/ca.crt testdata/tls/crl.pem) testdata/tls/fixture-node.crt
+openssl verify -crl_check -CAfile <(cat testdata/tls/ca.crt testdata/tls/crl.pem) testdata/tls/fixture-client.crt
+openssl verify -CAfile testdata/tls/ca.crt testdata/tls/wrong-ca-node.crt
+openssl x509 -in testdata/tls/fixture-node.crt -noout -ext subjectAltName,extendedKeyUsage
 ```
 
-Expected: the first command prints `error 23 at 0 depth lookup: certificate revoked` and `verification failed` for `revoked-node.crt`; the second prints `testdata/tls/fixture-node.crt: OK`.
+Expected: `revoked-node.crt` fails with `error 23 at 0 depth lookup: certificate revoked`; `fixture-node.crt` and `fixture-client.crt` both print `: OK`; `wrong-ca-node.crt` fails (it must NOT verify against the regenerated CA — confirming it is still signed by its own separate, unrelated CA, unaffected by this task); the SAN/EKU dump shows `IP Address:127.0.0.1` and both EKUs, matching the pre-existing fixture exactly.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 3: Run the workspace's existing test suite to confirm nothing broke**
+
+Run: `cargo test --workspace`
+Expected: all pre-existing tests still pass (they load whatever is currently in `testdata/tls/fixture-node.crt`/`fixture-client.crt`/`ca.crt`/`wrong-ca-node.crt` at test time and perform real TLS handshakes — they do not hardcode serials or key material, so a regenerated-but-still-internally-consistent CA and fixture pair keeps them green).
+
+- [ ] **Step 4: Commit, deliberately excluding the CA private key**
+
+`testdata/tls/ca.key` is not `.gitignore`d (check `.gitignore` — it only excludes `/target`, `/.superpowers`, `/Cargo.lock`, `/certs`), so a broad `git add testdata/tls/` would stage it as a new untracked file. The pre-existing repository state never committed a CA private key (`git ls-files testdata/tls/` lists `ca.crt` but no `ca.key`), and this task preserves that convention. Stage explicitly, by name, everything except `ca.key`:
 
 ```bash
-git add testdata/tls/
-git commit -m "testdata/tls: add ca-db, crl.pem, and a revoked-node fixture identity"
+git add testdata/tls/ca.crt testdata/tls/ca-db/ testdata/tls/crl.pem \
+    testdata/tls/fixture-node.crt testdata/tls/fixture-node.key \
+    testdata/tls/fixture-client.crt testdata/tls/fixture-client.key \
+    testdata/tls/revoked-node.crt testdata/tls/revoked-node.key
+git status
+```
+
+Confirm `git status` now shows `testdata/tls/ca.key` still untracked (not staged) before committing:
+
+```bash
+git commit -m "testdata/tls: regenerate CA + fixture-node/fixture-client, add ca-db, crl.pem, and a revoked-node fixture identity"
 ```
 
 ---
