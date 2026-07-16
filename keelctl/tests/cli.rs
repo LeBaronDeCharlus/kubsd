@@ -89,8 +89,10 @@ fn start_test_agentd_tcp(name: &str) -> String {
 fn start_test_control_plane_with_node(node_id: &str, node_addr: &str) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let (_worker_handle, commands) =
-        keel_controlplane::worker::spawn(keel_controlplane::Registry::new(), keel_controlplane::Placements::new());
+    let (_worker_handle, commands) = keel_controlplane::worker::spawn(
+        keel_controlplane::Registry::new("10.0.0.0/16".parse().unwrap()),
+        keel_controlplane::Placements::new(),
+    );
 
     let (reg_tx, reg_rx) = std::sync::mpsc::channel();
     commands
@@ -102,7 +104,7 @@ fn start_test_control_plane_with_node(node_id: &str, node_addr: &str) -> String 
             reg_tx,
         ))
         .unwrap();
-    reg_rx.recv().unwrap();
+    reg_rx.recv().unwrap().unwrap();
 
     let reloading_tls = keel_controlplane::tls::ReloadingTls::spawn(
         fixture("fixture-node.crt"),

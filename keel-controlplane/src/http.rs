@@ -1,5 +1,5 @@
 use crate::tls;
-use crate::wire::{ErrorBody, Heartbeat, NodeRegistration};
+use crate::wire::{ErrorBody, Heartbeat, NodeRegistration, RegisterResponse};
 use crate::worker::{Command, ScheduleOrResolveError};
 use rustls::{ServerConnection, StreamOwned};
 use std::io::{self, Read, Write};
@@ -265,7 +265,8 @@ fn handle_register(body: &[u8], commands: &Sender<Command>) -> (u16, Vec<u8>) {
         return error_response(500, "control plane worker is not running".to_string());
     }
     match reply_rx.recv() {
-        Ok(()) => (200, Vec::new()),
+        Ok(Ok(pod_cidr)) => yaml_response(200, &RegisterResponse { pod_cidr: pod_cidr.to_string() }),
+        Ok(Err(e)) => error_response(409, e.to_string()),
         Err(_) => error_response(500, "control plane worker did not respond".to_string()),
     }
 }
@@ -416,7 +417,7 @@ mod tests {
     fn start_test_server() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let (_worker_handle, commands) = worker::spawn(Registry::new(), Placements::new());
+        let (_worker_handle, commands) = worker::spawn(Registry::new("10.0.0.0/16".parse().unwrap()), Placements::new());
         let reloading_tls = tls::ReloadingTls::spawn(
             fixture("fixture-node.crt"),
             fixture("fixture-node.key"),
@@ -974,7 +975,7 @@ mod tests {
         )
         .unwrap();
 
-        let (_worker_handle, commands) = worker::spawn(Registry::new(), Placements::new());
+        let (_worker_handle, commands) = worker::spawn(Registry::new("10.0.0.0/16".parse().unwrap()), Placements::new());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         thread::spawn(move || run(listener, commands, reloading));
@@ -1016,7 +1017,7 @@ mod tests {
         )
         .unwrap();
 
-        let (_worker_handle, commands) = worker::spawn(Registry::new(), Placements::new());
+        let (_worker_handle, commands) = worker::spawn(Registry::new("10.0.0.0/16".parse().unwrap()), Placements::new());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         thread::spawn(move || run(listener, commands, reloading));

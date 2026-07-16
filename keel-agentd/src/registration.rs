@@ -139,7 +139,8 @@ mod tests {
     fn start_test_control_plane() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let (_worker_handle, commands) = worker::spawn(Registry::new(), Placements::new());
+        let (_worker_handle, commands) =
+            worker::spawn(Registry::new("10.0.0.0/16".parse().unwrap()), Placements::new());
         let reloading_tls = keel_controlplane::tls::ReloadingTls::spawn(
             fixture("fixture-node.crt"),
             fixture("fixture-node.key"),

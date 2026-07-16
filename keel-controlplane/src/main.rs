@@ -70,7 +70,8 @@ fn main() {
 
     eprintln!("keel-controlplane: starting (addr={})", config.addr);
 
-    let (_worker_handle, commands) = worker::spawn(Registry::new(), Placements::new());
+    let (_worker_handle, commands) =
+        worker::spawn(Registry::new("10.0.0.0/16".parse().unwrap()), Placements::new());
 
     let listener = TcpListener::bind(&config.addr).expect("failed to bind TCP listener");
     keel_controlplane::http::run(listener, commands, reloading_tls);
