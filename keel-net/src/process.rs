@@ -66,7 +66,14 @@ impl NetManager for ProcessNetManager {
         }
 
         let gateway = crate::bridge_gateway(address);
-        Self::run_checked("ifconfig", &[bridge, "inet", &gateway])?;
+        let gateway_set = Self::run("ifconfig", &[bridge, "inet", &gateway])?;
+        if !gateway_set.status.success() && !Self::stderr_contains(&gateway_set, "File exists") {
+            return Err(NetError::CommandFailed(
+                format!("ifconfig {bridge} inet {gateway}"),
+                gateway_set.status,
+                String::from_utf8_lossy(&gateway_set.stderr).into_owned(),
+            ));
+        }
 
         let epair_a = format!("{epair_base}a");
         let epair_b = format!("{epair_base}b");
@@ -109,7 +116,16 @@ impl NetManager for ProcessNetManager {
         Self::run_checked("jexec", &[jail_name, "/sbin/ifconfig", &epair_b, "up"])?;
 
         let gateway_ip = gateway.split('/').next().expect("gateway string always contains '/'");
-        Self::run_checked("jexec", &[jail_name, "/sbin/route", "add", "default", gateway_ip])
+        let route_add = Self::run("jexec", &[jail_name, "/sbin/route", "add", "default", gateway_ip])?;
+        if route_add.status.success() || Self::stderr_contains(&route_add, "already in table") {
+            Ok(())
+        } else {
+            Err(NetError::CommandFailed(
+                format!("jexec {jail_name} /sbin/route add default {gateway_ip}"),
+                route_add.status,
+                String::from_utf8_lossy(&route_add.stderr).into_owned(),
+            ))
+        }
     }
 
     fn detach_jail(&self, epair_base: &str) -> Result<(), NetError> {
