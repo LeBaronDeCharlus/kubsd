@@ -17,6 +17,7 @@ pub fn spawn(
     capacity_memory: u64,
     reloading_tls: Arc<tls::ReloadingTls>,
     commands: Sender<crate::worker::Command>,
+    pod_cidr_slot: crate::PodCidrSlot,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut registered = false;
@@ -24,7 +25,10 @@ pub fn spawn(
             let client_config = reloading_tls.client_config();
             if !registered {
                 match register_once(&control_plane_addr, &node_id, &advertise_addr, capacity_cpu, capacity_memory, &client_config) {
-                    Ok(()) => registered = true,
+                    Ok(pod_cidr) => {
+                        pod_cidr_slot.set(pod_cidr);
+                        registered = true;
+                    }
                     Err(e) => eprintln!("keel-agentd: registration failed: {e}"),
                 }
             } else {
@@ -48,11 +52,17 @@ fn register_once(
     capacity_cpu: f64,
     capacity_memory: u64,
     client_config: &Arc<rustls::ClientConfig>,
-) -> Result<(), String> {
+) -> Result<ipnet::Ipv4Net, String> {
     let body = format!(
         "id: {node_id}\naddr: {advertise_addr}\ncapacity_cpu: {capacity_cpu}\ncapacity_memory: {capacity_memory}\n"
     );
-    send_request(control_plane_addr, "POST", "/nodes/register", &body, client_config)
+    let response_body = send_request(control_plane_addr, "POST", "/nodes/register", &body, client_config)?;
+    let response: keel_controlplane::wire::RegisterResponse = serde_yaml::from_slice(&response_body)
+        .map_err(|e| format!("malformed registration response: {e}"))?;
+    response
+        .pod_cidr
+        .parse()
+        .map_err(|e| format!("control plane returned invalid pod_cidr '{}': {e}", response.pod_cidr))
 }
 
 fn heartbeat_once(
@@ -67,10 +77,11 @@ fn heartbeat_once(
         .map_err(|_| "worker is not running".to_string())?;
     let (committed_cpu, committed_memory) = rx.recv().map_err(|_| "worker did not respond".to_string())?;
     let body = format!("committed_cpu: {committed_cpu}\ncommitted_memory: {committed_memory}\n");
-    send_request(control_plane_addr, "POST", &format!("/nodes/{node_id}/heartbeat"), &body, client_config)
+    send_request(control_plane_addr, "POST", &format!("/nodes/{node_id}/heartbeat"), &body, client_config)?;
+    Ok(())
 }
 
-fn send_request(addr: &str, method: &str, path: &str, body: &str, client_config: &Arc<rustls::ClientConfig>) -> Result<(), String> {
+fn send_request(addr: &str, method: &str, path: &str, body: &str, client_config: &Arc<rustls::ClientConfig>) -> Result<Vec<u8>, String> {
     let server_name = tls::server_name_from_addr(addr)?;
     let tcp_stream = TcpStream::connect(addr).map_err(|e| format!("failed to connect to {addr}: {e}"))?;
     let conn = rustls::ClientConnection::new(Arc::clone(client_config), server_name).map_err(|e| e.to_string())?;
@@ -117,7 +128,7 @@ fn send_request(addr: &str, method: &str, path: &str, body: &str, client_config:
         return Err(format!("truncated response: expected {content_length} bytes, got {actual}"));
     }
     if (200..300).contains(&status) {
-        Ok(())
+        Ok(response[header_len..].to_vec())
     } else {
         Err(format!("control plane returned status {status}"))
     }
@@ -283,6 +294,7 @@ mod tests {
             8 * 1024 * 1024 * 1024,
             node_reloading_tls(),
             commands,
+            crate::PodCidrSlot::new(),
         );
 
         thread::sleep(Duration::from_millis(200));
@@ -341,6 +353,7 @@ mod tests {
             8 * 1024 * 1024 * 1024,
             node_reloading_tls(),
             commands,
+            crate::PodCidrSlot::new(),
         );
 
         thread::sleep(Duration::from_millis(200));
@@ -388,11 +401,42 @@ mod tests {
             8 * 1024 * 1024 * 1024,
             wrong_ca_reloading_tls(),
             commands,
+            crate::PodCidrSlot::new(),
         );
 
         thread::sleep(Duration::from_millis(200));
         let body = get_nodes(&control_plane_addr);
         assert!(!body.contains("node-1"), "expected node-1 to never register with a wrong-CA certificate, got: {body}");
+    }
+
+    #[test]
+    fn a_successful_registration_stores_the_returned_pod_cidr_in_the_slot() {
+        let control_plane_addr = start_test_control_plane();
+        let (_worker_handle, commands) = crate::worker::spawn(
+            crate::Reconciler::new(
+                keel_jail::FakeJailRuntime::new(),
+                keel_zfs::FakeZfsManager::new(),
+                keel_net::FakeNetManager::new(),
+                "zroot".to_string(),
+                std::env::temp_dir().join("keel-agentd-registration-test-a_successful_registration_stores_the_returned_pod_cidr_in_the_slot"),
+            )
+            .unwrap(),
+        );
+        let pod_cidr_slot = crate::PodCidrSlot::new();
+        let _handle = spawn(
+            "node-1".to_string(),
+            "10.0.0.1".to_string(),
+            control_plane_addr,
+            Duration::from_millis(50),
+            4.0,
+            8 * 1024 * 1024 * 1024,
+            node_reloading_tls(),
+            commands,
+            pod_cidr_slot.clone(),
+        );
+
+        thread::sleep(Duration::from_millis(200));
+        assert!(pod_cidr_slot.get().is_some(), "expected the registration loop to have stored a pod_cidr by now");
     }
 
     fn start_fake_control_plane_with_revoked_cert() -> String {
