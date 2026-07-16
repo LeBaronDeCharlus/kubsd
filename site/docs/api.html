@@ -36,6 +36,14 @@
     </div>
   </section>
 
+  <section id="authentication">
+    <div class="container">
+      <h2>Authentication</h2>
+      <p>Every endpoint reachable over TCP, both of <code>keel-controlplane</code>'s routes below and <code>keel-agentd</code>'s optional TCP listener, requires mutual TLS: the caller must present a certificate signed by the cluster's private CA, and that certificate is checked in real time against a certificate revocation list (CRL). A connection presenting no certificate, a certificate from a different CA, or a revoked certificate fails the TLS handshake itself, before any HTTP request is parsed or any route below ever runs. <code>keel-agentd</code>'s Unix socket is unaffected by any of this: no TLS, no certificate check, gated only by its <code>0600</code> filesystem permission.</p>
+      <p><code>keel-controlplane</code> (unconditionally) and <code>keel-agentd</code> (whenever its control-plane flags are set) each require four flags to serve this API: <code>--tls-ca-file</code>, <code>--tls-cert-file</code>, <code>--tls-key-file</code>, and <code>--tls-crl-file</code>. Certificates are issued once per identity by an operator via <code>scripts/gen-certs.sh</code>; see the <a href="cli.html#certificates">CLI reference</a> for the exact commands. Revoking a certificate, or rotating one to a fresh keypair, takes effect on an already-running <code>keel-controlplane</code>/<code>keel-agentd</code> within 30 seconds, with no restart, since both reload their certificate/key/CA/CRL files from disk on a background timer.</p>
+    </div>
+  </section>
+
   <section id="agentd">
     <div class="container">
       <h2>keel-agentd (Unix socket)</h2>

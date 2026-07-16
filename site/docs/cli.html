@@ -45,9 +45,26 @@
           <tr><td><code>--socket PATH</code></td><td><code>/var/run/keel-agentd.sock</code></td><td>Path to the keel-agentd Unix socket to talk to. Ignored if <code>--control-plane-addr</code> is given.</td></tr>
           <tr><td><code>--control-plane-addr ADDR</code></td><td>none</td><td>Address of a keel-controlplane to route through instead of a local socket. Alone, the control plane schedules the request onto whichever alive node has the most CPU/memory headroom; combined with <code>--node</code>, it routes to that exact node instead.</td></tr>
           <tr><td><code>--node ID</code></td><td>none</td><td>Pins the request to a specific node's keel-agentd instead of letting the control plane schedule it. Requires <code>--control-plane-addr</code>.</td></tr>
+          <tr><td><code>--tls-ca-file PATH</code></td><td>none</td><td>The cluster's private CA certificate. Required, together with the other three <code>--tls-*-file</code> flags below, whenever <code>--control-plane-addr</code> is given.</td></tr>
+          <tr><td><code>--tls-cert-file PATH</code></td><td>none</td><td>This caller's own certificate, signed by the cluster CA (one per human operator, issued by <code>scripts/gen-certs.sh client &lt;name&gt;</code>; see <a href="#certificates">Certificates</a> below).</td></tr>
+          <tr><td><code>--tls-key-file PATH</code></td><td>none</td><td>The private key matching <code>--tls-cert-file</code>.</td></tr>
+          <tr><td><code>--tls-crl-file PATH</code></td><td>none</td><td>The cluster's certificate revocation list. Checked on every connection in both directions; a revoked certificate, either the caller's own or the control plane's, fails the TLS handshake.</td></tr>
         </tbody>
       </table>
       <p>Giving <code>--node</code> without <code>--control-plane-addr</code> is a usage error. Giving <code>--control-plane-addr</code> alone is valid: it schedules automatically. Giving neither preserves keelctl's original behavior exactly: talk directly to <code>--socket</code> (or its default).</p>
+      <p>Giving <code>--control-plane-addr</code> without all four <code>--tls-*-file</code> flags is also a usage error, and fails locally before keelctl ever reaches the network. Every control-plane-routed connection is mutual TLS: keelctl proves its own identity with <code>--tls-cert-file</code>/<code>--tls-key-file</code>, and verifies the control plane's certificate against <code>--tls-ca-file</code> and <code>--tls-crl-file</code>, the same way the control plane verifies keelctl's.</p>
+    </div>
+  </section>
+
+  <section id="certificates">
+    <div class="container">
+      <h2>Certificates</h2>
+      <p>Control-plane-routed mode never involves keelctl generating or handling key material on its own: an operator generates a private CA once, then issues one client certificate per human operator and one dual-use certificate per node or control-plane instance, using <code>scripts/gen-certs.sh</code>.</p>
+      <pre>./scripts/gen-certs.sh init                # generate the CA once
+./scripts/gen-certs.sh client alice        # issue alice's own operator certificate
+./scripts/gen-certs.sh revoke alice        # eject a compromised identity, refreshes crl.pem
+./scripts/gen-certs.sh crl                 # refresh crl.pem with no status change</pre>
+      <p>Reissuing an existing name (<code>client alice</code> again) rotates it: the new certificate is issued first, and only once that succeeds is the previous certificate revoked and <code>crl.pem</code> regenerated, so a failed reissue never strands an identity with zero valid certificates. <code>keel-controlplane</code> and <code>keel-agentd</code> both reload their certificate, key, CA, and CRL files from disk on a background timer (every 30 seconds), so a rotated certificate or a refreshed CRL takes effect without restarting either daemon; a <code>keelctl</code> invocation, being a single short-lived process, always reads the current files fresh on every run.</p>
     </div>
   </section>
 
