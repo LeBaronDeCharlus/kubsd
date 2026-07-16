@@ -148,8 +148,15 @@ fn reconcile_routes(
     }
 
     for (pod_cidr, gateway_addr) in to_add {
+        // `gateway_addr` comes from a peer's `NodeStatus.addr`, which is a
+        // `host:port` TCP bind address (see `tls::server_name_from_addr`,
+        // which has to do the same stripping before using it as a TLS
+        // `ServerName`), not a bare IP. `route(8)` only accepts a bare IP as
+        // a gateway, so it must be stripped here before it reaches
+        // `NetManager::add_route`.
+        let gateway = gateway_addr.rsplit_once(':').map(|(host, _port)| host).unwrap_or(&gateway_addr).to_string();
         let (tx, rx) = std::sync::mpsc::channel();
-        if commands.send(crate::worker::Command::AddRoute(pod_cidr.clone(), gateway_addr.clone(), tx)).is_err() {
+        if commands.send(crate::worker::Command::AddRoute(pod_cidr.clone(), gateway.clone(), tx)).is_err() {
             return;
         }
         match rx.recv() {
@@ -158,7 +165,7 @@ fn reconcile_routes(
                     installed_routes.insert(peer.id.clone(), pod_cidr);
                 }
             }
-            Ok(Err(e)) => eprintln!("keel-agentd: failed to add route for {pod_cidr} via {gateway_addr}: {e}"),
+            Ok(Err(e)) => eprintln!("keel-agentd: failed to add route for {pod_cidr} via {gateway}: {e}"),
             Err(_) => eprintln!("keel-agentd: reconciler worker did not respond to AddRoute"),
         }
     }
@@ -617,7 +624,11 @@ mod tests {
             &control_plane_addr,
             "POST",
             "/nodes/register",
-            "id: node-2\naddr: 10.0.0.2\ncapacity_cpu: 4\ncapacity_memory: 8589934592\n",
+            // A realistic peer `addr` is a `host:port` TCP bind address (as
+            // produced by `--advertise-addr` since Milestone 8), not a bare
+            // IP -- the gateway installed in the route table must still end
+            // up as the bare host.
+            "id: node-2\naddr: 10.0.0.2:7621\ncapacity_cpu: 4\ncapacity_memory: 8589934592\n",
             &client_config,
         )
         .unwrap();
@@ -636,7 +647,7 @@ mod tests {
         let pod_cidr_slot = crate::PodCidrSlot::new();
         let _handle = spawn(
             "node-1".to_string(),
-            "10.0.0.1".to_string(),
+            "10.0.0.1:7621".to_string(),
             control_plane_addr,
             Duration::from_millis(50),
             4.0,
@@ -652,7 +663,77 @@ mod tests {
         assert_eq!(
             net.has_route("10.0.22.0/24"),
             Some("10.0.0.2".to_string()),
-            "expected node-1 to have installed a route to node-2's pod_cidr via its advertised address"
+            "expected node-1 to have installed a route to node-2's pod_cidr via its advertised address, with the port stripped from the gateway"
+        );
+    }
+
+    #[test]
+    fn route_reconciliation_withdraws_a_route_once_the_peer_is_reported_dead() {
+        // This test intentionally waits out the control plane's real
+        // DEAD_THRESHOLD (hardcoded to 15s in
+        // `keel_controlplane::registry::Registry`). There is no clock
+        // injection available through the public HTTP/worker API used by
+        // this integration-style test (the worker command loop calls
+        // `Instant::now()` directly), so there's no way to fast-forward the
+        // control plane's notion of "how long ago did this peer last
+        // heartbeat" from outside the process without changing that
+        // contract. A real wait is the only way to exercise the full
+        // registration-loop -> reconcile_routes -> worker channel path for
+        // route withdrawal (as opposed to `diff_routes`'s own pure-function
+        // unit tests above, which only exercise hand-built `HashMap`s).
+        let control_plane_addr = start_test_control_plane();
+
+        let client_config = node_client_config();
+        send_request(
+            &control_plane_addr,
+            "POST",
+            "/nodes/register",
+            "id: node-2\naddr: 10.0.0.2:7621\ncapacity_cpu: 4\ncapacity_memory: 8589934592\n",
+            &client_config,
+        )
+        .unwrap();
+
+        let net = keel_net::FakeNetManager::new();
+        let (_worker_handle, commands) = crate::worker::spawn(
+            crate::Reconciler::new(
+                keel_jail::FakeJailRuntime::new(),
+                keel_zfs::FakeZfsManager::new(),
+                net.clone(),
+                "zroot".to_string(),
+                std::env::temp_dir().join("keel-agentd-registration-test-route_reconciliation_withdraws_a_route_once_the_peer_is_reported_dead"),
+            )
+            .unwrap(),
+        );
+        let pod_cidr_slot = crate::PodCidrSlot::new();
+        let _handle = spawn(
+            "node-1".to_string(),
+            "10.0.0.1:7621".to_string(),
+            control_plane_addr,
+            Duration::from_millis(500),
+            4.0,
+            8 * 1024 * 1024 * 1024,
+            node_reloading_tls(),
+            commands,
+            pod_cidr_slot,
+        );
+
+        thread::sleep(Duration::from_millis(700));
+        assert_eq!(
+            net.has_route("10.0.22.0/24"),
+            Some("10.0.0.2".to_string()),
+            "expected node-1 to have installed a route to node-2's pod_cidr before node-2 goes dead"
+        );
+
+        // node-2 never heartbeats again after the single registration above,
+        // so once DEAD_THRESHOLD elapses the control plane will report it as
+        // Dead in `GET /nodes`, and node-1's registration loop should
+        // withdraw the route on its next tick.
+        thread::sleep(Duration::from_secs(15));
+
+        assert_eq!(
+            net.has_route("10.0.22.0/24"),
+            None,
+            "expected node-1 to have withdrawn the route once node-2 was reported dead"
         );
     }
 }
