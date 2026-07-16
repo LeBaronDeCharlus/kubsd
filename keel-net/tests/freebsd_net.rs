@@ -11,6 +11,10 @@ fn destroy_interface_if_exists(name: &str) {
     let _ = Command::new("ifconfig").args([name, "destroy"]).output();
 }
 
+fn destroy_route_if_exists(subnet: &str) {
+    let _ = Command::new("route").args(["delete", "-net", subnet]).output();
+}
+
 fn make_test_jail(name: &str) -> ProcessJailRuntime {
     let jails = ProcessJailRuntime::new();
     let _ = jails.destroy(name);
@@ -158,4 +162,34 @@ fn detach_before_destroy_works_while_jail_is_still_running() {
 
     jails.destroy(jail_name).expect("destroy after detach should still succeed");
     destroy_interface_if_exists(bridge);
+}
+
+#[test]
+fn add_route_then_remove_route_round_trips_through_the_kernel_table() {
+    let net = ProcessNetManager::new();
+    let subnet = "10.99.9.0/24";
+    destroy_route_if_exists(subnet);
+
+    net.add_route(subnet, "127.0.0.1").expect("add_route should succeed");
+    let check = Command::new("netstat").args(["-rn", "-f", "inet"]).output().expect("netstat should run");
+    let table = String::from_utf8_lossy(&check.stdout);
+    assert!(table.contains("10.99.9"), "expected the route to appear in the kernel table: {table}");
+
+    net.remove_route(subnet).expect("remove_route should succeed");
+    let check = Command::new("netstat").args(["-rn", "-f", "inet"]).output().expect("netstat should run");
+    let table = String::from_utf8_lossy(&check.stdout);
+    assert!(!table.contains("10.99.9"), "expected the route to be gone from the kernel table: {table}");
+}
+
+#[test]
+fn add_route_and_remove_route_are_idempotent_against_the_real_kernel() {
+    let net = ProcessNetManager::new();
+    let subnet = "10.99.10.0/24";
+    destroy_route_if_exists(subnet);
+
+    net.add_route(subnet, "127.0.0.1").expect("first add_route should succeed");
+    net.add_route(subnet, "127.0.0.1").expect("second add_route should tolerate the duplicate");
+
+    net.remove_route(subnet).expect("first remove_route should succeed");
+    net.remove_route(subnet).expect("second remove_route should tolerate the missing route");
 }

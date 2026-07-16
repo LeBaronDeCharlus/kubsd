@@ -33,4 +33,13 @@ pub trait NetManager {
     /// before jail destroy, not after: jail destroy does not clean up an
     /// epair moved into it, it orphans it back to the host.
     fn detach_jail(&self, epair_base: &str) -> Result<(), NetError>;
+
+    /// Adds a route to `subnet` via `gateway_addr` to the host's kernel
+    /// routing table. Idempotent: adding a route that already exists in
+    /// the table with the same gateway is a no-op success, not an error.
+    fn add_route(&self, subnet: &str, gateway_addr: &str) -> Result<(), NetError>;
+
+    /// Removes the route to `subnet` from the host's kernel routing table.
+    /// Idempotent: removing a route that isn't present is a no-op success.
+    fn remove_route(&self, subnet: &str) -> Result<(), NetError>;
 }

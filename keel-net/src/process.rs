@@ -119,4 +119,30 @@ impl NetManager for ProcessNetManager {
             ))
         }
     }
+
+    fn add_route(&self, subnet: &str, gateway_addr: &str) -> Result<(), NetError> {
+        let output = Self::run("route", &["add", "-net", subnet, gateway_addr])?;
+        if output.status.success() || Self::stderr_contains(&output, "File exists") {
+            Ok(())
+        } else {
+            Err(NetError::CommandFailed(
+                format!("route add -net {subnet} {gateway_addr}"),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ))
+        }
+    }
+
+    fn remove_route(&self, subnet: &str) -> Result<(), NetError> {
+        let output = Self::run("route", &["delete", "-net", subnet])?;
+        if output.status.success() || Self::stderr_contains(&output, "not in table") {
+            Ok(())
+        } else {
+            Err(NetError::CommandFailed(
+                format!("route delete -net {subnet}"),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ))
+        }
+    }
 }

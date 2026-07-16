@@ -7,11 +7,16 @@ use std::sync::Mutex;
 pub struct FakeNetManager {
     bridges: Mutex<HashSet<String>>,
     attachments: Mutex<HashMap<String, (String, String, String)>>,
+    routes: Mutex<HashMap<String, String>>,
 }
 
 impl FakeNetManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn has_route(&self, subnet: &str) -> Option<String> {
+        self.routes.lock().unwrap().get(subnet).cloned()
     }
 }
 
@@ -34,6 +39,16 @@ impl NetManager for FakeNetManager {
 
     fn detach_jail(&self, epair_base: &str) -> Result<(), NetError> {
         self.attachments.lock().unwrap().remove(epair_base);
+        Ok(())
+    }
+
+    fn add_route(&self, subnet: &str, gateway_addr: &str) -> Result<(), NetError> {
+        self.routes.lock().unwrap().insert(subnet.to_string(), gateway_addr.to_string());
+        Ok(())
+    }
+
+    fn remove_route(&self, subnet: &str) -> Result<(), NetError> {
+        self.routes.lock().unwrap().remove(subnet);
         Ok(())
     }
 }
@@ -86,5 +101,35 @@ mod tests {
         net.ensure_bridge_exists("keel0").unwrap();
         net.attach_jail("web-1", "keel0", "epair7", "10.0.0.5/24").unwrap();
         net.attach_jail("web-1", "keel0", "epair7", "10.0.0.5/24").unwrap();
+    }
+
+    #[test]
+    fn add_route_then_has_route_reflects_it() {
+        let net = FakeNetManager::new();
+        assert_eq!(net.has_route("10.0.4.0/24"), None);
+        net.add_route("10.0.4.0/24", "192.168.64.5").unwrap();
+        assert_eq!(net.has_route("10.0.4.0/24"), Some("192.168.64.5".to_string()));
+    }
+
+    #[test]
+    fn add_route_is_idempotent() {
+        let net = FakeNetManager::new();
+        net.add_route("10.0.4.0/24", "192.168.64.5").unwrap();
+        net.add_route("10.0.4.0/24", "192.168.64.5").unwrap();
+        assert_eq!(net.has_route("10.0.4.0/24"), Some("192.168.64.5".to_string()));
+    }
+
+    #[test]
+    fn remove_route_on_a_never_added_subnet_is_a_no_op_success() {
+        let net = FakeNetManager::new();
+        net.remove_route("10.0.9.0/24").unwrap();
+    }
+
+    #[test]
+    fn add_then_remove_route_clears_it() {
+        let net = FakeNetManager::new();
+        net.add_route("10.0.4.0/24", "192.168.64.5").unwrap();
+        net.remove_route("10.0.4.0/24").unwrap();
+        assert_eq!(net.has_route("10.0.4.0/24"), None);
     }
 }
