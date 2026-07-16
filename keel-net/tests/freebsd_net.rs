@@ -22,6 +22,7 @@ fn make_test_jail(name: &str) -> ProcessJailRuntime {
     let bin_dir = rootfs.join("sbin");
     std::fs::create_dir_all(&bin_dir).unwrap();
     std::fs::copy("/rescue/ifconfig", bin_dir.join("ifconfig")).expect("copy /rescue/ifconfig into test rootfs");
+    std::fs::copy("/rescue/route", bin_dir.join("route")).expect("copy /rescue/route into test rootfs");
     jails.create(name, &rootfs, true).expect("create should succeed"); // vnet: true
     jails
 }
@@ -161,6 +162,37 @@ fn detach_before_destroy_works_while_jail_is_still_running() {
     assert_eq!(jails.is_running(jail_name).unwrap(), false, "no command was ever started in this jail");
 
     jails.destroy(jail_name).expect("destroy after detach should still succeed");
+    destroy_interface_if_exists(bridge);
+}
+
+#[test]
+fn attach_jail_assigns_bridge_gateway_and_jail_default_route() {
+    let net = ProcessNetManager::new();
+    let bridge = "keel-test-br5";
+    let jail_name = "keel-net-test-gateway";
+    let epair_base = "epair54";
+
+    destroy_interface_if_exists(&format!("{epair_base}a"));
+    destroy_interface_if_exists(bridge);
+    let jails = make_test_jail(jail_name);
+
+    net.ensure_bridge_exists(bridge).expect("bridge should be created");
+    net.attach_jail(jail_name, bridge, epair_base, "10.99.20.5/24")
+        .expect("attach_jail should succeed");
+
+    let bridge_check = Command::new("ifconfig").arg(bridge).output().expect("ifconfig should run");
+    let bridge_output = String::from_utf8_lossy(&bridge_check.stdout);
+    assert!(bridge_output.contains("10.99.20.1"), "expected bridge gateway address in: {bridge_output}");
+
+    let route_check = Command::new("jexec")
+        .args([jail_name, "/sbin/route", "-n", "get", "default"])
+        .output()
+        .expect("jexec route should run");
+    let route_output = String::from_utf8_lossy(&route_check.stdout);
+    assert!(route_output.contains("10.99.20.1"), "expected default route via bridge gateway in: {route_output}");
+
+    jails.destroy(jail_name).expect("cleanup destroy should succeed");
+    destroy_interface_if_exists(&format!("{epair_base}a"));
     destroy_interface_if_exists(bridge);
 }
 

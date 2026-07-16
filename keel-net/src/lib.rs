@@ -6,6 +6,20 @@ pub use error::NetError;
 pub use fake::FakeNetManager;
 pub use process::ProcessNetManager;
 
+/// Computes the gateway address for a jail's bridge, purely from the
+/// jail's own `address` parameter: the network's first host address
+/// (`network + 1`), with the same prefix length as `address`.
+///
+/// For example, a jail addressed `10.0.60.5/24` gets the gateway
+/// `10.0.60.1/24`.
+pub(crate) fn bridge_gateway(address: &str) -> String {
+    let net: ipnet::Ipv4Net = address
+        .parse()
+        .expect("network.address is validated by keel_spec::validate_address before reaching NetManager");
+    let gateway_ip = std::net::Ipv4Addr::from(u32::from(net.network()) + 1);
+    format!("{gateway_ip}/{}", net.prefix_len())
+}
+
 pub trait NetManager {
     /// Idempotent: creates the bridge if it doesn't already exist and
     /// brings it up. Never destroys a bridge (there is no corresponding

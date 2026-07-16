@@ -65,6 +65,9 @@ impl NetManager for ProcessNetManager {
             return Err(NetError::NotFound(bridge.to_string()));
         }
 
+        let gateway = crate::bridge_gateway(address);
+        Self::run_checked("ifconfig", &[bridge, "inet", &gateway])?;
+
         let epair_a = format!("{epair_base}a");
         let epair_b = format!("{epair_base}b");
 
@@ -103,7 +106,10 @@ impl NetManager for ProcessNetManager {
         }
 
         Self::run_checked("jexec", &[jail_name, "/sbin/ifconfig", &epair_b, "inet", address])?;
-        Self::run_checked("jexec", &[jail_name, "/sbin/ifconfig", &epair_b, "up"])
+        Self::run_checked("jexec", &[jail_name, "/sbin/ifconfig", &epair_b, "up"])?;
+
+        let gateway_ip = gateway.split('/').next().expect("gateway string always contains '/'");
+        Self::run_checked("jexec", &[jail_name, "/sbin/route", "add", "default", gateway_ip])
     }
 
     fn detach_jail(&self, epair_base: &str) -> Result<(), NetError> {

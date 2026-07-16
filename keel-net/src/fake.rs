@@ -7,6 +7,7 @@ use std::sync::Mutex;
 #[derive(Default, Clone)]
 pub struct FakeNetManager {
     bridges: Arc<Mutex<HashSet<String>>>,
+    bridge_addresses: Arc<Mutex<HashMap<String, String>>>,
     attachments: Arc<Mutex<HashMap<String, (String, String, String)>>>,
     routes: Arc<Mutex<HashMap<String, String>>>,
 }
@@ -18,6 +19,10 @@ impl FakeNetManager {
 
     pub fn has_route(&self, subnet: &str) -> Option<String> {
         self.routes.lock().unwrap().get(subnet).cloned()
+    }
+
+    pub fn bridge_address(&self, bridge: &str) -> Option<String> {
+        self.bridge_addresses.lock().unwrap().get(bridge).cloned()
     }
 }
 
@@ -31,6 +36,8 @@ impl NetManager for FakeNetManager {
         if !self.bridges.lock().unwrap().contains(bridge) {
             return Err(NetError::NotFound(bridge.to_string()));
         }
+        let gateway = crate::bridge_gateway(address);
+        self.bridge_addresses.lock().unwrap().insert(bridge.to_string(), gateway);
         self.attachments.lock().unwrap().insert(
             epair_base.to_string(),
             (jail_name.to_string(), bridge.to_string(), address.to_string()),
@@ -132,5 +139,22 @@ mod tests {
         net.add_route("10.0.4.0/24", "192.168.64.5").unwrap();
         net.remove_route("10.0.4.0/24").unwrap();
         assert_eq!(net.has_route("10.0.4.0/24"), None);
+    }
+
+    #[test]
+    fn attach_jail_assigns_the_bridges_gateway_address() {
+        let net = FakeNetManager::new();
+        net.ensure_bridge_exists("keel0").unwrap();
+        net.attach_jail("web-1", "keel0", "epair7", "10.0.60.5/24").unwrap();
+        assert_eq!(net.bridge_address("keel0"), Some("10.0.60.1/24".to_string()));
+    }
+
+    #[test]
+    fn two_jails_in_the_same_subnet_compute_the_same_bridge_gateway() {
+        let net = FakeNetManager::new();
+        net.ensure_bridge_exists("keel0").unwrap();
+        net.attach_jail("web-1", "keel0", "epair7", "10.0.60.5/24").unwrap();
+        net.attach_jail("web-2", "keel0", "epair8", "10.0.60.6/24").unwrap();
+        assert_eq!(net.bridge_address("keel0"), Some("10.0.60.1/24".to_string()));
     }
 }
