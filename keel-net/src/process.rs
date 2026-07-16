@@ -117,7 +117,7 @@ impl NetManager for ProcessNetManager {
 
         let gateway_ip = gateway.split('/').next().expect("gateway string always contains '/'");
         let route_add = Self::run("jexec", &[jail_name, "/sbin/route", "add", "default", gateway_ip])?;
-        if route_add.status.success() || Self::stderr_contains(&route_add, "already in table") {
+        if route_add.status.success() || Self::stderr_contains(&route_add, "File exists") {
             Ok(())
         } else {
             Err(NetError::CommandFailed(
