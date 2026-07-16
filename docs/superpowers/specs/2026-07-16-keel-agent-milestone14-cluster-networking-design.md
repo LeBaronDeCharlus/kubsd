@@ -13,7 +13,8 @@ host-local, with no L2 or L3 connectivity between different nodes' jails.
 A jail on `node-4` cannot reach a jail on `node-5` today, regardless of
 what address either one is given; `keel-net`'s `NetManager` trait
 (`ensure_bridge_exists`/`attach_jail`/`detach_jail`) never leaves the local
-host, and `keel-spec`'s `NetworkSpec.address` is a plain, unvalidated,
+host, and `keel-spec`'s `NetworkSpec.address` is only validated for
+well-formedness (`validate_address` parses it as an `IpNet`), a plain
 user-chosen CIDR string with no cluster-wide coordination behind it. This
 gap has been on record as an explicit non-goal or "not yet designed" item
 since Milestone 7's own design spec, and is the last item in the
@@ -122,13 +123,33 @@ per-process for DoS resistance and would break the one property this
 scheme depends on: the same `node_id` string must hash to the same value
 on every call, across every process, forever). This is the same
 "hand-roll it, no new dependency" idiom this project already uses for
-constant-time comparison (Milestone 11) and HTTP parsing throughout.
+constant-time comparison (Milestone 11) and HTTP parsing throughout --
+`fnv1a` is hand-rolled specifically because no existing crate gives this
+project a process-stable hash, not because this milestone avoids
+dependencies as a blanket rule.
+
+`IpNet` (the `ipnet` crate) is not a new dependency to the workspace: it
+has been a `keel-spec` dependency since that crate's `validate_address`
+started parsing `NetworkSpec.address` CIDR strings with it (Milestone 1).
+`derive_pod_cidr` reuses that same, already-vetted crate in
+`keel-controlplane` rather than hand-rolling CIDR parsing or
+subnet-arithmetic alongside the hand-rolled hash; the apply-time
+containment check below reuses it again via `IpNet::contains`, rather
+than a new hand-rolled range check. `keel-controlplane` and `keel-agentd`
+each add a direct `ipnet` dependency to their own `Cargo.toml` -- an
+ordinary per-crate dependency declaration for a crate this project already
+trusts for exactly this job, not a new crate to the workspace.
 
 ### Registration flow and wire protocol change
 
 `keel-agentd`'s registration request body is unchanged (`id`, `addr`,
 `capacity_cpu`, `capacity_memory`) — the node doesn't choose its own
-subnet, so it has nothing new to report. `Registry`'s handling of
+subnet, so it has nothing new to report. `Registry` gains the operator's
+`--cluster-cidr` value at construction (`Registry::new(cluster_cidr:
+IpNet)`, set once in `keel-controlplane`'s `main.rs` from the parsed CLI
+flag and threaded through `worker::spawn` exactly like `Registry` and
+`Placements` already are), since `derive_pod_cidr` needs it on every
+`Command::Register`, not just once at startup. `Registry`'s handling of
 `Command::Register` (or wherever the worker processes it) now also:
 
 1. Calls `derive_pod_cidr(node_id, cluster_cidr)`.
@@ -174,7 +195,13 @@ that tick's register/heartbeat outcome:
 
 1. On a **successful registration**, the returned `pod_cidr` is stored in
    a small shared slot (readable by the HTTP handler for apply-time
-   validation, described below).
+   validation, described below). `registration.rs`'s `send_request` today
+   discards the response body after checking only the status code
+   (`register_once`/`heartbeat_once` both call it for `Ok(())`-or-error);
+   this milestone extends it to also return the body on success, so
+   `register_once` can parse out `pod_cidr`, the same YAML-body-over-the-
+   same-connection pattern the test-only `get_nodes` helper in this file
+   already exercises.
 2. **Every tick**, fetch `GET /nodes` (a new outbound call, reusing the
    exact same TLS/CRL-checked connection machinery every other outbound
    call in this project already uses) and diff the returned peer list
@@ -195,12 +222,17 @@ that tick's register/heartbeat outcome:
 `handle_apply` (`http.rs`) checks, before any ZFS/jail/network side effect
 is attempted: if this node has a stored `pod_cidr` (i.e., it registered
 successfully at least once), is the incoming `JailSpec.spec.network.address`
-inside it? If not, `400`, naming both the given address and the node's
-actual block, at the same point in the handler where the existing
-`metadata.name` mismatch check already short-circuits. A node with no
-`pod_cidr` (plain single-node mode, or one that has never yet registered
-successfully) skips the check entirely — the same "single-node usage
-completely unaffected" invariant every milestone since 7 has preserved.
+inside it? The check reuses `IpNet::contains`, called with the stored
+`pod_cidr` and the `IpNet` already produced by parsing
+`spec.network.address` (the same parse `keel-spec::validate_address`
+already performs during `parse_and_validate`) — no new hand-rolled
+range/mask arithmetic. If not contained, `400`, naming both the given
+address and the node's actual block, at the same point in the handler
+where the existing `metadata.name` mismatch check already short-circuits.
+A node with no `pod_cidr` (plain single-node mode, or one that has never
+yet registered successfully) skips the check entirely — the same
+"single-node usage completely unaffected" invariant every milestone since
+7 has preserved.
 
 ### CLI flags
 
