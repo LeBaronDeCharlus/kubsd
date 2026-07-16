@@ -60,8 +60,9 @@ drop-in replacement, and today it is far smaller in scope:
 In other words: what exists today spans a **kubelet** plus a thin
 multi-node control plane with a resource-aware scheduler (headroom-based
 placement by CPU/memory, node registry, routing a spec to a node either
-automatically or by name), not a full cluster. There is no cluster
-networking yet; see [Roadmap](#roadmap) below.
+automatically or by name), plus deterministic per-node subnets and kernel
+routing for cross-node jail reachability, not a full cluster. There is no
+service discovery or load balancing yet; see [Roadmap](#roadmap) below.
 
 ## Why you'd use it
 
@@ -660,6 +661,73 @@ untouched throughout both the revocation and rotation tests, kept
 completing scheduled apply/get/delete round trips at every stage. Clean
 teardown (no processes, no jails) confirmed on all three VMs afterward.
 
+### Milestone 14: cross-node overlay networking
+
+Every milestone through 13 built a multi-node control plane without ever
+touching cross-node data-plane networking: each node's `keel0` bridge and
+its jails' `epair(4)` attachments were entirely host-local, with no L2 or
+L3 connectivity between different nodes' jails. This milestone closes that
+gap using plain kernel routing rather than a tunnel protocol (no
+vxlan/gre/WireGuard, no new dependency, no new encapsulation), leaning on
+the same same-LAN trust this project's VM fleet has always run on.
+
+Each node is assigned a distinct, non-overlapping `/24` subnet,
+deterministically derived from its `node-id` and an operator-configured
+`--cluster-cidr` via a hand-rolled FNV-1a hash (Rust's default hasher is
+randomized per-process specifically to resist DoS attacks, which would
+break the one property this scheme needs: the same `node_id` must hash
+identically forever). `keel-controlplane` derives and collision-checks
+each node's subnet at registration time, stores it, and returns it in the
+registration response and every `GET /nodes` entry. `keel-agentd` stores
+its own assigned subnet and, on the same 5-second registration/heartbeat
+tick that already existed, additionally fetches the full peer list and
+reconciles its kernel routing table (`route(8)`) to route directly to
+every `Alive` peer's subnet via that peer's real address — no new
+background thread, no new polling cadence. A `JailSpec` applied with a
+`network.address` outside its own node's assigned subnet is rejected
+before any provisioning is attempted, naming both the given address and
+the node's actual block.
+
+A final whole-branch review caught a genuine cross-cutting bug before any
+VM was touched: `--advertise-addr` has been a `host:port` string since
+Milestone 8, and it was flowing unstripped into the `route(8)` gateway
+argument — which does not accept a port, so on real hardware no peer
+route would ever have installed, silently defeating this milestone's
+entire purpose despite every test passing (every fixture used a bare IP,
+a convention production never generates). Fixed by stripping the port the
+same way `tls.rs`'s `server_name_from_addr` already had to, plus adding
+the regression-guarding fixture and a withdrawal-path integration test
+that had been missing entirely.
+
+Live VM testing then surfaced a second gap invisible to any amount of
+code review: the `keel0` bridge has never been assigned an IP address, in
+any milestone up to now, because same-host jail-to-jail traffic only ever
+needed L2 bridging. Without one, a node has no locally-connected route for
+its own advertised subnet, and its jails have no default route for reply
+traffic to escape their own `/24`. Fixed in `keel-net` alone, using only
+`attach_jail`'s existing parameters: the gateway is derived from the
+jail's own address (network address + 1), idempotently assigned to the
+bridge, and configured as the jail's default route. A review round before
+redeployment caught a real regression in that fix itself — the new
+`ifconfig`/`route` calls didn't tolerate FreeBSD's repeat-operation
+errors the way this same function's sibling steps already do, which would
+have broken the second jail on any node and any jail restart — fixed to
+match the established idempotent-retry pattern.
+
+VM verification (three real nodes, same discipline as every milestone
+since Milestone 2) confirmed the whole chain end-to-end: `node-4` and
+`node-5` derived `10.0.60.0/24` and `10.0.207.0/24` respectively, an exact
+match to values independently computed during planning; restarting
+`node-4` re-derived the byte-identical block; a jail on each node could
+ping the other's jail IP directly with 0% packet loss, the core proof
+this milestone exists to deliver; killing `node-4`'s `keel-agentd` got its
+route withdrawn from `node-5`'s kernel table within one heartbeat-tick
+window with neither daemon ever restarting; and an out-of-subnet address
+was rejected with no jail ever created. `node-2`'s certificate set turned
+out to be stale (pre-dating the CRL infrastructure from Milestones 12-13)
+and was regenerated fresh, the same fix Milestone 13 needed for the same
+reason. Clean teardown confirmed on all three VMs afterward.
+
 ## Roadmap
 
 **Sub-project 1: single-node jail reconciliation daemon (complete)**
@@ -687,9 +755,13 @@ teardown (no processes, no jails) confirmed on all three VMs afterward.
 12. ~~Mutual TLS between client, control plane, and nodes, replacing the shared secret~~ done
 13. ~~Certificate revocation and rotation automation~~ done
 
+**Sub-project 5: cluster networking (in progress)**
+
+14. ~~Cross-node overlay networking: deterministic per-node subnets, kernel routing, apply-time subnet validation~~ done
+
 **Not yet designed** (future sub-projects, each will get its own spec):
 
-- Cluster networking (cross-node overlay, service discovery/load balancing)
+- Service discovery and load balancing (a stable, relocation-proof name for a jail, building on Milestone 14's IP-level reachability)
 - Storage orchestration beyond a single host's ZFS pool
 - bhyve VM workloads alongside jails
 
