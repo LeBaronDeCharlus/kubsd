@@ -1,6 +1,8 @@
 use crate::reconciler::ReconcileError;
 use crate::wire::ErrorBody;
 use crate::worker::Command;
+use crate::PodCidrSlot;
+use ipnet::IpNet;
 use keel_spec::JailSpec;
 use rustls::{ServerConnection, StreamOwned};
 use std::io::{self, Read, Write};
@@ -14,25 +16,32 @@ const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
 type TlsStream = StreamOwned<ServerConnection, TcpStream>;
 
-pub fn run(listener: UnixListener, commands: Sender<Command>) {
+pub fn run(listener: UnixListener, commands: Sender<Command>, pod_cidr_slot: PodCidrSlot) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let commands = commands.clone();
+        let pod_cidr_slot = pod_cidr_slot.clone();
         thread::spawn(move || {
-            let _ = handle_connection(stream, &commands);
+            let _ = handle_connection(stream, &commands, &pod_cidr_slot);
         });
     }
 }
 
-pub fn run_tls(listener: TcpListener, commands: Sender<Command>, reloading_tls: Arc<crate::tls::ReloadingTls>) {
+pub fn run_tls(
+    listener: TcpListener,
+    commands: Sender<Command>,
+    reloading_tls: Arc<crate::tls::ReloadingTls>,
+    pod_cidr_slot: PodCidrSlot,
+) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let commands = commands.clone();
         let tls_config = reloading_tls.server_config();
+        let pod_cidr_slot = pod_cidr_slot.clone();
         thread::spawn(move || {
             let Ok(conn) = ServerConnection::new(tls_config) else { return };
             let mut tls_stream = TlsStream::new(conn, stream);
-            if handle_connection_tls(&mut tls_stream, &commands).is_err() {
+            if handle_connection_tls(&mut tls_stream, &commands, &pod_cidr_slot).is_err() {
                 eprintln!("keel-agentd: TLS handshake or request handling failed for a connection");
             }
         });
@@ -45,21 +54,29 @@ struct ParsedRequest {
     body: Vec<u8>,
 }
 
-fn handle_connection(mut stream: UnixStream, commands: &Sender<Command>) -> io::Result<()> {
+fn handle_connection(
+    mut stream: UnixStream,
+    commands: &Sender<Command>,
+    pod_cidr_slot: &PodCidrSlot,
+) -> io::Result<()> {
     let request = match read_request(&mut stream)? {
         Some(r) => r,
         None => return Ok(()),
     };
-    let (status, body) = route(&request, commands);
+    let (status, body) = route(&request, commands, pod_cidr_slot);
     write_response(&mut stream, status, &body)
 }
 
-fn handle_connection_tls(stream: &mut TlsStream, commands: &Sender<Command>) -> io::Result<()> {
+fn handle_connection_tls(
+    stream: &mut TlsStream,
+    commands: &Sender<Command>,
+    pod_cidr_slot: &PodCidrSlot,
+) -> io::Result<()> {
     let request = match read_request_tls(stream)? {
         Some(r) => r,
         None => return Ok(()),
     };
-    let (status, body) = route(&request, commands);
+    let (status, body) = route(&request, commands, pod_cidr_slot);
     write_response_tls(stream, status, &body)
 }
 
@@ -195,11 +212,11 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-fn route(request: &ParsedRequest, commands: &Sender<Command>) -> (u16, Vec<u8>) {
+fn route(request: &ParsedRequest, commands: &Sender<Command>, pod_cidr_slot: &PodCidrSlot) -> (u16, Vec<u8>) {
     let segments: Vec<&str> =
         request.path.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
     match (request.method.as_str(), segments.as_slice()) {
-        ("PUT", ["jails", name]) => handle_apply(name, &request.body, commands),
+        ("PUT", ["jails", name]) => handle_apply(name, &request.body, commands, pod_cidr_slot),
         ("GET", ["jails"]) => handle_get(None, commands),
         ("GET", ["jails", name]) => handle_get(Some(name.to_string()), commands),
         ("DELETE", ["jails", name]) => handle_delete(name, commands),
@@ -207,7 +224,12 @@ fn route(request: &ParsedRequest, commands: &Sender<Command>) -> (u16, Vec<u8>) 
     }
 }
 
-fn handle_apply(path_name: &str, body: &[u8], commands: &Sender<Command>) -> (u16, Vec<u8>) {
+fn handle_apply(
+    path_name: &str,
+    body: &[u8],
+    commands: &Sender<Command>,
+    pod_cidr_slot: &PodCidrSlot,
+) -> (u16, Vec<u8>) {
     let spec: JailSpec = match serde_yaml::from_slice(body) {
         Ok(s) => s,
         Err(e) => return error_response(400, format!("invalid YAML: {e}")),
@@ -217,6 +239,21 @@ fn handle_apply(path_name: &str, body: &[u8], commands: &Sender<Command>) -> (u1
             400,
             format!("path name '{path_name}' does not match spec.metadata.name '{}'", spec.metadata.name),
         );
+    }
+    if let Some(pod_cidr) = pod_cidr_slot.get() {
+        // A malformed address is left to the existing `validate_address` check
+        // inside `Command::Apply` below, rather than duplicated here.
+        if let Ok(address) = spec.spec.network.address.parse::<IpNet>() {
+            if !IpNet::V4(pod_cidr).contains(&address.addr()) {
+                return error_response(
+                    400,
+                    format!(
+                        "network.address '{}' is outside this node's assigned subnet {pod_cidr}",
+                        spec.spec.network.address
+                    ),
+                );
+            }
+        }
     }
 
     let (reply_tx, reply_rx) = mpsc::channel();
@@ -322,8 +359,29 @@ mod tests {
         let socket_path = short_unique_socket_path();
         let _ = std::fs::remove_file(&socket_path);
         let listener = UnixListener::bind(&socket_path).unwrap();
-        thread::spawn(move || run(listener, commands));
+        thread::spawn(move || run(listener, commands, PodCidrSlot::new()));
         socket_path
+    }
+
+    fn start_test_server_with_pod_cidr(name: &str, pod_cidr: Option<&str>) -> (PathBuf, PodCidrSlot) {
+        let state_dir = std::env::temp_dir().join(format!("keel-agentd-http-test-state-{name}"));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        let zfs = FakeZfsManager::new();
+        zfs.seed_dataset("zroot/keel/base/14.2-web");
+        let reconciler = Reconciler::new(FakeJailRuntime::new(), zfs, FakeNetManager::new(), "zroot".to_string(), state_dir).unwrap();
+        let (_worker_handle, commands) = worker::spawn(reconciler);
+
+        let pod_cidr_slot = PodCidrSlot::new();
+        if let Some(cidr) = pod_cidr {
+            pod_cidr_slot.set(cidr.parse().unwrap());
+        }
+
+        let socket_path = short_unique_socket_path();
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let slot_clone = pod_cidr_slot.clone();
+        thread::spawn(move || run(listener, commands, slot_clone));
+        (socket_path, pod_cidr_slot)
     }
 
     fn send_request(socket_path: &PathBuf, method: &str, path: &str, body: &str) -> (u16, String) {
@@ -442,6 +500,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn put_with_address_inside_the_stored_pod_cidr_is_accepted() {
+        let (socket_path, _slot) = start_test_server_with_pod_cidr("put_with_address_inside_the_stored_pod_cidr_is_accepted", Some("10.0.4.0/24"));
+        let yaml = sample_spec_yaml("web-1").replace("10.0.0.5/24", "10.0.4.5/24");
+        let (status, _) = send_request(&socket_path, "PUT", "/jails/web-1", &yaml);
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn put_with_address_outside_the_stored_pod_cidr_is_rejected_before_any_side_effect() {
+        let (socket_path, _slot) = start_test_server_with_pod_cidr("put_with_address_outside_the_stored_pod_cidr_is_rejected", Some("10.0.4.0/24"));
+        let (status, body) = send_request(&socket_path, "PUT", "/jails/web-1", &sample_spec_yaml("web-1"));
+        assert_eq!(status, 400);
+        assert!(body.contains("10.0.0.5/24"), "expected the given address in the error, got: {body}");
+        assert!(body.contains("10.0.4.0/24"), "expected the node's actual block in the error, got: {body}");
+
+        let (status, _) = send_request(&socket_path, "GET", "/jails/web-1", "");
+        assert_eq!(status, 404, "the rejected apply must never have reached the reconciler");
+    }
+
+    #[test]
+    fn put_with_no_stored_pod_cidr_skips_the_subnet_check() {
+        let (socket_path, _slot) = start_test_server_with_pod_cidr("put_with_no_stored_pod_cidr_skips_the_subnet_check", None);
+        let (status, _) = send_request(&socket_path, "PUT", "/jails/web-1", &sample_spec_yaml("web-1"));
+        assert_eq!(status, 200, "single-node/never-registered mode must skip the subnet check entirely");
+    }
+
     use crate::tls;
 
     fn fixture(name: &str) -> PathBuf {
@@ -473,7 +558,7 @@ mod tests {
             Duration::from_secs(3600),
         )
         .unwrap();
-        thread::spawn(move || run_tls(listener, commands, reloading_tls));
+        thread::spawn(move || run_tls(listener, commands, reloading_tls, PodCidrSlot::new()));
         addr
     }
 
@@ -655,7 +740,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        thread::spawn(move || run_tls(listener, commands, reloading));
+        thread::spawn(move || run_tls(listener, commands, reloading, PodCidrSlot::new()));
 
         let (status, _) = send_request_tcp(&addr, "GET", "/jails", "");
         assert_eq!(status, 200, "expected the initial fixture-node certificate to be served");
@@ -700,7 +785,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        thread::spawn(move || run_tls(listener, commands, reloading));
+        thread::spawn(move || run_tls(listener, commands, reloading, PodCidrSlot::new()));
 
         std::fs::write(&cert_path, "not a certificate").unwrap();
         thread::sleep(Duration::from_millis(200));

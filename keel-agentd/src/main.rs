@@ -98,6 +98,7 @@ fn main() {
     );
 
     let (_worker_handle, commands) = worker::spawn(reconciler);
+    let pod_cidr_slot = keel_agentd::PodCidrSlot::new();
 
     if let (
         Some(node_id),
@@ -138,13 +139,15 @@ fn main() {
             capacity_memory,
             std::sync::Arc::clone(&reloading_tls),
             commands.clone(),
+            pod_cidr_slot.clone(),
         );
 
         eprintln!("keel-agentd: serving jails API over TLS on {advertise_addr}");
         let tcp_listener = TcpListener::bind(&advertise_addr)
             .unwrap_or_else(|e| panic!("failed to bind jails-API TCP listener on {advertise_addr}: {e}"));
         let tcp_commands = commands.clone();
-        thread::spawn(move || keel_agentd::http::run_tls(tcp_listener, tcp_commands, reloading_tls));
+        let tcp_pod_cidr_slot = pod_cidr_slot.clone();
+        thread::spawn(move || keel_agentd::http::run_tls(tcp_listener, tcp_commands, reloading_tls, tcp_pod_cidr_slot));
     }
 
     let timer_commands = commands.clone();
@@ -162,7 +165,7 @@ fn main() {
     std::fs::set_permissions(&config.socket, std::fs::Permissions::from_mode(0o600))
         .expect("failed to set socket permissions");
 
-    keel_agentd::http::run(listener, commands);
+    keel_agentd::http::run(listener, commands, pod_cidr_slot);
 }
 
 #[cfg(test)]
