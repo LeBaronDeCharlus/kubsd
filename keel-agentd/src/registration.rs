@@ -1,10 +1,42 @@
 use crate::tls;
+use keel_controlplane::wire::{NodeState, NodeStatus};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+pub(crate) fn diff_routes(
+    self_id: &str,
+    peers: &[NodeStatus],
+    installed: &HashMap<String, String>,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut to_add = Vec::new();
+    for peer in peers {
+        if peer.id == self_id || peer.status != NodeState::Alive {
+            continue;
+        }
+        if installed.get(&peer.id) != Some(&peer.pod_cidr) {
+            to_add.push((peer.pod_cidr.clone(), peer.addr.clone()));
+        }
+    }
+
+    let alive_ids: std::collections::HashSet<&str> = peers
+        .iter()
+        .filter(|p| p.status == NodeState::Alive && p.id != self_id)
+        .map(|p| p.id.as_str())
+        .collect();
+    let mut to_remove = Vec::new();
+    for (id, pod_cidr) in installed {
+        if !alive_ids.contains(id.as_str()) {
+            to_remove.push(pod_cidr.clone());
+        }
+    }
+
+    (to_add, to_remove)
+}
 
 // each parameter is independently needed by the registration loop; bundling into a struct would be over-engineering for this single call site
 #[allow(clippy::too_many_arguments)]
@@ -21,6 +53,7 @@ pub fn spawn(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut registered = false;
+        let mut installed_routes: HashMap<String, String> = HashMap::new();
         loop {
             let client_config = reloading_tls.client_config();
             if !registered {
@@ -40,6 +73,12 @@ pub fn spawn(
                     }
                 }
             }
+
+            match fetch_nodes(&control_plane_addr, &client_config) {
+                Ok(peers) => reconcile_routes(&node_id, &peers, &mut installed_routes, &commands),
+                Err(e) => eprintln!("keel-agentd: failed to fetch peer list for route reconciliation: {e}"),
+            }
+
             thread::sleep(heartbeat_interval);
         }
     })
@@ -79,6 +118,50 @@ fn heartbeat_once(
     let body = format!("committed_cpu: {committed_cpu}\ncommitted_memory: {committed_memory}\n");
     send_request(control_plane_addr, "POST", &format!("/nodes/{node_id}/heartbeat"), &body, client_config)?;
     Ok(())
+}
+
+fn fetch_nodes(control_plane_addr: &str, client_config: &Arc<rustls::ClientConfig>) -> Result<Vec<NodeStatus>, String> {
+    let body = send_request(control_plane_addr, "GET", "/nodes", "", client_config)?;
+    serde_yaml::from_slice(&body).map_err(|e| format!("malformed /nodes response: {e}"))
+}
+
+fn reconcile_routes(
+    self_id: &str,
+    peers: &[NodeStatus],
+    installed_routes: &mut HashMap<String, String>,
+    commands: &Sender<crate::worker::Command>,
+) {
+    let (to_add, to_remove) = diff_routes(self_id, peers, installed_routes);
+
+    for pod_cidr in to_remove {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if commands.send(crate::worker::Command::RemoveRoute(pod_cidr.clone(), tx)).is_err() {
+            return;
+        }
+        match rx.recv() {
+            Ok(Ok(())) => {
+                installed_routes.retain(|_, v| v != &pod_cidr);
+            }
+            Ok(Err(e)) => eprintln!("keel-agentd: failed to remove route for {pod_cidr}: {e}"),
+            Err(_) => eprintln!("keel-agentd: reconciler worker did not respond to RemoveRoute"),
+        }
+    }
+
+    for (pod_cidr, gateway_addr) in to_add {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if commands.send(crate::worker::Command::AddRoute(pod_cidr.clone(), gateway_addr.clone(), tx)).is_err() {
+            return;
+        }
+        match rx.recv() {
+            Ok(Ok(())) => {
+                if let Some(peer) = peers.iter().find(|p| p.pod_cidr == pod_cidr) {
+                    installed_routes.insert(peer.id.clone(), pod_cidr);
+                }
+            }
+            Ok(Err(e)) => eprintln!("keel-agentd: failed to add route for {pod_cidr} via {gateway_addr}: {e}"),
+            Err(_) => eprintln!("keel-agentd: reconciler worker did not respond to AddRoute"),
+        }
+    }
 }
 
 fn send_request(addr: &str, method: &str, path: &str, body: &str, client_config: &Arc<rustls::ClientConfig>) -> Result<Vec<u8>, String> {
@@ -142,6 +225,61 @@ mod tests {
     use keel_controlplane::worker;
     use std::net::TcpListener;
     use std::sync::mpsc;
+
+    fn node_status(id: &str, addr: &str, pod_cidr: &str, status: NodeState) -> NodeStatus {
+        NodeStatus {
+            id: id.to_string(),
+            addr: addr.to_string(),
+            pod_cidr: pod_cidr.to_string(),
+            status,
+            last_seen_secs: 0,
+            capacity_cpu: 4.0,
+            capacity_memory: 8 * 1024 * 1024 * 1024,
+            committed_cpu: 0.0,
+            committed_memory: 0,
+        }
+    }
+
+    #[test]
+    fn a_new_alive_peer_is_added_and_self_is_never_added() {
+        let peers = vec![
+            node_status("node-1", "10.0.0.1", "10.0.1.0/24", NodeState::Alive),
+            node_status("node-2", "10.0.0.2", "10.0.2.0/24", NodeState::Alive),
+        ];
+        let (to_add, to_remove) = diff_routes("node-1", &peers, &HashMap::new());
+        assert_eq!(to_add, vec![("10.0.2.0/24".to_string(), "10.0.0.2".to_string())]);
+        assert!(to_remove.is_empty());
+    }
+
+    #[test]
+    fn an_already_installed_peer_with_the_same_pod_cidr_is_not_re_added() {
+        let peers = vec![node_status("node-2", "10.0.0.2", "10.0.2.0/24", NodeState::Alive)];
+        let mut installed = HashMap::new();
+        installed.insert("node-2".to_string(), "10.0.2.0/24".to_string());
+        let (to_add, to_remove) = diff_routes("node-1", &peers, &installed);
+        assert!(to_add.is_empty());
+        assert!(to_remove.is_empty());
+    }
+
+    #[test]
+    fn a_dead_peer_that_was_installed_is_removed() {
+        let peers = vec![node_status("node-2", "10.0.0.2", "10.0.2.0/24", NodeState::Dead)];
+        let mut installed = HashMap::new();
+        installed.insert("node-2".to_string(), "10.0.2.0/24".to_string());
+        let (to_add, to_remove) = diff_routes("node-1", &peers, &installed);
+        assert!(to_add.is_empty());
+        assert_eq!(to_remove, vec!["10.0.2.0/24".to_string()]);
+    }
+
+    #[test]
+    fn a_peer_missing_entirely_from_the_list_that_was_installed_is_removed() {
+        let peers: Vec<NodeStatus> = vec![];
+        let mut installed = HashMap::new();
+        installed.insert("node-2".to_string(), "10.0.2.0/24".to_string());
+        let (to_add, to_remove) = diff_routes("node-1", &peers, &installed);
+        assert!(to_add.is_empty());
+        assert_eq!(to_remove, vec!["10.0.2.0/24".to_string()]);
+    }
 
     fn fixture(name: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../testdata/tls")).join(name)
@@ -468,5 +606,53 @@ mod tests {
         let addr = start_fake_control_plane_with_revoked_cert();
         let result = send_request(&addr, "GET", "/nodes", "", &node_client_config());
         assert!(result.is_err(), "expected a revoked peer certificate to fail the connection, got: {result:?}");
+    }
+
+    #[test]
+    fn route_reconciliation_adds_a_route_for_a_peer() {
+        let control_plane_addr = start_test_control_plane();
+
+        let client_config = node_client_config();
+        send_request(
+            &control_plane_addr,
+            "POST",
+            "/nodes/register",
+            "id: node-2\naddr: 10.0.0.2\ncapacity_cpu: 4\ncapacity_memory: 8589934592\n",
+            &client_config,
+        )
+        .unwrap();
+
+        let net = keel_net::FakeNetManager::new();
+        let (_worker_handle, commands) = crate::worker::spawn(
+            crate::Reconciler::new(
+                keel_jail::FakeJailRuntime::new(),
+                keel_zfs::FakeZfsManager::new(),
+                net.clone(),
+                "zroot".to_string(),
+                std::env::temp_dir().join("keel-agentd-registration-test-route_reconciliation_adds_a_route_for_a_peer"),
+            )
+            .unwrap(),
+        );
+        let pod_cidr_slot = crate::PodCidrSlot::new();
+        let _handle = spawn(
+            "node-1".to_string(),
+            "10.0.0.1".to_string(),
+            control_plane_addr,
+            Duration::from_millis(50),
+            4.0,
+            8 * 1024 * 1024 * 1024,
+            node_reloading_tls(),
+            commands,
+            pod_cidr_slot,
+        );
+
+        thread::sleep(Duration::from_millis(300));
+
+        // derive_pod_cidr("node-2", "10.0.0.0/16") == 10.0.22.0/24 (verified independently; see this plan's Verified Facts table).
+        assert_eq!(
+            net.has_route("10.0.22.0/24"),
+            Some("10.0.0.2".to_string()),
+            "expected node-1 to have installed a route to node-2's pod_cidr via its advertised address"
+        );
     }
 }

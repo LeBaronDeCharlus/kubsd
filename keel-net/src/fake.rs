@@ -1,13 +1,14 @@
 use crate::NetError;
 use crate::NetManager;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::Mutex;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct FakeNetManager {
-    bridges: Mutex<HashSet<String>>,
-    attachments: Mutex<HashMap<String, (String, String, String)>>,
-    routes: Mutex<HashMap<String, String>>,
+    bridges: Arc<Mutex<HashSet<String>>>,
+    attachments: Arc<Mutex<HashMap<String, (String, String, String)>>>,
+    routes: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl FakeNetManager {
