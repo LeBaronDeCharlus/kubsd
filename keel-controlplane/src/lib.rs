@@ -2,6 +2,7 @@ pub mod http;
 pub mod placements;
 pub mod registry;
 pub mod scheduler;
+pub mod subnet;
 pub mod tls;
 pub mod wire;
 pub mod worker;
