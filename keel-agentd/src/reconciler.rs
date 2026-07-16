@@ -109,6 +109,14 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager> Reconciler<J, Z, N> {
         Ok(())
     }
 
+    pub fn add_route(&self, subnet: &str, gateway_addr: &str) -> Result<(), keel_net::NetError> {
+        self.net.add_route(subnet, gateway_addr)
+    }
+
+    pub fn remove_route(&self, subnet: &str) -> Result<(), keel_net::NetError> {
+        self.net.remove_route(subnet)
+    }
+
     fn configure_networking_and_limits(&mut self, name: &str, record: &JailRecord) -> Result<(), ReconcileError> {
         let jail_name = record::jail_name(name);
         let epair_base = record::epair_base_name(record.epair_ordinal);

@@ -14,6 +14,8 @@ pub enum Command {
     Delete(String, Sender<Result<(), ReconcileError>>),
     Tick,
     CommittedResources(Sender<(f64, u64)>),
+    AddRoute(String, String, Sender<Result<(), keel_net::NetError>>),
+    RemoveRoute(String, Sender<Result<(), keel_net::NetError>>),
 }
 
 pub fn spawn<J, Z, N>(mut reconciler: Reconciler<J, Z, N>) -> (JoinHandle<()>, Sender<Command>)
@@ -67,6 +69,12 @@ fn handle_command<J: JailRuntime, Z: ZfsManager, N: NetManager>(
         }
         Command::CommittedResources(reply) => {
             let _ = reply.send(reconciler.committed_resources());
+        }
+        Command::AddRoute(subnet, gateway_addr, reply) => {
+            let _ = reply.send(reconciler.add_route(&subnet, &gateway_addr));
+        }
+        Command::RemoveRoute(subnet, reply) => {
+            let _ = reply.send(reconciler.remove_route(&subnet));
         }
     }
 }
@@ -199,5 +207,27 @@ mod tests {
         commands.send(Command::CommittedResources(tx)).unwrap();
         // sample_spec's fixed resources: cpu "2", memory "512M".
         assert_eq!(rx.recv().unwrap(), (2.0, 512 * 1024 * 1024));
+    }
+
+    #[test]
+    fn add_route_command_calls_through_to_the_net_manager() {
+        let commands = spawn_test_worker("add_route_command_calls_through_to_the_net_manager");
+
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::AddRoute("10.0.5.0/24".to_string(), "192.168.64.5".to_string(), tx)).unwrap();
+        assert!(rx.recv().unwrap().is_ok());
+    }
+
+    #[test]
+    fn remove_route_command_calls_through_to_the_net_manager() {
+        let commands = spawn_test_worker("remove_route_command_calls_through_to_the_net_manager");
+
+        let (add_tx, add_rx) = mpsc::channel();
+        commands.send(Command::AddRoute("10.0.5.0/24".to_string(), "192.168.64.5".to_string(), add_tx)).unwrap();
+        add_rx.recv().unwrap().unwrap();
+
+        let (rm_tx, rm_rx) = mpsc::channel();
+        commands.send(Command::RemoveRoute("10.0.5.0/24".to_string(), rm_tx)).unwrap();
+        assert!(rm_rx.recv().unwrap().is_ok());
     }
 }
