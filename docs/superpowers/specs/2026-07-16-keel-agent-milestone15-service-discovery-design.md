@@ -76,11 +76,13 @@ same sub-project, mirroring exactly how Milestone 14 itself deferred
 - **No rolling updates.** Once a `Service` exists, only `spec.replicas`
   can change (scaling up or down). Changing `spec.template` (image,
   command, resources, ...) on an existing service is rejected, the same
-  "changed image is a 409" precedent `kind: Jail`'s `validate_transition`
-  already establishes for its own immutable fields. An operator who wants
-  to change a service's template deletes and re-applies it. A rolling
-  (gradual, zero-downtime) update strategy is out of scope for this
-  milestone entirely.
+  `409` precedent `kind: Jail`'s `validate_transition` already establishes
+  for its own two immutable fields (`spec.image` and
+  `spec.network.address`, both currently rejected via
+  `SpecError::ImmutableField`). An operator who wants to change a
+  service's template deletes and re-applies it. A rolling (gradual,
+  zero-downtime) update strategy is out of scope for this milestone
+  entirely.
 - **No control-plane persistence of `Service` definitions.** Matching
   this project's established stance since Milestone 7: a control-plane
   restart forgets every `Service` (the same way it already forgets every
@@ -168,16 +170,22 @@ already-tested pure function completely untouched.
 Once a replica's target node is chosen, its `network.address` is the
 first address in that node's `pod_cidr` (Milestone 14's `NodeStatus`
 field), starting from network-plus-2, not already used by another jail on
-that node. Network-plus-1 (e.g. `10.0.60.1` for `pod_cidr 10.0.60.0/24`)
-is permanently excluded — Milestone 14's `attach_jail` fix already assigns
-that exact address to the node's `keel0` bridge as its gateway, so it is
-reserved before this milestone's own "used addresses" tracking ever
-starts, the same way network-plus-1 is implicitly off-limits everywhere
-else in this project's addressing story. This needs a small new per-node
-"used addresses" set, seeded with network-plus-1 and otherwise populated
-the same way `Placements` already is (recorded when a replica is
-scheduled, freed when it's torn down) — no new persistence, no new wire
-type, just one more in-memory map living next to `Placements`/`Services`.
+that node. `NodeStatus.pod_cidr` is a plain `String` on the wire (the
+control plane's internal `NodeRecord` keeps it typed as `Ipv4Net`, but
+nothing outside `keel-controlplane` sees that), so this milestone's
+address-assignment code parses it back into a network type before doing
+arithmetic on it — the same way any other consumer of `NodeStatus` would
+have to. Network-plus-1 (e.g. `10.0.60.1` for `pod_cidr 10.0.60.0/24`) is
+permanently excluded — Milestone 14's `attach_jail` (via `keel-net`'s
+`bridge_gateway` helper) already assigns that exact address to the node's
+`keel0` bridge as its gateway, so it is reserved before this milestone's
+own "used addresses" tracking ever starts, the same way network-plus-1 is
+implicitly off-limits everywhere else in this project's addressing story.
+This needs a small new per-node "used addresses" set, seeded with
+network-plus-1 and otherwise populated the same way `Placements` already
+is (recorded when a replica is scheduled, freed when it's torn down) — no
+new persistence, no new wire type, just one more in-memory map living next
+to `Placements`/`Services`.
 
 ### Health signal: extending the existing heartbeat
 
@@ -189,6 +197,15 @@ locally, just also folded into the outbound heartbeat body). This is the
 everything else about how it applies, runs, and reports on a jail is
 completely unchanged, since a replica is not a distinct concept to a node
 at all.
+
+This also changes an internal, not just wire, type: `keel-controlplane`'s
+`Command::Heartbeat` variant (`worker.rs`) is today a positional tuple
+`Heartbeat(String, f64, u64, Sender<Result<(), UnknownNode>>)` carrying
+just `(node_id, committed_cpu, committed_memory, reply)`. It gains a fifth
+field carrying the per-jail running/backoff statuses, which every existing
+call site constructing this variant (including `worker.rs`'s own tests,
+which build it directly over a bare `mpsc::channel()`) must be updated to
+populate.
 
 ### Discovery: `GET /services/<name>`
 
@@ -206,8 +223,15 @@ each one's name, node, and address as YAML:
   address: 10.0.207.6
 ```
 
-`GET /services` (no name) lists every known service, mirroring
-`GET /nodes`/`GET /jails`'s existing bare-collection convention.
+`GET /services` (no name) lists every known service, a bare-collection
+route mirroring `GET /nodes`'s existing convention at the control-plane
+layer. (There is no existing control-plane-level `GET /jails` bare
+collection to mirror alongside it — today a bare `GET /jails` only exists
+one layer down, scoped to a single node, inside `keel-agentd` itself;
+`keel-controlplane` only exposes `GET /jails/<name>`, resolved via
+`Placements`, and the per-node-scoped `GET /nodes/<id>/jails` forward. So
+`GET /services` is a new bare-collection precedent at the control-plane
+layer, not an existing one being reused.)
 
 ### Self-healing reconciliation: piggybacked on `Command::Heartbeat`
 
@@ -245,7 +269,9 @@ knows `kind` upfront from the parsed YAML.
 - Applying a `Service` whose `template` differs from an already-existing
   service of the same name (anything other than `replicas`) is rejected
   with `409`, the same shape and status code as `kind: Jail`'s existing
-  immutable-field rejection.
+  immutable-field rejection (`SpecError::ImmutableField` mapped to `409`
+  in `keel-agentd`'s `status_for_error`, today covering `spec.image` and
+  `spec.network.address`).
 - Applying a `Service` (or a plain `kind: Jail`) whose derived/given name
   collides with an existing jail owned by a *different* service, or with
   a plain unmanaged `kind: Jail`, is rejected at apply time with `400`,
