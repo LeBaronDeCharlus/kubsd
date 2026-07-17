@@ -1,6 +1,7 @@
 use crate::placements::Placements;
+use crate::scheduler::{self, NodeResources};
 use keel_spec::JailTemplate;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServiceRecord {
@@ -125,6 +126,33 @@ pub fn diff_replicas(desired: u32, healthy_indices: &BTreeSet<u32>) -> (Vec<u32>
         (Vec::new(), to_remove)
     } else {
         (Vec::new(), Vec::new())
+    }
+}
+
+/// Every node currently hosting at least one of `service_name`'s replicas,
+/// per `Placements` (matching replica names by the `<service_name>-`
+/// prefix via `replica_index`).
+pub fn nodes_hosting_service(service_name: &str, placements: &Placements) -> HashSet<String> {
+    placements
+        .iter()
+        .filter(|(jail_name, _)| replica_index(service_name, jail_name).is_some())
+        .map(|(_, node_id)| node_id.to_string())
+        .collect()
+}
+
+/// Prefers a node not in `busy_nodes` (same-service spreading); falls back
+/// to `pick_node`'s plain headroom-based bin-packing over the *unfiltered*
+/// `candidates` once every candidate is busy. `scheduler::pick_node` itself
+/// is unchanged -- this is purely a filter applied by its caller.
+pub fn pick_node_for_service(
+    candidates: Vec<NodeResources>,
+    busy_nodes: &HashSet<String>,
+) -> Result<String, scheduler::ScheduleError> {
+    let filtered: Vec<NodeResources> = candidates.iter().cloned().filter(|n| !busy_nodes.contains(&n.id)).collect();
+    if !filtered.is_empty() {
+        scheduler::pick_node(&filtered)
+    } else {
+        scheduler::pick_node(&candidates)
     }
 }
 
@@ -264,5 +292,40 @@ mod tests {
     fn diff_replicas_at_the_desired_count_does_nothing() {
         let healthy = BTreeSet::from([0, 1]);
         assert_eq!(diff_replicas(2, &healthy), (vec![], vec![]));
+    }
+
+    fn node(id: &str, capacity_cpu: f64, capacity_memory: u64) -> NodeResources {
+        NodeResources { id: id.to_string(), capacity_cpu, capacity_memory, committed_cpu: 0.0, committed_memory: 0 }
+    }
+
+    #[test]
+    fn nodes_hosting_service_finds_only_this_services_placements() {
+        let mut placements = Placements::new();
+        placements.set("web-0".to_string(), "node-1".to_string());
+        placements.set("web-1".to_string(), "node-2".to_string());
+        placements.set("other-jail".to_string(), "node-3".to_string());
+        let busy = nodes_hosting_service("web", &placements);
+        assert_eq!(busy, HashSet::from(["node-1".to_string(), "node-2".to_string()]));
+    }
+
+    #[test]
+    fn pick_node_for_service_avoids_a_busy_node_when_an_alternative_exists() {
+        let candidates = vec![node("node-1", 4.0, 100), node("node-2", 4.0, 100)];
+        let busy = HashSet::from(["node-1".to_string()]);
+        assert_eq!(pick_node_for_service(candidates, &busy), Ok("node-2".to_string()));
+    }
+
+    #[test]
+    fn pick_node_for_service_falls_back_to_bin_packing_once_every_node_is_busy() {
+        let candidates = vec![node("node-1", 4.0, 100), node("node-2", 4.0, 100)];
+        let busy = HashSet::from(["node-1".to_string(), "node-2".to_string()]);
+        // Both busy: falls back to the unfiltered candidate list, which
+        // `pick_node`'s own tie-break (ascending id) picks node-1.
+        assert_eq!(pick_node_for_service(candidates, &busy), Ok("node-1".to_string()));
+    }
+
+    #[test]
+    fn pick_node_for_service_with_no_candidates_at_all_is_no_available_nodes() {
+        assert_eq!(pick_node_for_service(vec![], &HashSet::new()), Err(scheduler::ScheduleError::NoAvailableNodes));
     }
 }

@@ -4,6 +4,7 @@ pub enum ScheduleError {
     NoAvailableNodes,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct NodeResources {
     pub id: String,
     pub capacity_cpu: f64,
