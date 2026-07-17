@@ -21,6 +21,7 @@ impl UsedAddresses {
     }
 
     pub fn record(&mut self, jail_name: String, node_id: String, addr: Ipv4Addr) {
+        self.release(&jail_name);
         self.used_by_node.entry(node_id.clone()).or_default().insert(addr);
         self.by_jail.insert(jail_name, (node_id, addr));
     }
@@ -85,6 +86,25 @@ mod tests {
         used.record("web-0".to_string(), "node-1".to_string(), addr("10.0.60.2"));
         used.release("web-0");
         assert_eq!(first_free_address(cidr("10.0.60.0/24"), "node-1", &used), Some(addr("10.0.60.2")));
+    }
+
+    #[test]
+    fn re_recording_a_jail_on_a_different_node_frees_its_old_address() {
+        let mut used = UsedAddresses::new();
+        used.record("web-0".to_string(), "node-1".to_string(), addr("10.0.60.2"));
+        used.record("web-0".to_string(), "node-2".to_string(), addr("10.0.60.5"));
+
+        // The old (node-1, 10.0.60.2) pair must no longer be considered used.
+        assert_eq!(first_free_address(cidr("10.0.60.0/24"), "node-1", &used), Some(addr("10.0.60.2")));
+        // The jail now resolves to its new node/address.
+        assert_eq!(used.address_of("web-0"), Some(addr("10.0.60.5")));
+    }
+
+    #[test]
+    fn releasing_a_never_recorded_jail_is_a_safe_no_op() {
+        let mut used = UsedAddresses::new();
+        used.release("never-seen");
+        assert_eq!(used.address_of("never-seen"), None);
     }
 
     #[test]
