@@ -98,9 +98,7 @@ pub fn replica_index(service_name: &str, jail_name: &str) -> Option<u32> {
 /// service if it matches that service's deterministic replica pattern;
 /// otherwise, if it's placed at all, it's an unmanaged plain `kind: Jail`.
 pub fn owner_of(name: &str, placements: &Placements, services: &Services) -> Option<Owner> {
-    if placements.get(name).is_none() {
-        return None;
-    }
+    placements.get(name)?;
     for service_name in services.names() {
         if replica_index(service_name, name).is_some() {
             return Some(Owner::Service(service_name.to_string()));
@@ -148,7 +146,7 @@ pub fn pick_node_for_service(
     candidates: Vec<NodeResources>,
     busy_nodes: &HashSet<String>,
 ) -> Result<String, scheduler::ScheduleError> {
-    let filtered: Vec<NodeResources> = candidates.iter().cloned().filter(|n| !busy_nodes.contains(&n.id)).collect();
+    let filtered: Vec<NodeResources> = candidates.iter().filter(|n| !busy_nodes.contains(&n.id)).cloned().collect();
     if !filtered.is_empty() {
         scheduler::pick_node(&filtered)
     } else {
