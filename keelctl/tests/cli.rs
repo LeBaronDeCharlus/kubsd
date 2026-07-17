@@ -306,6 +306,47 @@ fn apply_get_delete_round_trip() {
     assert!(stderr.contains("not found"), "expected 'not found' in stderr, got: {stderr}");
 }
 
+fn write_service_spec_file(test_name: &str, service_name: &str, replicas: u32) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("keelctl-test-service-spec-{test_name}.yaml"));
+    let yaml = format!(
+        "apiVersion: keel/v1\nkind: Service\nmetadata:\n  name: {service_name}\nspec:\n  replicas: {replicas}\n  template:\n    image: base/14.2-web\n    command: [\"/usr/local/bin/myapp\"]\n    network:\n      vnet: true\n      bridge: keel0\n    resources:\n      cpu: \"1\"\n      memory: 256M\n    restartPolicy: Always\n"
+    );
+    std::fs::write(&path, yaml).unwrap();
+    path
+}
+
+#[test]
+fn apply_routes_a_service_kind_to_the_services_path() {
+    let node_addr = start_test_agentd_tcp("service_apply_routing");
+    let control_plane_addr = start_test_control_plane_with_node("node-1", &node_addr);
+    let spec_path = write_service_spec_file("service_apply_routing", "web", 0);
+
+    let (ok, _, stderr) = run_keelctl_scheduled(&control_plane_addr, &["apply", "-f", spec_path.to_str().unwrap()]);
+    assert!(ok, "service apply failed: {stderr}");
+
+    let (ok, body, stderr) = run_keelctl_scheduled(&control_plane_addr, &["get", "web"]);
+    assert!(ok, "expected the jail-path 404 to fall back to the service path: {stderr}");
+    assert_eq!(body.trim(), "[]", "a zero-replica service has no discoverable replicas yet");
+}
+
+#[test]
+fn delete_falls_back_from_jail_to_service_on_404() {
+    let control_plane_addr = start_test_control_plane_with_node("node-1", "127.0.0.1:1");
+    let spec_path = write_service_spec_file("service_delete_fallback", "web", 0);
+    run_keelctl_scheduled(&control_plane_addr, &["apply", "-f", spec_path.to_str().unwrap()]);
+
+    let (ok, _, stderr) = run_keelctl_scheduled(&control_plane_addr, &["delete", "web"]);
+    assert!(ok, "expected delete to fall back to the service path: {stderr}");
+}
+
+#[test]
+fn get_on_a_name_that_is_neither_a_jail_nor_a_service_still_reports_jail_not_found() {
+    let socket_path = start_test_server("neither_jail_nor_service");
+    let (ok, _, stderr) = run_keelctl(&socket_path, &["get", "missing"]);
+    assert!(!ok);
+    assert!(stderr.contains("not found"), "expected the original jail-not-found error preserved, got: {stderr}");
+}
+
 #[test]
 fn apply_rejects_a_file_with_an_invalid_spec() {
     let socket_path = start_test_server("apply_rejects_a_file_with_an_invalid_spec");

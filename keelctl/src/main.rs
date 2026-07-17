@@ -118,7 +118,7 @@ fn jails_path(target: &Target, suffix: &str) -> String {
     }
 }
 
-fn dispatch(target: &Target, method: &str, path: &str, body: &str) -> Result<String, String> {
+fn dispatch(target: &Target, method: &str, path: &str, body: &str) -> Result<(u16, String), String> {
     match target {
         Target::Socket(socket) => send_request(socket, method, path, body),
         Target::ControlPlane { addr, tls_ca_file, tls_cert_file, tls_key_file, tls_crl_file, .. } => {
@@ -127,31 +127,71 @@ fn dispatch(target: &Target, method: &str, path: &str, body: &str) -> Result<Str
     }
 }
 
+/// Converts a raw `(status, body)` pair into the old collapsed
+/// `Result<String, String>` shape: 2xx becomes `Ok(body)`, anything else
+/// becomes `Err` of the parsed `ErrorBody`'s message (or the raw body, if
+/// it isn't one).
+fn success_body(result: Result<(u16, String), String>) -> Result<String, String> {
+    let (status, body) = result?;
+    if (200..300).contains(&status) {
+        Ok(body)
+    } else {
+        let error: ErrorBody = serde_yaml::from_str(&body).unwrap_or(ErrorBody { error: body });
+        Err(error.error)
+    }
+}
+
 fn run_apply(target: &Target, args: &[String]) -> Result<String, String> {
     let index = args.iter().position(|a| a == "-f").ok_or("apply requires -f FILE")?;
     let file = args.get(index + 1).ok_or("apply requires -f FILE")?;
     let yaml = std::fs::read_to_string(file).map_err(|e| format!("failed to read {file}: {e}"))?;
-    let spec = keel_spec::parse_and_validate(&yaml).map_err(|e| format!("invalid spec: {e}"))?;
-    let path = jails_path(target, &format!("/jails/{}", spec.metadata.name));
-    dispatch(target, "PUT", &path, &yaml).map(|_| String::new())
+    let kind = keel_spec::sniff_kind(&yaml).map_err(|e| format!("invalid spec: {e}"))?;
+    if kind == "Service" {
+        let spec = keel_spec::parse_and_validate_service(&yaml).map_err(|e| format!("invalid spec: {e}"))?;
+        let path = jails_path(target, &format!("/services/{}", spec.metadata.name));
+        success_body(dispatch(target, "PUT", &path, &yaml)).map(|_| String::new())
+    } else {
+        let spec = keel_spec::parse_and_validate(&yaml).map_err(|e| format!("invalid spec: {e}"))?;
+        let path = jails_path(target, &format!("/jails/{}", spec.metadata.name));
+        success_body(dispatch(target, "PUT", &path, &yaml)).map(|_| String::new())
+    }
 }
 
 fn run_get(target: &Target, args: &[String]) -> Result<String, String> {
-    let suffix = match args.first() {
-        Some(name) => format!("/jails/{name}"),
-        None => "/jails".to_string(),
-    };
-    let path = jails_path(target, &suffix);
-    dispatch(target, "GET", &path, "")
+    match args.first() {
+        Some(name) => get_or_delete_with_service_fallback(target, "GET", name),
+        None => success_body(dispatch(target, "GET", &jails_path(target, "/jails"), "")),
+    }
 }
 
 fn run_delete(target: &Target, args: &[String]) -> Result<String, String> {
     let name = args.first().ok_or("delete requires a jail name")?;
-    let path = jails_path(target, &format!("/jails/{name}"));
-    dispatch(target, "DELETE", &path, "").map(|_| String::new())
+    get_or_delete_with_service_fallback(target, "DELETE", name).map(|_| String::new())
 }
 
-fn send_request(socket: &PathBuf, method: &str, path: &str, body: &str) -> Result<String, String> {
+/// Tries `/jails/<name>` first; on a `404`, retries against
+/// `/services/<name>` (jail names and service names share one flat
+/// namespace, so a 404 on one path is a cheap, unambiguous signal to try
+/// the other). If *both* return 404, the original jail-path error is
+/// surfaced -- it's the more familiar message, and the only one available
+/// at all against a plain single-node `keel-agentd`, which has no
+/// `/services` route whatsoever.
+fn get_or_delete_with_service_fallback(target: &Target, method: &str, name: &str) -> Result<String, String> {
+    let jail_path = jails_path(target, &format!("/jails/{name}"));
+    let (status, body) = dispatch(target, method, &jail_path, "")?;
+    if status != 404 {
+        return success_body(Ok((status, body)));
+    }
+    let service_path = jails_path(target, &format!("/services/{name}"));
+    let (service_status, service_body) = dispatch(target, method, &service_path, "")?;
+    if service_status == 404 {
+        success_body(Ok((status, body)))
+    } else {
+        success_body(Ok((service_status, service_body)))
+    }
+}
+
+fn send_request(socket: &PathBuf, method: &str, path: &str, body: &str) -> Result<(u16, String), String> {
     let mut stream = UnixStream::connect(socket)
         .map_err(|e| format!("failed to connect to {}: {e}", socket.display()))?;
     let request =
@@ -175,7 +215,7 @@ fn send_request_tcp(
     tls_cert_file: &PathBuf,
     tls_key_file: &PathBuf,
     tls_crl_file: &PathBuf,
-) -> Result<String, String> {
+) -> Result<(u16, String), String> {
     let client_config = std::sync::Arc::new(
         tls::load_client_config(tls_cert_file, tls_key_file, tls_ca_file, tls_crl_file)
             .map_err(|e| format!("failed to load TLS client config: {e}"))?,
@@ -212,7 +252,7 @@ fn send_request_tcp(
     parse_response(&response)
 }
 
-fn parse_response(response: &[u8]) -> Result<String, String> {
+fn parse_response(response: &[u8]) -> Result<(u16, String), String> {
     let mut headers = [httparse::EMPTY_HEADER; 16];
     let mut parsed = httparse::Response::new(&mut headers);
     let header_len = match parsed.parse(response).map_err(|e| format!("malformed response: {e}"))? {
@@ -232,14 +272,7 @@ fn parse_response(response: &[u8]) -> Result<String, String> {
         return Err(format!("truncated response: expected {content_length} bytes, got {actual}"));
     }
     let response_body = String::from_utf8_lossy(&response[header_len..]).to_string();
-
-    if (200..300).contains(&status) {
-        Ok(response_body)
-    } else {
-        let error: ErrorBody =
-            serde_yaml::from_str(&response_body).unwrap_or(ErrorBody { error: response_body });
-        Err(error.error)
-    }
+    Ok((status, response_body))
 }
 
 #[cfg(test)]
