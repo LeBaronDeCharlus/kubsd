@@ -1609,7 +1609,12 @@ Add to `keel-controlplane/src/worker.rs`'s `#[cfg(test)] mod tests`, a helper an
     }
 
     #[test]
-    fn reconcile_services_reschedules_a_replica_whose_jail_is_reported_not_running() {
+    fn reconcile_services_leaves_a_crash_looping_replica_on_a_still_alive_node_alone() {
+        // A replica whose node is Alive is never rescheduled elsewhere just
+        // because it's crash-looping -- that node's own keel-agentd is
+        // already retrying it locally via its Milestone-4 crash-loop
+        // backoff. Rescheduling on top of that would fight the local
+        // backoff and orphan the original, untracked, on its old node.
         let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(), UsedAddresses::new()).1;
         register_node(&commands, "node-1", "10.0.0.1", 4.0, 8 * 1024 * 1024 * 1024);
         apply_service(&commands, "web", 1);
@@ -1618,9 +1623,33 @@ Add to `keel-controlplane/src/worker.rs`'s `#[cfg(test)] mod tests`, a helper an
         rec_rx.recv().unwrap();
         heartbeat_with_jails(&commands, "node-1", vec![crate::wire::JailHealth { name: "web-0".to_string(), running: false }]);
 
+        assert_eq!(
+            reconcile(&commands),
+            vec![],
+            "a crash-looping replica on a still-Alive node must be left to local backoff, not rescheduled"
+        );
+    }
+
+    #[test]
+    fn reconcile_services_reschedules_a_replica_whose_node_is_unreachable() {
+        // web-0 is "placed" on a node that was never registered at all --
+        // registry.resolve() fails for it exactly the way it would for a
+        // genuinely Dead node, so this exercises the same "node itself is
+        // unreachable, local backoff can't help" path without needing to
+        // wait out the real Dead-node heartbeat timeout in a test.
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(), UsedAddresses::new()).1;
+        register_node(&commands, "node-1", "10.0.0.1", 4.0, 8 * 1024 * 1024 * 1024);
+        apply_service(&commands, "web", 1);
+        let (rec_tx, rec_rx) = mpsc::channel();
+        commands.send(Command::RecordPlacement("web-0".to_string(), "node-unreachable".to_string(), rec_tx)).unwrap();
+        rec_rx.recv().unwrap();
+
         let actions = reconcile(&commands);
         assert_eq!(actions.len(), 1);
-        assert!(matches!(&actions[0], ReplicaAction::Schedule { replica_name, .. } if replica_name == "web-0"));
+        assert!(
+            matches!(&actions[0], ReplicaAction::Schedule { replica_name, node_id, .. } if replica_name == "web-0" && node_id == "node-1"),
+            "expected web-0 rescheduled onto the one real Alive node, got: {actions:?}"
+        );
     }
 
     #[test]
@@ -1871,13 +1900,26 @@ Add the six match arms in `handle_command` (after `ApplyService`):
                         services::replica_index(service_name, jail_name).map(|idx| (idx, jail_name.to_string(), node_id.to_string()))
                     })
                     .collect();
-                let healthy_indices: BTreeSet<u32> = placed
+                // Deliberately NOT also requiring `is_jail_running`: a
+                // replica whose node is Alive still counts as present even
+                // while crash-looping, since that node's own keel-agentd is
+                // already retrying it locally via its own Milestone-4
+                // crash-loop backoff. Rescheduling it elsewhere on top of
+                // that would fight the local backoff and orphan the
+                // original, untracked, on its old node. Only a node that's
+                // actually unreachable (registry.resolve fails, whether
+                // Dead or never-registered) makes local recovery impossible
+                // and warrants scheduling a replacement. `GET /services`'s
+                // own Alive+running check (unchanged, see DiscoverService)
+                // still excludes a crash-looping replica from what's
+                // actually advertised as usable.
+                let present_indices: BTreeSet<u32> = placed
                     .iter()
-                    .filter(|(_, jail_name, node_id)| registry.resolve(node_id, now).is_ok() && registry.is_jail_running(node_id, jail_name))
+                    .filter(|(_, _, node_id)| registry.resolve(node_id, now).is_ok())
                     .map(|(idx, _, _)| *idx)
                     .collect();
 
-                let (to_add, to_remove) = services::diff_replicas(record.desired_replicas, &healthy_indices);
+                let (to_add, to_remove) = services::diff_replicas(record.desired_replicas, &present_indices);
                 let mut busy = services::nodes_hosting_service(service_name, placements);
 
                 for idx in to_add {
@@ -2231,7 +2273,7 @@ fn handle_apply_service(
             reconcile_and_execute(commands, client_config);
             (200, Vec::new())
         }
-        Ok(Err(crate::services::ApplyServiceError::TemplateChanged(_))) => error_response(409, "service template is immutable once created; delete and re-apply instead".to_string()),
+        Ok(Err(e @ crate::services::ApplyServiceError::TemplateChanged(_))) => error_response(409, e.to_string()),
         Ok(Err(e @ crate::services::ApplyServiceError::NameConflict { .. })) => error_response(400, e.to_string()),
         Err(_) => error_response(500, "control plane worker did not respond".to_string()),
     }

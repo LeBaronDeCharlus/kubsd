@@ -50,11 +50,21 @@ same sub-project, mirroring exactly how Milestone 14 itself deferred
   is `Alive` and whose own jail is currently `running`, with its node and
   address — the actual discovery mechanism this milestone exists to
   deliver.
-- If a node hosting a replica goes `Dead` (or that replica starts
-  crash-looping), the control plane automatically schedules a replacement
-  on a healthy node, piggybacking on the same 5-second heartbeat traffic
-  that already exists — no new background thread, no new polling cadence,
-  matching Milestone 14's own established idiom for this project.
+- If a node hosting a replica goes `Dead`, the control plane automatically
+  schedules a replacement on a healthy node, piggybacking on the same
+  5-second heartbeat traffic that already exists — no new background
+  thread, no new polling cadence, matching Milestone 14's own established
+  idiom for this project. A replica that is merely crash-looping while its
+  node stays `Alive` is deliberately left alone by this mechanism: that
+  node's own `keel-agentd` is already running its Milestone-4 crash-loop
+  backoff on that exact jail, restarting it in place. The control plane
+  only steps in when local recovery is impossible because the node itself
+  is unreachable — rescheduling a still-locally-recoverable replica onto a
+  different node would both fight the local backoff and leave the original
+  instance behind, untracked, still restarting on its old node forever.
+  `GET /services/<name>` still excludes a crash-looping replica from its
+  results regardless of this distinction, since discovery cares whether a
+  replica is currently usable, not why it might not be.
 - `keelctl apply/get/delete` all work against `kind: Service` specs the
   same way they already work against `kind: Jail`.
 - Plain single-node `keel-agentd` usage, and every existing `kind: Jail`
@@ -239,14 +249,23 @@ No new thread, no new timer. Every time the worker processes an
 incoming `Command::Heartbeat` (already happening once per node per 5
 seconds), it also walks every `Service` and compares its
 `desired_replicas` against how many of its replicas currently resolve to
-an `Alive`+`running` placement:
+a placement on an `Alive` node — deliberately *not* also requiring
+`running`, per the Goals section above: a replica whose node is `Alive`
+still counts as present even while crash-looping, since that node's own
+`keel-agentd` is already retrying it locally, and rescheduling it
+elsewhere on top of that would both fight the local backoff and orphan
+the original, untracked, on its old node:
 
-- **Missing replicas** (desired > healthy count) get scheduled via the
+- **Missing replicas** (desired > present count) get scheduled via the
   same spreading + auto-addressing logic above, for names starting from
-  the lowest unplaced index.
-- **Excess replicas** (a scale-down: healthy count > desired) get torn
+  the lowest unplaced index. "Missing" here means unplaced entirely, or
+  placed on a node that has gone `Dead` — never merely crash-looping on a
+  still-`Alive` node.
+- **Excess replicas** (a scale-down: present count > desired) get torn
   down starting from the *highest* index, deterministically, via the
-  existing per-node `DELETE /nodes/<id>/jails/<name>` forwarding path.
+  existing per-node `DELETE /nodes/<id>/jails/<name>` forwarding path,
+  regardless of whether that replica happens to be running or
+  crash-looping at the moment of scale-down.
 
 A `Service` applied when there isn't yet enough cluster capacity for all
 its replicas is **not an error**: `apply` succeeds, places as many
