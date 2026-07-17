@@ -728,6 +728,95 @@ out to be stale (pre-dating the CRL infrastructure from Milestones 12-13)
 and was regenerated fresh, the same fix Milestone 13 needed for the same
 reason. Clean teardown confirmed on all three VMs afterward.
 
+### Milestone 15: service discovery via replica sets
+
+Milestone 14 closed the host/kernel half of the "cluster networking" line:
+it gave every node a routable subnet and taught nodes to route directly to
+each other's jails. Its own design spec explicitly deferred the other
+half, a stable name that resolves to (and eventually load-balances
+across) a jail's current instance, since that was meaningless without the
+reachability Milestone 14 built and untouched by that milestone's own
+scope. This milestone, the first in a new Sub-Project 6, opens that line,
+scoped to exactly two things: a replica-set concept (N interchangeable
+copies of a jail template, scheduled across nodes, named deterministically)
+and discovery (querying which of those replicas are currently healthy and
+where). It deliberately stops short of any traffic-distribution mechanism,
+a proxy, DNS-based round robin, or client-side load balancing; that stays
+a distinct, later milestone in the same sub-project, mirroring exactly how
+Milestone 14 deferred discovery and load balancing out of cluster
+networking in the first place.
+
+A new `kind: Service` spec (`keel-spec`'s `ServiceSpec`/`ServiceSpecBody`/
+`JailTemplate`, the latter being `kind: Jail`'s own spec fields minus
+`network.address`) produces `N` deterministically named jails (`<name>-0`
+through `<name>-{N-1}`). `keel-controlplane` took on its first-ever
+dependency on `keel-spec` to construct these replica specs itself, plus a
+new `Services` registry (desired replica count and template, structurally
+parallel to the existing `Placements`/`Registry`, and just as unpersisted:
+forgotten on a control-plane restart, matching the project's stance since
+Milestone 7). Replica *placement* reuses the existing `Placements` map
+completely unchanged, since `web-0` is exactly as ordinary a jail name as
+any plain `kind: Jail` ever produced. The scheduler's own `pick_node`
+function is likewise untouched; a new spreading wrapper filters candidate
+nodes to exclude any already hosting another replica of the same service
+before calling it, falling back to plain headroom-based bin-packing only
+once every `Alive` node already has one. Each replica's address is
+auto-assigned as the first free address in its target node's Milestone-14
+`pod_cidr` (skipping network-plus-1, permanently reserved as that node's
+bridge gateway), tracked in a new per-node `UsedAddresses` map living
+beside `Placements`.
+
+Self-healing reconciliation piggybacks entirely on the existing 5-second
+heartbeat: no new thread, no new polling cadence, matching Milestone 14's
+own idiom. `keel-agentd`'s heartbeat body gained exactly one new field
+(per-jail running/backoff status, data `GET /jails` already exposed
+locally); every other line of `keel-agentd`'s behavior is unchanged, since
+a replica is indistinguishable from any other jail to the node hosting it.
+On each incoming heartbeat, the control plane now also diffs each
+service's desired replica count against how many currently resolve to an
+`Alive` node plus a `running` jail, scheduling missing replicas from the
+lowest unplaced index and tearing down excess ones from the highest.
+`GET /services/<name>` (returning only `Alive`+`running` replicas) is the
+actual discovery surface this milestone exists to deliver. `keelctl apply`
+sniffs `kind` before choosing `/jails/<name>` or `/services/<name>`;
+`get`/`delete` try the jail path first and fall back to the service path
+on a 404, since jail and service names share one flat namespace.
+
+Task 7's own given tests initially assumed `DeleteService`/
+`ReleaseReplicaAddress` acted alone; in the real system they always pair
+with `RemovePlacement`, fired together by Task 8's execution step only
+once a teardown actually succeeds. Rather than guess at which side was
+wrong, the implementer escalated, confirmed the real pairing, and
+corrected the two tests to match the system's actual
+state-only-after-confirmed-execution semantics instead of weakening that
+guarantee to fit the tests.
+
+The design spec's own Open Questions accept one known, bounded
+concurrency limitation rather than fixing it in this milestone:
+`ReconcileServices` computes its actions from a point-in-time snapshot and
+reserves nothing in shared state, so two heartbeats (or a heartbeat racing
+a `Service` apply) can each compute a reconcile action for the same
+missing replica index before either records its result. If a
+resource-committing write lands between the two computations, both can
+schedule successfully onto different nodes, and only one placement
+survives the last-write-wins overwrite, leaving the other node's jail
+permanently untracked by the control plane until an operator notices it
+directly or the node is reused. This is accepted the same way Milestones
+9/10 accepted "no hard admission guarantee" and "no overcommit protection
+beyond the ranking itself": a bounded, eventual-consistency gap rather
+than a correctness bug blocking the milestone.
+
+This milestone's verification so far is unit/integration-test-only: 331
+tests pass across every workspace crate, and clippy is clean relative to
+the pre-existing baseline. The real 3-node VM verification this design
+calls for, applying a 3-replica service across the live cluster, killing
+a node's `keel-agentd` and confirming a replacement replica lands on a
+healthy node within one heartbeat tick, scaling the service up and down,
+deleting it and confirming every replica tears down, and confirming plain
+`kind: Jail` workflows are entirely unaffected, has not been run in this
+session (no VM/SSH access was available); it is deferred and will be run
+separately before this milestone is considered fully verified.
+
 ## Roadmap
 
 **Sub-project 1: single-node jail reconciliation daemon (complete)**
@@ -759,9 +848,13 @@ reason. Clean teardown confirmed on all three VMs afterward.
 
 14. ~~Cross-node overlay networking: deterministic per-node subnets, kernel routing, apply-time subnet validation~~ done
 
+**Sub-project 6: service discovery and load balancing (in progress)**
+
+15. Service discovery via replica sets: `kind: Service`, deterministic replica naming, same-service scheduler spreading, auto-assigned addressing, heartbeat-piggybacked self-healing, `GET /services/<name>` discovery — code complete and reviewed (331 tests passing, clippy clean); real 3-node VM verification not yet run
+- Load-balancing/traffic-distribution mechanism across a service's replicas (a proxy, DNS-based round robin, or client-side selection) — not yet designed, a distinct later milestone in this same sub-project
+
 **Not yet designed** (future sub-projects, each will get its own spec):
 
-- Service discovery and load balancing (a stable, relocation-proof name for a jail, building on Milestone 14's IP-level reachability)
 - Storage orchestration beyond a single host's ZFS pool
 - bhyve VM workloads alongside jails
 
