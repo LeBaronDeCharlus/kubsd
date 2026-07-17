@@ -350,6 +350,12 @@ fn handle_delete_service(
 /// heartbeat traffic" self-healing mechanism: no new thread, no new timer,
 /// just one more step in handling a request that already happens every 5
 /// seconds per node.
+///
+/// Note: the compute (`Command::ReconcileServices`) and execute (below)
+/// steps are not atomic with each other, which opens a narrow, accepted
+/// concurrency gap between two racing calls to this function -- see the doc
+/// comment on `Command::ReconcileServices` in `worker.rs` for the full
+/// explanation.
 fn reconcile_and_execute(commands: &Sender<Command>, client_config: &Arc<rustls::ClientConfig>) {
     let (reply_tx, reply_rx) = mpsc::channel();
     if commands.send(Command::ReconcileServices(reply_tx)).is_err() {

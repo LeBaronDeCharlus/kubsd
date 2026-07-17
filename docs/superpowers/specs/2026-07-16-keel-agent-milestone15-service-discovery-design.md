@@ -335,3 +335,22 @@ knows `kind` upfront from the parsed YAML.
   re-apply cycle) are left as a future milestone's concern if ever
   needed; today's "template is immutable, replicas is the only mutable
   field" is a deliberate simplification, not an oversight.
+- `Command::ReconcileServices` computes its `Vec<ReplicaAction>` from a
+  point-in-time snapshot and reserves nothing in shared state; the
+  actual `RecordPlacement`/`RecordReplicaAddress` confirmation only
+  happens later, after a real network round-trip to the target node
+  succeeds. Because two heartbeats (or a heartbeat racing a `Service`
+  apply) can each trigger a reconcile computation before either has
+  recorded its results, there is a narrow window where a
+  resource-committing write landing between the two computations (e.g.
+  another node's heartbeat updating its own committed CPU/memory) can
+  cause them to pick different nodes for the same missing replica
+  index, so both schedule successfully and only one placement survives
+  the last-write-wins overwrite, leaving the other node's jail
+  permanently untracked by the control plane until an operator notices
+  it (via that node's own `GET /jails`) or the node is reused/rebuilt.
+  This is accepted as a known, bounded limitation for this milestone
+  rather than fixed now, consistent with this project's existing
+  tolerance for eventual-consistency gaps elsewhere (Milestone 9/10's
+  "no hard admission guarantee," "no overcommit protection beyond the
+  ranking itself").

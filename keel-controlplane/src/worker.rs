@@ -54,6 +54,43 @@ pub enum Command {
     RemovePlacement(String, Sender<()>),
     OwnerOf(String, Sender<Option<Owner>>),
     ApplyService(String, u32, keel_spec::JailTemplate, Sender<Result<(), services::ApplyServiceError>>),
+    /// Computes a point-in-time `Vec<ReplicaAction>` from the current
+    /// `placements`/`registry`/`used_addresses` snapshot, but reserves
+    /// nothing: nothing is recorded in shared state here. The caller
+    /// (`reconcile_and_execute` in `http.rs`) only records the outcome, via
+    /// `RecordPlacement`/`RecordReplicaAddress`, after each computed action
+    /// has been executed and confirmed with a real network round-trip
+    /// (`forward()`) to the target node. Because `keel-controlplane` handles
+    /// each incoming connection on its own thread, two heartbeats (or a
+    /// heartbeat racing a `Service` apply) that arrive close together can
+    /// each send `ReconcileServices` and get a snapshot computed before
+    /// either has recorded its results.
+    ///
+    /// This is a known, accepted limitation of the reconcile-then-execute
+    /// design from the Milestone 15 spec, not a bug to fix here. In the
+    /// common case it is harmless: if nothing else changes between the two
+    /// computations, both are deterministic and pick the same node/address
+    /// for the same replica, so the duplicate `PUT` is an idempotent no-op
+    /// and the duplicate `RecordPlacement`/`RecordReplicaAddress` calls just
+    /// overwrite the same values. It is not self-correcting, however, if a
+    /// resource-committing write (e.g. another node's heartbeat updating its
+    /// own `committed_cpu`/`committed_memory`) lands between the two racing
+    /// computations: the scheduler's node ranking can then differ between
+    /// them, so the two computations can pick *different* nodes for the same
+    /// missing replica index. Both `forward()` calls can succeed
+    /// independently, creating two real jails for one logical replica on two
+    /// different nodes; since `RecordPlacement`/`RecordReplicaAddress` are
+    /// simple last-write-wins overwrites, only one placement survives in the
+    /// control plane's bookkeeping, and the other node's jail (plus the
+    /// address it consumed) becomes permanently untracked -- no later
+    /// reconcile pass detects it, since reconciliation only ever looks at
+    /// what's already recorded in `placements`, never at a node's actual
+    /// full jail set. The practical impact is bounded to one extra idle
+    /// jail on one node (discoverable directly via that node's own
+    /// `keel-agentd` `GET /jails`), consistent with this project's existing
+    /// tolerance for eventual-consistency gaps elsewhere (see Milestone
+    /// 9/10's "no hard admission guarantee" / "no overcommit protection
+    /// beyond the ranking itself").
     ReconcileServices(Sender<Vec<ReplicaAction>>),
     DiscoverService(String, Sender<Result<Vec<wire::ServiceReplica>, services::UnknownService>>),
     ListServices(Sender<Vec<wire::ServiceSummary>>),
@@ -165,6 +202,9 @@ fn handle_command(
             let _ = reply.send(result);
         }
         Command::ReconcileServices(reply) => {
+            // See the doc comment on the `Command::ReconcileServices` variant
+            // above for the known compute/execute race and why it's an
+            // accepted limitation for this milestone rather than a bug.
             let now = Instant::now();
             let alive_nodes: Vec<scheduler::NodeResources> = registry
                 .list(now)
