@@ -44,6 +44,65 @@ pub enum RestartPolicy {
     Never,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServiceSpec {
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    pub kind: String,
+    pub metadata: Metadata,
+    pub spec: ServiceSpecBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServiceSpecBody {
+    pub replicas: u32,
+    pub template: JailTemplate,
+}
+
+/// The same fields `kind: Jail`'s `Spec` has, minus `network.address` — a
+/// replica's address is always auto-assigned (see `keel-controlplane`'s
+/// `addresses` module), never given directly in a `Service`'s template.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JailTemplate {
+    pub image: String,
+    pub command: Vec<String>,
+    pub network: TemplateNetworkSpec,
+    pub resources: ResourcesSpec,
+    #[serde(rename = "restartPolicy")]
+    pub restart_policy: RestartPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TemplateNetworkSpec {
+    pub vnet: bool,
+    pub bridge: String,
+}
+
+impl JailTemplate {
+    /// Builds the concrete `JailSpec` for one replica: the template's fields
+    /// plus the deterministic replica `name` and its auto-assigned `address`
+    /// (already formatted as a CIDR string, e.g. `"10.0.60.2/24"`).
+    pub fn to_jail_spec(&self, name: &str, address: &str) -> JailSpec {
+        JailSpec {
+            api_version: "keel/v1".to_string(),
+            kind: "Jail".to_string(),
+            metadata: Metadata { name: name.to_string() },
+            spec: Spec {
+                image: self.image.clone(),
+                command: self.command.clone(),
+                network: NetworkSpec {
+                    vnet: self.network.vnet,
+                    bridge: self.network.bridge.clone(),
+                    address: address.to_string(),
+                },
+                resources: self.resources.clone(),
+                restart_policy: self.restart_policy,
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,5 +139,66 @@ spec:
         assert_eq!(spec.spec.resources.cpu, "2");
         assert_eq!(spec.spec.resources.memory, "512M");
         assert_eq!(spec.spec.restart_policy, RestartPolicy::Always);
+    }
+
+    const SERVICE_EXAMPLE_YAML: &str = r#"
+apiVersion: keel/v1
+kind: Service
+metadata:
+  name: web
+spec:
+  replicas: 3
+  template:
+    image: base/14.2-web
+    command: ["/usr/local/bin/myapp"]
+    network:
+      vnet: true
+      bridge: keel0
+    resources:
+      cpu: "1"
+      memory: "256M"
+    restartPolicy: Always
+"#;
+
+    #[test]
+    fn parses_the_service_example_yaml() {
+        let spec: ServiceSpec = serde_yaml::from_str(SERVICE_EXAMPLE_YAML).unwrap();
+        assert_eq!(spec.api_version, "keel/v1");
+        assert_eq!(spec.kind, "Service");
+        assert_eq!(spec.metadata.name, "web");
+        assert_eq!(spec.spec.replicas, 3);
+        assert_eq!(spec.spec.template.image, "base/14.2-web");
+        assert!(spec.spec.template.network.vnet);
+        assert_eq!(spec.spec.template.network.bridge, "keel0");
+        assert_eq!(spec.spec.template.resources.cpu, "1");
+        assert_eq!(spec.spec.template.restart_policy, RestartPolicy::Always);
+    }
+
+    #[test]
+    fn rejects_a_template_with_an_embedded_network_address() {
+        let yaml = SERVICE_EXAMPLE_YAML.replace(
+            "    network:\n      vnet: true\n      bridge: keel0\n",
+            "    network:\n      vnet: true\n      bridge: keel0\n      address: 10.0.0.5/24\n",
+        );
+        assert!(
+            serde_yaml::from_str::<ServiceSpec>(&yaml).is_err(),
+            "template.network.address is not a valid field and must be rejected"
+        );
+    }
+
+    #[test]
+    fn to_jail_spec_builds_a_replica_spec_from_the_template_plus_name_and_address() {
+        let service: ServiceSpec = serde_yaml::from_str(SERVICE_EXAMPLE_YAML).unwrap();
+        let jail = service.spec.template.to_jail_spec("web-0", "10.0.60.2/24");
+        assert_eq!(jail.api_version, "keel/v1");
+        assert_eq!(jail.kind, "Jail");
+        assert_eq!(jail.metadata.name, "web-0");
+        assert_eq!(jail.spec.image, "base/14.2-web");
+        assert_eq!(jail.spec.command, vec!["/usr/local/bin/myapp".to_string()]);
+        assert!(jail.spec.network.vnet);
+        assert_eq!(jail.spec.network.bridge, "keel0");
+        assert_eq!(jail.spec.network.address, "10.0.60.2/24");
+        assert_eq!(jail.spec.resources.cpu, "1");
+        assert_eq!(jail.spec.restart_policy, RestartPolicy::Always);
     }
 }
