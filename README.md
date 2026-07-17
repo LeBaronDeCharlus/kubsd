@@ -773,11 +773,21 @@ own idiom. `keel-agentd`'s heartbeat body gained exactly one new field
 locally); every other line of `keel-agentd`'s behavior is unchanged, since
 a replica is indistinguishable from any other jail to the node hosting it.
 On each incoming heartbeat, the control plane now also diffs each
-service's desired replica count against how many currently resolve to an
-`Alive` node plus a `running` jail, scheduling missing replicas from the
-lowest unplaced index and tearing down excess ones from the highest.
-`GET /services/<name>` (returning only `Alive`+`running` replicas) is the
-actual discovery surface this milestone exists to deliver. `keelctl apply`
+service's desired replica count against how many currently resolve to a
+placement on an `Alive` node, scheduling missing replicas from the lowest
+unplaced index and tearing down excess ones from the highest. That check
+deliberately stops at "node is `Alive`", not "jail is `running`": a
+replica that's crash-looping on a node that's still reachable is left
+alone by this mechanism entirely, since that node's own `keel-agentd` is
+already retrying it locally via its own Milestone-4 crash-loop backoff,
+and rescheduling on top of that would both fight the local backoff and
+orphan the original, untracked, on its old node. Only a node that's
+actually unreachable (`Dead`, or one the replica was somehow placed on
+without ever registering) triggers a real reschedule. `GET /services/<name>`
+(returning only `Alive`+`running` replicas) is the actual discovery
+surface this milestone exists to deliver, and keeps excluding a
+crash-looping replica from what's advertised as usable even though
+reconciliation now leaves it in place. `keelctl apply`
 sniffs `kind` before choosing `/jails/<name>` or `/services/<name>`;
 `get`/`delete` try the jail path first and fall back to the service path
 on a 404, since jail and service names share one flat namespace.
@@ -790,6 +800,22 @@ wrong, the implementer escalated, confirmed the real pairing, and
 corrected the two tests to match the system's actual
 state-only-after-confirmed-execution semantics instead of weakening that
 guarantee to fit the tests.
+
+The final whole-branch review, done only after all ten tasks had already
+passed their own individual reviews, caught one real bug none of those
+narrower passes could see: `ReconcileServices` originally treated a
+crash-looping-but-still-placed replica identically to a genuinely missing
+one, rescheduling it onto a different node without ever tearing down the
+original. Unlike the concurrency item below, this wasn't a rare timing
+window, it fired on any live-node crash-loop in a multi-node cluster, and
+a persistently crash-looping replica would have ping-ponged across nodes,
+leaving an orphan behind at every hop. Fixed by making "present" mean
+"placed on an `Alive` node" rather than "placed on an `Alive` node and
+currently `running`": a crash-looping replica is now left entirely to its
+node's own existing Milestone-4 local backoff, and reconciliation only
+reschedules when the node itself is unreachable. `GET /services/<name>`'s
+own discovery filter is unrelated and unchanged, it still excludes a
+crash-looping replica from what's advertised as usable.
 
 The design spec's own Open Questions accept one known, bounded
 concurrency limitation rather than fixing it in this milestone:
@@ -806,7 +832,7 @@ directly or the node is reused. This is accepted the same way Milestones
 beyond the ranking itself": a bounded, eventual-consistency gap rather
 than a correctness bug blocking the milestone.
 
-This milestone's verification so far is unit/integration-test-only: 331
+This milestone's verification so far is unit/integration-test-only: 332
 tests pass across every workspace crate, and clippy is clean relative to
 the pre-existing baseline. The real 3-node VM verification this design
 calls for, applying a 3-replica service across the live cluster, killing
@@ -850,7 +876,7 @@ separately before this milestone is considered fully verified.
 
 **Sub-project 6: service discovery and load balancing (in progress)**
 
-15. Service discovery via replica sets: `kind: Service`, deterministic replica naming, same-service scheduler spreading, auto-assigned addressing, heartbeat-piggybacked self-healing, `GET /services/<name>` discovery — code complete and reviewed (331 tests passing, clippy clean); real 3-node VM verification not yet run
+15. Service discovery via replica sets: `kind: Service`, deterministic replica naming, same-service scheduler spreading, auto-assigned addressing, heartbeat-piggybacked self-healing, `GET /services/<name>` discovery — code complete and reviewed (332 tests passing, clippy clean); real 3-node VM verification not yet run
 - Load-balancing/traffic-distribution mechanism across a service's replicas (a proxy, DNS-based round robin, or client-side selection) — not yet designed, a distinct later milestone in this same sub-project
 
 **Not yet designed** (future sub-projects, each will get its own spec):
