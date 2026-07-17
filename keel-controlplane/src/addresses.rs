@@ -1,0 +1,112 @@
+use ipnet::Ipv4Net;
+use std::collections::{HashMap, HashSet};
+use std::net::Ipv4Addr;
+
+/// Which addresses are currently assigned to a replica, per node -- lives
+/// next to `Placements`/`Services`: no persistence, forgotten on restart,
+/// populated when a replica is scheduled and freed when it's torn down.
+#[derive(Debug, Default, Clone)]
+pub struct UsedAddresses {
+    used_by_node: HashMap<String, HashSet<Ipv4Addr>>,
+    by_jail: HashMap<String, (String, Ipv4Addr)>,
+}
+
+impl UsedAddresses {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_used(&self, node_id: &str, addr: Ipv4Addr) -> bool {
+        self.used_by_node.get(node_id).is_some_and(|set| set.contains(&addr))
+    }
+
+    pub fn record(&mut self, jail_name: String, node_id: String, addr: Ipv4Addr) {
+        self.used_by_node.entry(node_id.clone()).or_default().insert(addr);
+        self.by_jail.insert(jail_name, (node_id, addr));
+    }
+
+    pub fn release(&mut self, jail_name: &str) {
+        if let Some((node_id, addr)) = self.by_jail.remove(jail_name) {
+            if let Some(set) = self.used_by_node.get_mut(&node_id) {
+                set.remove(&addr);
+            }
+        }
+    }
+
+    pub fn address_of(&self, jail_name: &str) -> Option<Ipv4Addr> {
+        self.by_jail.get(jail_name).map(|(_, addr)| *addr)
+    }
+}
+
+/// The first address in `pod_cidr` not already used on `node_id`, starting
+/// from network-plus-2. `Ipv4Net::hosts()` already excludes the network and
+/// broadcast addresses; the first host address (network-plus-1) is further
+/// skipped here because `keel-net`'s `bridge_gateway` (Milestone 14)
+/// permanently reserves it as the node's `keel0` bridge gateway.
+pub fn first_free_address(pod_cidr: Ipv4Net, node_id: &str, used: &UsedAddresses) -> Option<Ipv4Addr> {
+    pod_cidr.hosts().skip(1).find(|addr| !used.is_used(node_id, *addr))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cidr(s: &str) -> Ipv4Net {
+        s.parse().unwrap()
+    }
+
+    fn addr(s: &str) -> Ipv4Addr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn first_free_address_skips_network_and_network_plus_one() {
+        let used = UsedAddresses::new();
+        assert_eq!(first_free_address(cidr("10.0.60.0/24"), "node-1", &used), Some(addr("10.0.60.2")));
+    }
+
+    #[test]
+    fn first_free_address_skips_addresses_already_recorded_used_on_that_node() {
+        let mut used = UsedAddresses::new();
+        used.record("web-0".to_string(), "node-1".to_string(), addr("10.0.60.2"));
+        assert_eq!(first_free_address(cidr("10.0.60.0/24"), "node-1", &used), Some(addr("10.0.60.3")));
+    }
+
+    #[test]
+    fn first_free_address_on_a_different_node_is_unaffected_by_another_nodes_usage() {
+        let mut used = UsedAddresses::new();
+        used.record("web-0".to_string(), "node-1".to_string(), addr("10.0.60.2"));
+        assert_eq!(first_free_address(cidr("10.0.60.0/24"), "node-2", &used), Some(addr("10.0.60.2")));
+    }
+
+    #[test]
+    fn record_then_release_frees_the_address_again() {
+        let mut used = UsedAddresses::new();
+        used.record("web-0".to_string(), "node-1".to_string(), addr("10.0.60.2"));
+        used.release("web-0");
+        assert_eq!(first_free_address(cidr("10.0.60.0/24"), "node-1", &used), Some(addr("10.0.60.2")));
+    }
+
+    #[test]
+    fn address_of_returns_none_for_an_unrecorded_jail() {
+        let used = UsedAddresses::new();
+        assert_eq!(used.address_of("web-0"), None);
+    }
+
+    #[test]
+    fn address_of_returns_the_recorded_address() {
+        let mut used = UsedAddresses::new();
+        used.record("web-0".to_string(), "node-1".to_string(), addr("10.0.60.2"));
+        assert_eq!(used.address_of("web-0"), Some(addr("10.0.60.2")));
+    }
+
+    #[test]
+    fn a_full_pod_cidr_returns_none() {
+        // A /30 has exactly 2 host addresses (per `hosts()`): network+1 and
+        // network+2. Skipping network+1 leaves only network+2; once that's
+        // used, nothing remains.
+        let mut used = UsedAddresses::new();
+        used.record("web-0".to_string(), "node-1".to_string(), addr("10.0.60.2"));
+        assert_eq!(first_free_address(cidr("10.0.60.0/30"), "node-1", &used), None);
+    }
+}

@@ -1,3 +1,4 @@
+pub mod addresses;
 pub mod http;
 pub mod placements;
 pub mod registry;
