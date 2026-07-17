@@ -84,9 +84,12 @@ pub fn replica_name(service_name: &str, index: u32) -> String {
 }
 
 /// If `jail_name` is `"<service_name>-<index>"` for a plain non-negative
-/// integer index, returns that index.
+/// integer index, returns that index. Rejects non-canonical forms (leading
+/// `+`, leading zeros) so that e.g. `"web-03"` is not mistaken for index 3.
 pub fn replica_index(service_name: &str, jail_name: &str) -> Option<u32> {
-    jail_name.strip_prefix(service_name)?.strip_prefix('-')?.parse::<u32>().ok()
+    let suffix = jail_name.strip_prefix(service_name)?.strip_prefix('-')?;
+    let index: u32 = suffix.parse().ok()?;
+    if index.to_string() == suffix { Some(index) } else { None }
 }
 
 /// Returns the current owner of a name already present in `placements`, or
@@ -192,6 +195,16 @@ mod tests {
         assert_eq!(replica_index("web", "web-2"), Some(2));
         assert_eq!(replica_index("web", "other-2"), None);
         assert_eq!(replica_index("web", "web-not-a-number"), None);
+    }
+
+    #[test]
+    fn replica_index_rejects_a_leading_zero() {
+        assert_eq!(replica_index("web", "web-03"), None);
+    }
+
+    #[test]
+    fn replica_index_rejects_a_leading_plus() {
+        assert_eq!(replica_index("web", "web-+3"), None);
     }
 
     #[test]
