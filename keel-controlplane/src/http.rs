@@ -1,6 +1,6 @@
 use crate::tls;
 use crate::wire::{ErrorBody, Heartbeat, NodeRegistration, RegisterResponse};
-use crate::worker::{Command, ScheduleOrResolveError};
+use crate::worker::{Command, ReplicaAction, ScheduleOrResolveError};
 use rustls::{ServerConnection, StreamOwned};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -130,9 +130,12 @@ fn route(
         request.path.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
     match (request.method.as_str(), segments.as_slice()) {
         ("POST", ["nodes", "register"]) => handle_register(&request.body, commands),
-        ("POST", ["nodes", id, "heartbeat"]) => handle_heartbeat(id, &request.body, commands),
+        ("POST", ["nodes", id, "heartbeat"]) => handle_heartbeat(id, &request.body, commands, client_config),
         ("GET", ["nodes"]) => handle_list(commands),
         ("PUT", ["nodes", id, "jails", name]) => {
+            if let Some(response) = reject_if_service_owned(name, commands) {
+                return response;
+            }
             let (status, body) =
                 handle_forward(id, "PUT", &format!("/jails/{name}"), &request.body, commands, client_config);
             if (200..300).contains(&status) {
@@ -151,9 +154,18 @@ fn route(
             }
             (status, body)
         }
-        ("PUT", ["jails", name]) => handle_scheduled_apply(name, &request.body, commands, client_config),
+        ("PUT", ["jails", name]) => {
+            if let Some(response) = reject_if_service_owned(name, commands) {
+                return response;
+            }
+            handle_scheduled_apply(name, &request.body, commands, client_config)
+        }
         ("GET", ["jails", name]) => handle_scheduled_read(name, commands, client_config),
         ("DELETE", ["jails", name]) => handle_scheduled_delete(name, commands, client_config),
+        ("PUT", ["services", name]) => handle_apply_service(name, &request.body, commands, client_config),
+        ("GET", ["services", name]) => handle_get_service(name, commands),
+        ("DELETE", ["services", name]) => handle_delete_service(name, commands, client_config),
+        ("GET", ["services"]) => handle_list_services(commands),
         _ => error_response(404, format!("no route for {} {}", request.method, request.path)),
     }
 }
@@ -246,6 +258,162 @@ fn send_remove_placement(name: &str, commands: &Sender<Command>) {
     }
 }
 
+fn reject_if_service_owned(name: &str, commands: &Sender<Command>) -> Option<(u16, Vec<u8>)> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::OwnerOf(name.to_string(), reply_tx)).is_err() {
+        return Some(error_response(500, "control plane worker is not running".to_string()));
+    }
+    match reply_rx.recv() {
+        Ok(Some(crate::services::Owner::Service(owner))) => {
+            Some(error_response(400, format!("name '{name}' is already in use by service '{owner}'")))
+        }
+        Ok(_) => None,
+        Err(_) => Some(error_response(500, "control plane worker did not respond".to_string())),
+    }
+}
+
+fn handle_apply_service(
+    name: &str,
+    body: &[u8],
+    commands: &Sender<Command>,
+    client_config: &Arc<rustls::ClientConfig>,
+) -> (u16, Vec<u8>) {
+    let spec: keel_spec::ServiceSpec = match keel_spec::parse_and_validate_service(&String::from_utf8_lossy(body)) {
+        Ok(s) => s,
+        Err(e) => return error_response(400, format!("invalid spec: {e}")),
+    };
+    if spec.metadata.name != name {
+        return error_response(400, format!("path name '{name}' does not match spec.metadata.name '{}'", spec.metadata.name));
+    }
+
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::ApplyService(name.to_string(), spec.spec.replicas, spec.spec.template, reply_tx)).is_err() {
+        return error_response(500, "control plane worker is not running".to_string());
+    }
+    match reply_rx.recv() {
+        Ok(Ok(())) => {
+            reconcile_and_execute(commands, client_config);
+            (200, Vec::new())
+        }
+        Ok(Err(crate::services::ApplyServiceError::TemplateChanged(_))) => error_response(409, "service template is immutable once created; delete and re-apply instead".to_string()),
+        Ok(Err(e @ crate::services::ApplyServiceError::NameConflict { .. })) => error_response(400, e.to_string()),
+        Err(_) => error_response(500, "control plane worker did not respond".to_string()),
+    }
+}
+
+fn handle_get_service(name: &str, commands: &Sender<Command>) -> (u16, Vec<u8>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::DiscoverService(name.to_string(), reply_tx)).is_err() {
+        return error_response(500, "control plane worker is not running".to_string());
+    }
+    match reply_rx.recv() {
+        Ok(Ok(replicas)) => yaml_response(200, &replicas),
+        Ok(Err(e)) => error_response(404, e.to_string()),
+        Err(_) => error_response(500, "control plane worker did not respond".to_string()),
+    }
+}
+
+fn handle_list_services(commands: &Sender<Command>) -> (u16, Vec<u8>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::ListServices(reply_tx)).is_err() {
+        return error_response(500, "control plane worker is not running".to_string());
+    }
+    match reply_rx.recv() {
+        Ok(summaries) => yaml_response(200, &summaries),
+        Err(_) => error_response(500, "control plane worker did not respond".to_string()),
+    }
+}
+
+fn handle_delete_service(
+    name: &str,
+    commands: &Sender<Command>,
+    client_config: &Arc<rustls::ClientConfig>,
+) -> (u16, Vec<u8>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::DeleteService(name.to_string(), reply_tx)).is_err() {
+        return error_response(500, "control plane worker is not running".to_string());
+    }
+    match reply_rx.recv() {
+        Ok(Ok(actions)) => {
+            execute_replica_actions(actions, commands, client_config);
+            (200, Vec::new())
+        }
+        Ok(Err(e)) => error_response(404, e.to_string()),
+        Err(_) => error_response(500, "control plane worker did not respond".to_string()),
+    }
+}
+
+/// Asks the worker to compute the current best-effort set of scheduling/
+/// teardown actions across every service, then executes them. Called right
+/// after a successful `Service` apply and right after a successful
+/// heartbeat -- the latter is this milestone's "piggyback on the existing
+/// heartbeat traffic" self-healing mechanism: no new thread, no new timer,
+/// just one more step in handling a request that already happens every 5
+/// seconds per node.
+fn reconcile_and_execute(commands: &Sender<Command>, client_config: &Arc<rustls::ClientConfig>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::ReconcileServices(reply_tx)).is_err() {
+        return;
+    }
+    if let Ok(actions) = reply_rx.recv() {
+        execute_replica_actions(actions, commands, client_config);
+    }
+}
+
+fn execute_replica_actions(actions: Vec<ReplicaAction>, commands: &Sender<Command>, client_config: &Arc<rustls::ClientConfig>) {
+    for action in actions {
+        match action {
+            ReplicaAction::Schedule { replica_name, node_id, node_addr, template, address, prefix_len } => {
+                let cidr = format!("{address}/{prefix_len}");
+                let spec = template.to_jail_spec(&replica_name, &cidr);
+                let body = serde_yaml::to_string(&spec).expect("JailSpec serialization should not fail");
+                match forward(&node_addr, "PUT", &format!("/jails/{replica_name}"), body.as_bytes(), client_config) {
+                    Ok((status, _)) if (200..300).contains(&status) => {
+                        send_record_placement(&replica_name, &node_id, commands);
+                        send_record_replica_address(&replica_name, &node_id, address, commands);
+                    }
+                    Ok((status, resp_body)) => eprintln!(
+                        "keel-controlplane: failed to schedule replica '{replica_name}' on node '{node_id}': status {status}, body {:?}",
+                        String::from_utf8_lossy(&resp_body)
+                    ),
+                    Err(e) => eprintln!(
+                        "keel-controlplane: failed to reach node '{node_id}' at {node_addr} while scheduling replica '{replica_name}': {e}"
+                    ),
+                }
+            }
+            ReplicaAction::TearDown { replica_name, node_id, node_addr } => {
+                match forward(&node_addr, "DELETE", &format!("/jails/{replica_name}"), &[], client_config) {
+                    Ok((status, _)) if (200..300).contains(&status) => {
+                        send_remove_placement(&replica_name, commands);
+                        send_release_replica_address(&replica_name, commands);
+                    }
+                    Ok((status, resp_body)) => eprintln!(
+                        "keel-controlplane: failed to tear down replica '{replica_name}' on node '{node_id}': status {status}, body {:?}",
+                        String::from_utf8_lossy(&resp_body)
+                    ),
+                    Err(e) => eprintln!(
+                        "keel-controlplane: failed to reach node '{node_id}' at {node_addr} while tearing down replica '{replica_name}': {e}"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+fn send_record_replica_address(name: &str, node_id: &str, address: std::net::Ipv4Addr, commands: &Sender<Command>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::RecordReplicaAddress(name.to_string(), node_id.to_string(), address, reply_tx)).is_ok() {
+        let _ = reply_rx.recv();
+    }
+}
+
+fn send_release_replica_address(name: &str, commands: &Sender<Command>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::ReleaseReplicaAddress(name.to_string(), reply_tx)).is_ok() {
+        let _ = reply_rx.recv();
+    }
+}
+
 fn handle_register(body: &[u8], commands: &Sender<Command>) -> (u16, Vec<u8>) {
     let registration: NodeRegistration = match serde_yaml::from_slice(body) {
         Ok(r) => r,
@@ -271,7 +439,7 @@ fn handle_register(body: &[u8], commands: &Sender<Command>) -> (u16, Vec<u8>) {
     }
 }
 
-fn handle_heartbeat(id: &str, body: &[u8], commands: &Sender<Command>) -> (u16, Vec<u8>) {
+fn handle_heartbeat(id: &str, body: &[u8], commands: &Sender<Command>, client_config: &Arc<rustls::ClientConfig>) -> (u16, Vec<u8>) {
     let heartbeat: Heartbeat = match serde_yaml::from_slice(body) {
         Ok(h) => h,
         Err(e) => return error_response(400, format!("invalid YAML: {e}")),
@@ -284,7 +452,10 @@ fn handle_heartbeat(id: &str, body: &[u8], commands: &Sender<Command>) -> (u16, 
         return error_response(500, "control plane worker is not running".to_string());
     }
     match reply_rx.recv() {
-        Ok(Ok(())) => (200, Vec::new()),
+        Ok(Ok(())) => {
+            reconcile_and_execute(commands, client_config);
+            (200, Vec::new())
+        }
         Ok(Err(e)) => error_response(404, e.to_string()),
         Err(_) => error_response(500, "control plane worker did not respond".to_string()),
     }
@@ -1006,6 +1177,157 @@ mod tests {
             result.is_err() || result.unwrap().0 != 200,
             "expected the server's replaced certificate to be rejected by the client after reload"
         );
+    }
+
+    fn service_yaml(name: &str, replicas: u32) -> String {
+        format!(
+            "apiVersion: keel/v1\nkind: Service\nmetadata:\n  name: {name}\nspec:\n  replicas: {replicas}\n  template:\n    image: base/14.2-web\n    command: [\"/usr/local/bin/myapp\"]\n    network:\n      vnet: true\n      bridge: keel0\n    resources:\n      cpu: \"1\"\n      memory: 256M\n    restartPolicy: Always\n"
+        )
+    }
+
+    #[test]
+    fn put_service_creates_and_schedules_replicas_across_registered_nodes() {
+        let cp_addr = start_test_server();
+        let node_a = start_fake_remote_tls_agentd(200, "running: true\n");
+        let node_b = start_fake_remote_tls_agentd(200, "running: true\n");
+        register_node(&cp_addr, "node-a", &node_a);
+        register_node(&cp_addr, "node-b", &node_b);
+
+        let (status, _) = send_request(&cp_addr, "PUT", "/services/web", &service_yaml("web", 2));
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn put_service_with_zero_replicas_succeeds_and_schedules_nothing() {
+        let cp_addr = start_test_server();
+        let (status, _) = send_request(&cp_addr, "PUT", "/services/web", &service_yaml("web", 0));
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn put_service_changing_the_template_on_an_existing_service_returns_409() {
+        let cp_addr = start_test_server();
+        send_request(&cp_addr, "PUT", "/services/web", &service_yaml("web", 1));
+        let changed = service_yaml("web", 1).replace("base/14.2-web", "base/different-image");
+        let (status, _) = send_request(&cp_addr, "PUT", "/services/web", &changed);
+        assert_eq!(status, 409);
+    }
+
+    #[test]
+    fn put_service_colliding_with_an_existing_unmanaged_jail_returns_400() {
+        let cp_addr = start_test_server();
+        let node_addr = start_fake_remote_tls_agentd(200, "running: true\n");
+        register_node(&cp_addr, "node-a", &node_addr);
+        send_request(&cp_addr, "PUT", "/nodes/node-a/jails/web-0", "apiVersion: keel/v1\n");
+
+        let (status, body) = send_request(&cp_addr, "PUT", "/services/web", &service_yaml("web", 1));
+        assert_eq!(status, 400);
+        assert!(body.contains("web-0"), "expected the conflicting name in the error, got: {body}");
+    }
+
+    #[test]
+    fn put_jail_colliding_with_an_existing_service_replica_returns_400() {
+        let cp_addr = start_test_server();
+        let node_addr = start_fake_remote_tls_agentd(200, "running: true\n");
+        register_node(&cp_addr, "node-a", &node_addr);
+        send_request(&cp_addr, "PUT", "/services/web", &service_yaml("web", 1));
+
+        let (status, body) = send_request(&cp_addr, "PUT", "/nodes/node-a/jails/web-0", "apiVersion: keel/v1\n");
+        assert_eq!(status, 400);
+        assert!(body.contains("service 'web'"), "expected the owning service named in the error, got: {body}");
+    }
+
+    #[test]
+    fn get_service_returns_only_alive_and_running_replicas() {
+        let cp_addr = start_test_server();
+        let node_addr = start_fake_remote_tls_agentd(200, "running: true\n");
+        register_node(&cp_addr, "node-a", &node_addr);
+        send_request(&cp_addr, "PUT", "/services/web", &service_yaml("web", 1));
+
+        send_request(&cp_addr, "POST", "/nodes/node-a/heartbeat", "committed_cpu: 0\ncommitted_memory: 0\njails:\n  - name: web-0\n    running: true\n");
+
+        let (status, body) = send_request(&cp_addr, "GET", "/services/web", "");
+        assert_eq!(status, 200);
+        assert!(body.contains("web-0"), "expected the healthy replica listed, got: {body}");
+        assert!(body.contains("node-a"), "got: {body}");
+    }
+
+    #[test]
+    fn get_service_omits_a_crash_looping_replica() {
+        let cp_addr = start_test_server();
+        let node_addr = start_fake_remote_tls_agentd(200, "running: true\n");
+        register_node(&cp_addr, "node-a", &node_addr);
+        send_request(&cp_addr, "PUT", "/services/web", &service_yaml("web", 1));
+
+        send_request(&cp_addr, "POST", "/nodes/node-a/heartbeat", "committed_cpu: 0\ncommitted_memory: 0\njails:\n  - name: web-0\n    running: false\n");
+
+        let (status, body) = send_request(&cp_addr, "GET", "/services/web", "");
+        assert_eq!(status, 200);
+        assert_eq!(body.trim(), "[]", "expected no replicas listed while crash-looping, got: {body}");
+    }
+
+    #[test]
+    fn get_service_on_an_unknown_name_returns_404() {
+        let cp_addr = start_test_server();
+        let (status, body) = send_request(&cp_addr, "GET", "/services/missing", "");
+        assert_eq!(status, 404);
+        assert!(body.contains("missing"));
+    }
+
+    #[test]
+    fn get_services_bare_lists_every_service() {
+        let cp_addr = start_test_server();
+        send_request(&cp_addr, "PUT", "/services/web", &service_yaml("web", 2));
+        send_request(&cp_addr, "PUT", "/services/api", &service_yaml("api", 1));
+
+        let (status, body) = send_request(&cp_addr, "GET", "/services", "");
+        assert_eq!(status, 200);
+        assert!(body.contains("web"), "got: {body}");
+        assert!(body.contains("api"), "got: {body}");
+    }
+
+    #[test]
+    fn delete_service_tears_down_every_placed_replica() {
+        let cp_addr = start_test_server();
+        let node_addr = start_fake_remote_tls_agentd(200, "running: true\n");
+        register_node(&cp_addr, "node-a", &node_addr);
+        send_request(&cp_addr, "PUT", "/services/web", &service_yaml("web", 1));
+        send_request(&cp_addr, "POST", "/nodes/node-a/heartbeat", "committed_cpu: 0\ncommitted_memory: 0\njails:\n  - name: web-0\n    running: true\n");
+
+        let (status, _) = send_request(&cp_addr, "DELETE", "/services/web", "");
+        assert_eq!(status, 200);
+
+        let (status, _) = send_request(&cp_addr, "GET", "/services/web", "");
+        assert_eq!(status, 404, "expected the service itself to be forgotten after delete");
+    }
+
+    #[test]
+    fn delete_service_on_an_unknown_name_returns_404() {
+        let cp_addr = start_test_server();
+        let (status, _) = send_request(&cp_addr, "DELETE", "/services/missing", "");
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn heartbeat_piggybacks_reconciliation_and_replaces_a_replica_once_its_node_is_registered() {
+        let cp_addr = start_test_server();
+        let node_addr = start_fake_remote_tls_agentd(200, "running: true\n");
+        // Apply a 1-replica service before any node exists: it succeeds
+        // (best-effort), placing nothing yet.
+        let (status, _) = send_request(&cp_addr, "PUT", "/services/web", &service_yaml("web", 1));
+        assert_eq!(status, 200);
+        let (_, body) = send_request(&cp_addr, "GET", "/services/web", "");
+        assert_eq!(body.trim(), "[]", "expected no capacity yet, got: {body}");
+
+        // Once a node registers and heartbeats, the very next heartbeat's
+        // piggybacked reconciliation should place the missing replica.
+        register_node(&cp_addr, "node-a", &node_addr);
+        send_request(&cp_addr, "POST", "/nodes/node-a/heartbeat", "committed_cpu: 0\ncommitted_memory: 0\n");
+        send_request(&cp_addr, "POST", "/nodes/node-a/heartbeat", "committed_cpu: 0\ncommitted_memory: 0\njails:\n  - name: web-0\n    running: true\n");
+
+        let (status, body) = send_request(&cp_addr, "GET", "/services/web", "");
+        assert_eq!(status, 200);
+        assert!(body.contains("web-0"), "expected the replica to have been scheduled by heartbeat-piggybacked reconciliation, got: {body}");
     }
 
     #[test]
