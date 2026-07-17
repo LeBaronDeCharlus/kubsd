@@ -21,6 +21,10 @@ impl Placements {
     pub fn remove(&mut self, jail_name: &str) {
         self.by_jail.remove(jail_name);
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.by_jail.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
 }
 
 #[cfg(test)]
@@ -54,5 +58,15 @@ mod tests {
         placements.set("web-1".to_string(), "node-1".to_string());
         placements.remove("web-1");
         assert_eq!(placements.get("web-1"), None);
+    }
+
+    #[test]
+    fn iter_yields_every_entry() {
+        let mut placements = Placements::new();
+        placements.set("web-1".to_string(), "node-1".to_string());
+        placements.set("web-2".to_string(), "node-2".to_string());
+        let mut entries: Vec<(&str, &str)> = placements.iter().collect();
+        entries.sort();
+        assert_eq!(entries, vec![("web-1", "node-1"), ("web-2", "node-2")]);
     }
 }
