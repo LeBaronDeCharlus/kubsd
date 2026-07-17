@@ -1732,6 +1732,18 @@ Add to `keel-controlplane/src/worker.rs`'s `#[cfg(test)] mod tests`, a helper an
         let actions = rx.recv().unwrap().unwrap();
         assert_eq!(actions.len(), 2);
 
+        // DeleteService only forgets the service definition and reports what
+        // needs tearing down; it never touches Placements itself. In the real
+        // system, Task 8's execute_replica_actions removes each placement
+        // only after successfully forwarding that replica's teardown to its
+        // node -- simulate that pairing here before checking the name is
+        // free again, since nothing at this layer does it automatically.
+        for i in 0..2 {
+            let (tx, rx) = mpsc::channel();
+            commands.send(Command::RemovePlacement(format!("web-{i}"), tx)).unwrap();
+            rx.recv().unwrap();
+        }
+
         // The service definition itself is gone: a later apply of the same
         // name with a different template is a fresh create, not a rejected
         // template change.
@@ -1762,14 +1774,22 @@ Add to `keel-controlplane/src/worker.rs`'s `#[cfg(test)] mod tests`, a helper an
         commands.send(Command::DiscoverService("web".to_string(), dtx)).unwrap();
         assert_eq!(drx.recv().unwrap().unwrap()[0].address, "10.0.60.2");
 
+        // A real teardown always pairs ReleaseReplicaAddress with
+        // RemovePlacement -- both fire together from Task 8's
+        // execute_replica_actions right after a successful DELETE forward.
+        // Simulate that pairing here rather than releasing in isolation,
+        // which can't actually happen against a healthy, still-placed
+        // replica in the deployed system.
         let (rtx, rrx) = mpsc::channel();
         commands.send(Command::ReleaseReplicaAddress("web-0".to_string(), rtx)).unwrap();
         rrx.recv().unwrap();
-        // Releasing just frees the address for reuse; it doesn't affect
-        // Placements/Registry, so discovery is unaffected by this alone.
+        let (rp_tx, rp_rx) = mpsc::channel();
+        commands.send(Command::RemovePlacement("web-0".to_string(), rp_tx)).unwrap();
+        rp_rx.recv().unwrap();
+
         let (dtx2, drx2) = mpsc::channel();
         commands.send(Command::DiscoverService("web".to_string(), dtx2)).unwrap();
-        assert_eq!(drx2.recv().unwrap().unwrap()[0].address, "10.0.60.2", "release only frees bookkeeping, not the live report");
+        assert_eq!(drx2.recv().unwrap().unwrap(), vec![], "a fully torn-down replica is no longer discoverable");
     }
 ```
 
