@@ -51,6 +51,19 @@ pub struct ErrorBody {
     pub error: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServiceReplica {
+    pub name: String,
+    pub node: String,
+    pub address: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServiceSummary {
+    pub name: String,
+    pub desired_replicas: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +149,19 @@ mod tests {
         let yaml = serde_yaml::to_string(&body).unwrap();
         let parsed: ErrorBody = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed, body);
+    }
+
+    #[test]
+    fn service_replica_round_trips_through_yaml() {
+        let replica = ServiceReplica { name: "web-0".to_string(), node: "node-4".to_string(), address: "10.0.60.2".to_string() };
+        let yaml = serde_yaml::to_string(&replica).unwrap();
+        assert_eq!(serde_yaml::from_str::<ServiceReplica>(&yaml).unwrap(), replica);
+    }
+
+    #[test]
+    fn service_summary_round_trips_through_yaml() {
+        let summary = ServiceSummary { name: "web".to_string(), desired_replicas: 3 };
+        let yaml = serde_yaml::to_string(&summary).unwrap();
+        assert_eq!(serde_yaml::from_str::<ServiceSummary>(&yaml).unwrap(), summary);
     }
 }
