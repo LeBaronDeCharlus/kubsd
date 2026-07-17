@@ -295,7 +295,7 @@ fn handle_apply_service(
             reconcile_and_execute(commands, client_config);
             (200, Vec::new())
         }
-        Ok(Err(crate::services::ApplyServiceError::TemplateChanged(_))) => error_response(409, "service template is immutable once created; delete and re-apply instead".to_string()),
+        Ok(Err(e @ crate::services::ApplyServiceError::TemplateChanged(_))) => error_response(409, e.to_string()),
         Ok(Err(e @ crate::services::ApplyServiceError::NameConflict { .. })) => error_response(400, e.to_string()),
         Err(_) => error_response(500, "control plane worker did not respond".to_string()),
     }
