@@ -24,7 +24,7 @@ pub enum PlacementError {
 
 pub enum Command {
     Register(String, String, f64, u64, Sender<Result<ipnet::Ipv4Net, PodCidrCollision>>),
-    Heartbeat(String, f64, u64, Sender<Result<(), UnknownNode>>),
+    Heartbeat(String, f64, u64, Vec<crate::wire::JailHealth>, Sender<Result<(), UnknownNode>>),
     List(Sender<Vec<NodeStatus>>),
     Resolve(String, Sender<Result<String, ResolveError>>),
     ResolveOrSchedule(String, Sender<Result<(String, String), ScheduleOrResolveError>>),
@@ -49,8 +49,8 @@ fn handle_command(registry: &mut Registry, placements: &mut Placements, command:
             let result = registry.register(id, addr, capacity_cpu, capacity_memory, Instant::now());
             let _ = reply.send(result);
         }
-        Command::Heartbeat(id, committed_cpu, committed_memory, reply) => {
-            let result = registry.heartbeat(&id, committed_cpu, committed_memory, Instant::now());
+        Command::Heartbeat(id, committed_cpu, committed_memory, jails, reply) => {
+            let result = registry.heartbeat(&id, committed_cpu, committed_memory, jails, Instant::now());
             let _ = reply.send(result);
         }
         Command::List(reply) => {
@@ -145,7 +145,7 @@ mod tests {
         let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new()).1;
 
         let (hb_tx, hb_rx) = mpsc::channel();
-        commands.send(Command::Heartbeat("missing".to_string(), 0.0, 0, hb_tx)).unwrap();
+        commands.send(Command::Heartbeat("missing".to_string(), 0.0, 0, vec![], hb_tx)).unwrap();
         assert!(hb_rx.recv().unwrap().is_err());
     }
 
@@ -166,7 +166,7 @@ mod tests {
         reg_rx.recv().unwrap().unwrap();
 
         let (hb_tx, hb_rx) = mpsc::channel();
-        commands.send(Command::Heartbeat("node-1".to_string(), 0.0, 0, hb_tx)).unwrap();
+        commands.send(Command::Heartbeat("node-1".to_string(), 0.0, 0, vec![], hb_tx)).unwrap();
         assert!(hb_rx.recv().unwrap().is_ok());
     }
 
@@ -219,7 +219,7 @@ mod tests {
 
     fn heartbeat_node(commands: &Sender<Command>, id: &str, committed_cpu: f64, committed_memory: u64) {
         let (hb_tx, hb_rx) = mpsc::channel();
-        commands.send(Command::Heartbeat(id.to_string(), committed_cpu, committed_memory, hb_tx)).unwrap();
+        commands.send(Command::Heartbeat(id.to_string(), committed_cpu, committed_memory, vec![], hb_tx)).unwrap();
         hb_rx.recv().unwrap().unwrap();
     }
 

@@ -278,7 +278,7 @@ fn handle_heartbeat(id: &str, body: &[u8], commands: &Sender<Command>) -> (u16, 
     };
     let (reply_tx, reply_rx) = mpsc::channel();
     if commands
-        .send(Command::Heartbeat(id.to_string(), heartbeat.committed_cpu, heartbeat.committed_memory, reply_tx))
+        .send(Command::Heartbeat(id.to_string(), heartbeat.committed_cpu, heartbeat.committed_memory, heartbeat.jails, reply_tx))
         .is_err()
     {
         return error_response(500, "control plane worker is not running".to_string());

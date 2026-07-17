@@ -15,6 +15,7 @@ struct NodeRecord {
     committed_cpu: f64,
     committed_memory: u64,
     pod_cidr: Ipv4Net,
+    running_jails: HashMap<String, bool>,
 }
 
 #[derive(Debug)]
@@ -76,6 +77,7 @@ impl Registry {
                 committed_cpu: 0.0,
                 committed_memory: 0,
                 pod_cidr,
+                running_jails: HashMap::new(),
             },
         );
         Ok(pod_cidr)
@@ -86,6 +88,7 @@ impl Registry {
         id: &str,
         committed_cpu: f64,
         committed_memory: u64,
+        jails: Vec<crate::wire::JailHealth>,
         now: Instant,
     ) -> Result<(), UnknownNode> {
         match self.nodes.get_mut(id) {
@@ -93,10 +96,25 @@ impl Registry {
                 record.last_heartbeat = now;
                 record.committed_cpu = committed_cpu;
                 record.committed_memory = committed_memory;
+                record.running_jails = jails.into_iter().map(|j| (j.name, j.running)).collect();
                 Ok(())
             }
             None => Err(UnknownNode(id.to_string())),
         }
+    }
+
+    /// Whether `node_id`'s most recent heartbeat reported `jail_name` as
+    /// running. `false` for an unknown node, an unknown jail, or a node
+    /// that has never heartbeated with jail health at all.
+    pub fn is_jail_running(&self, node_id: &str, jail_name: &str) -> bool {
+        self.nodes.get(node_id).and_then(|r| r.running_jails.get(jail_name)).copied().unwrap_or(false)
+    }
+
+    /// The node's assigned `pod_cidr`, typed -- for consumers (address
+    /// auto-assignment) that need to do arithmetic on it rather than just
+    /// display it, unlike `list()`'s stringified `NodeStatus.pod_cidr`.
+    pub fn pod_cidr(&self, node_id: &str) -> Option<Ipv4Net> {
+        self.nodes.get(node_id).map(|r| r.pod_cidr)
     }
 
     pub fn list(&self, now: Instant) -> Vec<NodeStatus> {
@@ -217,7 +235,7 @@ mod tests {
         registry.register("node-1".to_string(), "10.0.0.1".to_string(), 4.0, 8 * 1024 * 1024 * 1024, t0).unwrap();
 
         let t1 = t0 + Duration::from_secs(10);
-        registry.heartbeat("node-1", 0.0, 0, t1).unwrap();
+        registry.heartbeat("node-1", 0.0, 0, vec![], t1).unwrap();
 
         let statuses = registry.list(t1);
         assert_eq!(statuses[0].last_seen_secs, 0);
@@ -226,7 +244,7 @@ mod tests {
     #[test]
     fn heartbeat_on_an_unknown_node_returns_unknown_node_error() {
         let mut registry = Registry::new(test_cluster_cidr());
-        let err = registry.heartbeat("missing", 0.0, 0, Instant::now()).unwrap_err();
+        let err = registry.heartbeat("missing", 0.0, 0, vec![], Instant::now()).unwrap_err();
         assert_eq!(err, UnknownNode("missing".to_string()));
         assert_eq!(err.to_string(), "unknown node 'missing'");
     }
@@ -307,12 +325,78 @@ mod tests {
         registry.register("node-1".to_string(), "10.0.0.1".to_string(), 4.0, 8 * 1024 * 1024 * 1024, t0).unwrap();
 
         let t1 = t0 + Duration::from_secs(5);
-        registry.heartbeat("node-1", 2.0, 1024 * 1024 * 1024, t1).unwrap();
+        registry.heartbeat("node-1", 2.0, 1024 * 1024 * 1024, vec![], t1).unwrap();
 
         let statuses = registry.list(t1);
         assert_eq!(statuses[0].committed_cpu, 2.0);
         assert_eq!(statuses[0].committed_memory, 1024 * 1024 * 1024);
         assert_eq!(statuses[0].capacity_cpu, 4.0, "heartbeat must not change capacity");
         assert_eq!(statuses[0].capacity_memory, 8 * 1024 * 1024 * 1024, "heartbeat must not change capacity");
+    }
+
+    #[test]
+    fn heartbeat_records_per_jail_running_status() {
+        let mut registry = Registry::new(test_cluster_cidr());
+        let now = Instant::now();
+        registry.register("node-1".to_string(), "10.0.0.1".to_string(), 4.0, 8 * 1024 * 1024 * 1024, now).unwrap();
+
+        registry
+            .heartbeat(
+                "node-1",
+                0.0,
+                0,
+                vec![
+                    crate::wire::JailHealth { name: "web-0".to_string(), running: true },
+                    crate::wire::JailHealth { name: "web-1".to_string(), running: false },
+                ],
+                now,
+            )
+            .unwrap();
+
+        assert!(registry.is_jail_running("node-1", "web-0"));
+        assert!(!registry.is_jail_running("node-1", "web-1"));
+    }
+
+    #[test]
+    fn is_jail_running_on_an_unreported_jail_is_false() {
+        let mut registry = Registry::new(test_cluster_cidr());
+        let now = Instant::now();
+        registry.register("node-1".to_string(), "10.0.0.1".to_string(), 4.0, 8 * 1024 * 1024 * 1024, now).unwrap();
+        assert!(!registry.is_jail_running("node-1", "web-0"));
+    }
+
+    #[test]
+    fn is_jail_running_on_an_unknown_node_is_false() {
+        let registry = Registry::new(test_cluster_cidr());
+        assert!(!registry.is_jail_running("missing", "web-0"));
+    }
+
+    #[test]
+    fn a_later_heartbeat_replaces_the_previous_jail_health_report_wholesale() {
+        let mut registry = Registry::new(test_cluster_cidr());
+        let t0 = Instant::now();
+        registry.register("node-1".to_string(), "10.0.0.1".to_string(), 4.0, 8 * 1024 * 1024 * 1024, t0).unwrap();
+        registry
+            .heartbeat("node-1", 0.0, 0, vec![crate::wire::JailHealth { name: "web-0".to_string(), running: true }], t0)
+            .unwrap();
+
+        let t1 = t0 + Duration::from_secs(5);
+        registry.heartbeat("node-1", 0.0, 0, vec![], t1).unwrap();
+
+        assert!(!registry.is_jail_running("node-1", "web-0"), "a heartbeat with no jails must clear the previous report");
+    }
+
+    #[test]
+    fn pod_cidr_returns_the_registered_nodes_block() {
+        let mut registry = Registry::new(test_cluster_cidr());
+        let now = Instant::now();
+        registry.register("node-1".to_string(), "10.0.0.1".to_string(), 4.0, 8 * 1024 * 1024 * 1024, now).unwrap();
+        assert_eq!(registry.pod_cidr("node-1"), Some("10.0.131.0/24".parse().unwrap()));
+    }
+
+    #[test]
+    fn pod_cidr_on_an_unknown_node_is_none() {
+        let registry = Registry::new(test_cluster_cidr());
+        assert_eq!(registry.pod_cidr("missing"), None);
     }
 }

@@ -12,6 +12,14 @@ pub struct NodeRegistration {
 pub struct Heartbeat {
     pub committed_cpu: f64,
     pub committed_memory: u64,
+    #[serde(default)]
+    pub jails: Vec<JailHealth>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JailHealth {
+    pub name: String,
+    pub running: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -88,10 +96,31 @@ mod tests {
 
     #[test]
     fn heartbeat_round_trips_through_yaml() {
-        let heartbeat = Heartbeat { committed_cpu: 2.0, committed_memory: 1024 * 1024 * 1024 };
+        let heartbeat = Heartbeat { committed_cpu: 2.0, committed_memory: 1024 * 1024 * 1024, jails: vec![] };
         let yaml = serde_yaml::to_string(&heartbeat).unwrap();
         let parsed: Heartbeat = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed, heartbeat);
+    }
+
+    #[test]
+    fn heartbeat_with_jails_round_trips_through_yaml() {
+        let heartbeat = Heartbeat {
+            committed_cpu: 2.0,
+            committed_memory: 1024 * 1024 * 1024,
+            jails: vec![
+                JailHealth { name: "web-0".to_string(), running: true },
+                JailHealth { name: "web-1".to_string(), running: false },
+            ],
+        };
+        let yaml = serde_yaml::to_string(&heartbeat).unwrap();
+        let parsed: Heartbeat = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed, heartbeat);
+    }
+
+    #[test]
+    fn heartbeat_without_a_jails_field_defaults_to_empty() {
+        let parsed: Heartbeat = serde_yaml::from_str("committed_cpu: 1\ncommitted_memory: 2\n").unwrap();
+        assert_eq!(parsed.jails, vec![]);
     }
 
     #[test]

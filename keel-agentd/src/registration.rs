@@ -110,12 +110,24 @@ fn heartbeat_once(
     commands: &Sender<crate::worker::Command>,
     client_config: &Arc<rustls::ClientConfig>,
 ) -> Result<(), String> {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (resources_tx, resources_rx) = std::sync::mpsc::channel();
     commands
-        .send(crate::worker::Command::CommittedResources(tx))
+        .send(crate::worker::Command::CommittedResources(resources_tx))
         .map_err(|_| "worker is not running".to_string())?;
-    let (committed_cpu, committed_memory) = rx.recv().map_err(|_| "worker did not respond".to_string())?;
-    let body = format!("committed_cpu: {committed_cpu}\ncommitted_memory: {committed_memory}\n");
+    let (committed_cpu, committed_memory) = resources_rx.recv().map_err(|_| "worker did not respond".to_string())?;
+
+    let (jails_tx, jails_rx) = std::sync::mpsc::channel();
+    commands
+        .send(crate::worker::Command::Get(None, jails_tx))
+        .map_err(|_| "worker is not running".to_string())?;
+    let statuses = jails_rx.recv().map_err(|_| "worker did not respond".to_string())?;
+    let jails: Vec<keel_controlplane::wire::JailHealth> = statuses
+        .into_iter()
+        .map(|s| keel_controlplane::wire::JailHealth { name: s.record.spec.metadata.name, running: s.running })
+        .collect();
+
+    let heartbeat = keel_controlplane::wire::Heartbeat { committed_cpu, committed_memory, jails };
+    let body = serde_yaml::to_string(&heartbeat).map_err(|e| format!("failed to serialize heartbeat: {e}"))?;
     send_request(control_plane_addr, "POST", &format!("/nodes/{node_id}/heartbeat"), &body, client_config)?;
     Ok(())
 }
