@@ -417,7 +417,12 @@ mod tests {
     fn start_test_server() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let (_worker_handle, commands) = worker::spawn(Registry::new("10.0.0.0/16".parse().unwrap()), Placements::new());
+        let (_worker_handle, commands) = worker::spawn(
+            Registry::new("10.0.0.0/16".parse().unwrap()),
+            Placements::new(),
+            crate::services::Services::new(),
+            crate::addresses::UsedAddresses::new(),
+        );
         let reloading_tls = tls::ReloadingTls::spawn(
             fixture("fixture-node.crt"),
             fixture("fixture-node.key"),
@@ -975,7 +980,12 @@ mod tests {
         )
         .unwrap();
 
-        let (_worker_handle, commands) = worker::spawn(Registry::new("10.0.0.0/16".parse().unwrap()), Placements::new());
+        let (_worker_handle, commands) = worker::spawn(
+            Registry::new("10.0.0.0/16".parse().unwrap()),
+            Placements::new(),
+            crate::services::Services::new(),
+            crate::addresses::UsedAddresses::new(),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         thread::spawn(move || run(listener, commands, reloading));
@@ -1017,7 +1027,12 @@ mod tests {
         )
         .unwrap();
 
-        let (_worker_handle, commands) = worker::spawn(Registry::new("10.0.0.0/16".parse().unwrap()), Placements::new());
+        let (_worker_handle, commands) = worker::spawn(
+            Registry::new("10.0.0.0/16".parse().unwrap()),
+            Placements::new(),
+            crate::services::Services::new(),
+            crate::addresses::UsedAddresses::new(),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         thread::spawn(move || run(listener, commands, reloading));

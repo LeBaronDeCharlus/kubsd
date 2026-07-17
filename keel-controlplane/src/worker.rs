@@ -5,6 +5,8 @@ use crate::wire::{NodeState, NodeStatus};
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
+use crate::addresses::UsedAddresses;
+use crate::services::{self, Owner, Services};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ScheduleOrResolveError {
@@ -31,19 +33,32 @@ pub enum Command {
     ResolvePlacement(String, Sender<Result<(String, String), PlacementError>>),
     RecordPlacement(String, String, Sender<()>),
     RemovePlacement(String, Sender<()>),
+    OwnerOf(String, Sender<Option<Owner>>),
+    ApplyService(String, u32, keel_spec::JailTemplate, Sender<Result<(), services::ApplyServiceError>>),
 }
 
-pub fn spawn(mut registry: Registry, mut placements: Placements) -> (JoinHandle<()>, Sender<Command>) {
+pub fn spawn(
+    mut registry: Registry,
+    mut placements: Placements,
+    mut services: Services,
+    mut used_addresses: UsedAddresses,
+) -> (JoinHandle<()>, Sender<Command>) {
     let (tx, rx) = mpsc::channel::<Command>();
     let handle = thread::spawn(move || {
         for command in rx {
-            handle_command(&mut registry, &mut placements, command);
+            handle_command(&mut registry, &mut placements, &mut services, &mut used_addresses, command);
         }
     });
     (handle, tx)
 }
 
-fn handle_command(registry: &mut Registry, placements: &mut Placements, command: Command) {
+fn handle_command(
+    registry: &mut Registry,
+    placements: &mut Placements,
+    services: &mut Services,
+    used_addresses: &mut UsedAddresses,
+    command: Command,
+) {
     match command {
         Command::Register(id, addr, capacity_cpu, capacity_memory, reply) => {
             let result = registry.register(id, addr, capacity_cpu, capacity_memory, Instant::now());
@@ -106,20 +121,51 @@ fn handle_command(registry: &mut Registry, placements: &mut Placements, command:
             placements.remove(&jail_name);
             let _ = reply.send(());
         }
+        Command::OwnerOf(name, reply) => {
+            let _ = reply.send(services::owner_of(&name, placements, services));
+        }
+        Command::ApplyService(name, replicas, template, reply) => {
+            let result = (|| {
+                for i in 0..replicas {
+                    let candidate = services::replica_name(&name, i);
+                    if let Some(owner) = services::owner_of(&candidate, placements, services) {
+                        let is_self = matches!(&owner, Owner::Service(other) if other == &name);
+                        if !is_self {
+                            return Err(services::ApplyServiceError::NameConflict { name: candidate, owner });
+                        }
+                    }
+                }
+                services.apply(name, replicas, template)
+            })();
+            let _ = reply.send(result);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::addresses::UsedAddresses;
+    use crate::services::{ApplyServiceError, Owner, Services};
+    use keel_spec::{JailTemplate, ResourcesSpec, RestartPolicy, TemplateNetworkSpec};
 
     fn test_cluster_cidr() -> ipnet::Ipv4Net {
         "10.0.0.0/16".parse().unwrap()
     }
 
+    fn template() -> JailTemplate {
+        JailTemplate {
+            image: "base/14.2-web".to_string(),
+            command: vec!["/usr/local/bin/myapp".to_string()],
+            network: TemplateNetworkSpec { vnet: true, bridge: "keel0".to_string() },
+            resources: ResourcesSpec { cpu: "1".to_string(), memory: "256M".to_string() },
+            restart_policy: RestartPolicy::Always,
+        }
+    }
+
     #[test]
     fn register_command_makes_the_node_visible_in_list() {
-        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new()).1;
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(), UsedAddresses::new()).1;
 
         let (reg_tx, reg_rx) = mpsc::channel();
         commands
@@ -142,7 +188,7 @@ mod tests {
 
     #[test]
     fn heartbeat_command_on_unknown_id_returns_an_error() {
-        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new()).1;
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(), UsedAddresses::new()).1;
 
         let (hb_tx, hb_rx) = mpsc::channel();
         commands.send(Command::Heartbeat("missing".to_string(), 0.0, 0, vec![], hb_tx)).unwrap();
@@ -151,7 +197,7 @@ mod tests {
 
     #[test]
     fn heartbeat_command_on_a_registered_node_succeeds() {
-        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new()).1;
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(), UsedAddresses::new()).1;
 
         let (reg_tx, reg_rx) = mpsc::channel();
         commands
@@ -172,7 +218,7 @@ mod tests {
 
     #[test]
     fn list_command_on_a_fresh_worker_is_empty() {
-        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new()).1;
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(), UsedAddresses::new()).1;
 
         let (list_tx, list_rx) = mpsc::channel();
         commands.send(Command::List(list_tx)).unwrap();
@@ -181,7 +227,7 @@ mod tests {
 
     #[test]
     fn resolve_command_on_a_registered_alive_node_returns_its_address() {
-        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new()).1;
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(), UsedAddresses::new()).1;
 
         let (reg_tx, reg_rx) = mpsc::channel();
         commands
@@ -202,7 +248,7 @@ mod tests {
 
     #[test]
     fn resolve_command_on_an_unknown_node_returns_an_error() {
-        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new()).1;
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(), UsedAddresses::new()).1;
 
         let (resolve_tx, resolve_rx) = mpsc::channel();
         commands.send(Command::Resolve("missing".to_string(), resolve_tx)).unwrap();
@@ -225,7 +271,7 @@ mod tests {
 
     #[test]
     fn resolve_or_schedule_on_a_fresh_jail_name_with_equal_headroom_breaks_ties_by_ascending_id() {
-        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new()).1;
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(), UsedAddresses::new()).1;
         register_node(&commands, "node-1", "10.0.0.1", 4.0, 8 * 1024 * 1024 * 1024);
         register_node(&commands, "node-2", "10.0.0.2", 4.0, 8 * 1024 * 1024 * 1024);
 
@@ -236,7 +282,7 @@ mod tests {
 
     #[test]
     fn resolve_or_schedule_on_a_fresh_jail_name_schedules_onto_the_node_with_more_headroom() {
-        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new()).1;
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(), UsedAddresses::new()).1;
         register_node(&commands, "node-1", "10.0.0.1", 4.0, 100);
         register_node(&commands, "node-2", "10.0.0.2", 4.0, 100);
         heartbeat_node(&commands, "node-1", 3.0, 10); // 25% cpu headroom
@@ -249,7 +295,7 @@ mod tests {
 
     #[test]
     fn resolve_or_schedule_on_an_already_placed_jail_is_sticky() {
-        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new()).1;
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(), UsedAddresses::new()).1;
         register_node(&commands, "node-1", "10.0.0.1", 4.0, 8 * 1024 * 1024 * 1024);
         register_node(&commands, "node-2", "10.0.0.2", 4.0, 8 * 1024 * 1024 * 1024);
 
@@ -264,7 +310,7 @@ mod tests {
 
     #[test]
     fn resolve_or_schedule_with_no_alive_nodes_returns_no_available_nodes() {
-        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new()).1;
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(), UsedAddresses::new()).1;
 
         let (tx, rx) = mpsc::channel();
         commands.send(Command::ResolveOrSchedule("web-1".to_string(), tx)).unwrap();
@@ -273,7 +319,7 @@ mod tests {
 
     #[test]
     fn resolve_placement_on_an_unplaced_jail_returns_not_placed() {
-        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new()).1;
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(), UsedAddresses::new()).1;
 
         let (tx, rx) = mpsc::channel();
         commands.send(Command::ResolvePlacement("web-1".to_string(), tx)).unwrap();
@@ -282,7 +328,7 @@ mod tests {
 
     #[test]
     fn record_then_remove_placement_is_reflected_by_resolve_placement() {
-        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new()).1;
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(), UsedAddresses::new()).1;
         register_node(&commands, "node-1", "10.0.0.1", 4.0, 8 * 1024 * 1024 * 1024);
 
         let (rec_tx, rec_rx) = mpsc::channel();
@@ -300,5 +346,87 @@ mod tests {
         let (tx2, rx2) = mpsc::channel();
         commands.send(Command::ResolvePlacement("web-1".to_string(), tx2)).unwrap();
         assert_eq!(rx2.recv().unwrap(), Err(PlacementError::NotPlaced("web-1".to_string())));
+    }
+
+    #[test]
+    fn apply_service_command_creates_a_new_service() {
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(), UsedAddresses::new()).1;
+
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::ApplyService("web".to_string(), 3, template(), tx)).unwrap();
+        assert_eq!(rx.recv().unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn apply_service_command_rejects_a_template_change_on_an_existing_service() {
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(), UsedAddresses::new()).1;
+
+        let (tx1, rx1) = mpsc::channel();
+        commands.send(Command::ApplyService("web".to_string(), 3, template(), tx1)).unwrap();
+        rx1.recv().unwrap().unwrap();
+
+        let mut changed = template();
+        changed.image = "base/different-image".to_string();
+        let (tx2, rx2) = mpsc::channel();
+        commands.send(Command::ApplyService("web".to_string(), 3, changed, tx2)).unwrap();
+        assert_eq!(rx2.recv().unwrap(), Err(ApplyServiceError::TemplateChanged("web".to_string())));
+    }
+
+    #[test]
+    fn apply_service_command_rejects_a_name_already_used_by_an_unmanaged_jail() {
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(), UsedAddresses::new()).1;
+
+        let (rec_tx, rec_rx) = mpsc::channel();
+        commands.send(Command::RecordPlacement("web-0".to_string(), "node-1".to_string(), rec_tx)).unwrap();
+        rec_rx.recv().unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::ApplyService("web".to_string(), 1, template(), tx)).unwrap();
+        assert_eq!(
+            rx.recv().unwrap(),
+            Err(ApplyServiceError::NameConflict { name: "web-0".to_string(), owner: Owner::Unmanaged })
+        );
+    }
+
+    #[test]
+    fn apply_service_command_reapplying_the_same_service_with_more_replicas_does_not_conflict_with_itself() {
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(), UsedAddresses::new()).1;
+
+        let (tx1, rx1) = mpsc::channel();
+        commands.send(Command::ApplyService("web".to_string(), 1, template(), tx1)).unwrap();
+        rx1.recv().unwrap().unwrap();
+
+        let (rec_tx, rec_rx) = mpsc::channel();
+        commands.send(Command::RecordPlacement("web-0".to_string(), "node-1".to_string(), rec_tx)).unwrap();
+        rec_rx.recv().unwrap();
+
+        let (tx2, rx2) = mpsc::channel();
+        commands.send(Command::ApplyService("web".to_string(), 3, template(), tx2)).unwrap();
+        assert_eq!(rx2.recv().unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn owner_of_command_on_an_unplaced_name_is_none() {
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(), UsedAddresses::new()).1;
+
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::OwnerOf("web-0".to_string(), tx)).unwrap();
+        assert_eq!(rx.recv().unwrap(), None);
+    }
+
+    #[test]
+    fn owner_of_command_on_a_service_replica_names_that_service() {
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(), UsedAddresses::new()).1;
+
+        let (apply_tx, apply_rx) = mpsc::channel();
+        commands.send(Command::ApplyService("web".to_string(), 1, template(), apply_tx)).unwrap();
+        apply_rx.recv().unwrap().unwrap();
+        let (rec_tx, rec_rx) = mpsc::channel();
+        commands.send(Command::RecordPlacement("web-0".to_string(), "node-1".to_string(), rec_tx)).unwrap();
+        rec_rx.recv().unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::OwnerOf("web-0".to_string(), tx)).unwrap();
+        assert_eq!(rx.recv().unwrap(), Some(Owner::Service("web".to_string())));
     }
 }

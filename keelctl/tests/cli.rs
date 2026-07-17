@@ -92,6 +92,8 @@ fn start_test_control_plane_with_node(node_id: &str, node_addr: &str) -> String 
     let (_worker_handle, commands) = keel_controlplane::worker::spawn(
         keel_controlplane::Registry::new("10.0.0.0/16".parse().unwrap()),
         keel_controlplane::Placements::new(),
+        keel_controlplane::Services::new(),
+        keel_controlplane::addresses::UsedAddresses::new(),
     );
 
     let (reg_tx, reg_rx) = std::sync::mpsc::channel();
