@@ -62,8 +62,14 @@ pub trait NetManager {
     /// gateway address (the bridge's *first* address, set via a plain
     /// `ifconfig <bridge> inet <addr>`), a service VIP is always a
     /// *second* address on an already-configured bridge, requiring the
-    /// `alias` keyword. Idempotent: aliasing an address already present is
-    /// a no-op success.
+    /// `alias` keyword. The alias is always installed with an explicit
+    /// `/32` (host) netmask, since a VIP is always a single host address,
+    /// never a subnet -- FreeBSD's `ifconfig alias` with no explicit
+    /// netmask falls back to the address's legacy classful default (a
+    /// `/8` for a `10.x.x.x` VIP), which would install a connected route
+    /// wide enough to shadow Milestone 14's per-node pod-CIDR routing.
+    /// Idempotent: aliasing an address already present is a no-op
+    /// success.
     fn add_alias(&self, bridge: &str, address: &str) -> Result<(), NetError>;
 
     /// Removes `address` from `bridge`'s aliased addresses. Idempotent:

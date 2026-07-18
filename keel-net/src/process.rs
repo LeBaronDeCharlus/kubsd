@@ -169,12 +169,20 @@ impl NetManager for ProcessNetManager {
     }
 
     fn add_alias(&self, bridge: &str, address: &str) -> Result<(), NetError> {
-        let output = Self::run("ifconfig", &[bridge, "alias", address])?;
+        // A service VIP is always a single host address, never a subnet.
+        // FreeBSD's `ifconfig alias` with no explicit netmask falls back to
+        // the address's classful default (a bare `alias` of a `10.x.x.x`
+        // VIP would install a connected `/8` route, which would
+        // shadow/hijack Milestone 14's per-node `10.0.x.0/24` pod-CIDR
+        // routing on this node), so the netmask must always be pinned to
+        // `/32` explicitly here.
+        let netmask = "255.255.255.255";
+        let output = Self::run("ifconfig", &[bridge, "alias", address, "netmask", netmask])?;
         if output.status.success() || Self::stderr_contains(&output, "File exists") {
             Ok(())
         } else {
             Err(NetError::CommandFailed(
-                format!("ifconfig {bridge} alias {address}"),
+                format!("ifconfig {bridge} alias {address} netmask {netmask}"),
                 output.status,
                 String::from_utf8_lossy(&output.stderr).into_owned(),
             ))

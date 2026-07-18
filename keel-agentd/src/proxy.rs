@@ -20,6 +20,17 @@ const PROXY_BRIDGE: &str = "keel0";
 /// a single blocking `accept()` call.
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// How long `handle_connection` below waits on a single `connect()` attempt
+/// to a replica before giving up on it and moving to the retry-once
+/// fallback. The OS default connect timeout (tens of seconds) would let a
+/// black-holed (routable but unresponsive) replica -- exactly what "this
+/// replica's node just died" looks like on the wire -- stall the first
+/// attempt long enough that the retry never gets a chance to run,
+/// defeating the failover this proxy exists for. Kept short enough that a
+/// dead replica fails fast, long enough not to false-positive a
+/// genuinely-slow-but-alive one under normal load.
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
 pub struct ProxiedService {
     replicas: Arc<Mutex<Vec<SocketAddr>>>,
     stop: Arc<AtomicBool>,
@@ -125,7 +136,7 @@ fn handle_connection(mut incoming: TcpStream, replicas: &Arc<Mutex<Vec<SocketAdd
     let attempts = 2.min(snapshot.len());
     for attempt in 0..attempts {
         let target = snapshot[(start + attempt) % snapshot.len()];
-        let Ok(mut outgoing) = TcpStream::connect(target) else { continue };
+        let Ok(mut outgoing) = TcpStream::connect_timeout(&target, RELAY_CONNECT_TIMEOUT) else { continue };
         let Ok(mut incoming_clone) = incoming.try_clone() else { return };
         let Ok(mut outgoing_clone) = outgoing.try_clone() else { return };
         let to_replica = thread::spawn(move || {
@@ -306,6 +317,49 @@ mod tests {
 
         let buf = client_thread.join().unwrap();
         assert_eq!(&buf, b"ping");
+    }
+
+    #[test]
+    fn a_black_holed_first_replica_still_fails_over_quickly() {
+        // Unlike `spawn_refusing_listener` (fast RST -- "replica actively
+        // down") this simulates the scenario `RELAY_CONNECT_TIMEOUT`
+        // actually exists for: a replica whose node just died, so nothing
+        // answers the SYN at all -- no RST, no SYN-ACK. `10.255.255.1` is
+        // a private address nothing in this sandbox is configured to
+        // answer: confirmed directly (outside this test, via a plain
+        // socket connect with a manual timeout) that connecting to it
+        // blocks for the full timeout given rather than failing fast, the
+        // same black-hole behavior a dead node's last-known address would
+        // show on the wire. This is as close to a true network black hole
+        // as this sandbox can safely construct without root/firewall
+        // control.
+        let black_hole: SocketAddr = "10.255.255.1:9".parse().unwrap();
+        let live_addr = spawn_echo_replica(0);
+
+        let replicas = Arc::new(Mutex::new(vec![black_hole, live_addr]));
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let harness = TcpListener::bind("127.0.0.1:0").unwrap();
+        let harness_addr = harness.local_addr().unwrap();
+        let client_thread = std::thread::spawn(move || {
+            let mut client = TcpStream::connect(harness_addr).unwrap();
+            client.write_all(b"ping").unwrap();
+            let mut buf = [0u8; 4];
+            client.read_exact(&mut buf).unwrap();
+            buf
+        });
+        let (incoming, _) = harness.accept().unwrap();
+
+        let start = std::time::Instant::now();
+        handle_connection(incoming, &replicas, &counter);
+        let elapsed = start.elapsed();
+
+        let buf = client_thread.join().unwrap();
+        assert_eq!(&buf, b"ping", "expected failover to the live second replica to still succeed");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "expected RELAY_CONNECT_TIMEOUT to bound the black-holed first attempt well under the OS's ~75s default connect timeout, took {elapsed:?}"
+        );
     }
 
     #[test]
