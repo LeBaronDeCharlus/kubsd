@@ -1,16 +1,21 @@
 use crate::placements::Placements;
 use crate::scheduler::{self, NodeResources};
+use ipnet::Ipv4Net;
 use keel_spec::JailTemplate;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::net::Ipv4Addr;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServiceRecord {
     pub desired_replicas: u32,
     pub template: JailTemplate,
+    pub vip: Ipv4Addr,
+    pub port: u16,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Services {
+    service_cidr: Ipv4Net,
     by_name: HashMap<String, ServiceRecord>,
 }
 
@@ -35,6 +40,10 @@ pub enum ApplyServiceError {
     NameConflict { name: String, owner: Owner },
     #[error("service '{0}' template is immutable once created; delete and re-apply instead")]
     TemplateChanged(String),
+    #[error("service '{0}' port is immutable once created; delete and re-apply instead")]
+    PortChanged(String),
+    #[error("no free VIP available in the service CIDR for service '{0}'")]
+    VipPoolExhausted(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -42,8 +51,8 @@ pub enum ApplyServiceError {
 pub struct UnknownService(pub String);
 
 impl Services {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(service_cidr: Ipv4Net) -> Self {
+        Self { service_cidr, by_name: HashMap::new() }
     }
 
     pub fn get(&self, name: &str) -> Option<&ServiceRecord> {
@@ -61,16 +70,39 @@ impl Services {
         entries
     }
 
-    /// Creates the service if `name` is new, or updates `desired_replicas`
-    /// if it already exists and `template` is unchanged. Rejects a template
-    /// change on an existing service (only `replicas` may change).
-    pub fn apply(&mut self, name: String, desired_replicas: u32, template: JailTemplate) -> Result<(), ApplyServiceError> {
+    /// Creates the service if `name` is new (allocating and probing a VIP
+    /// within `service_cidr`), or updates `desired_replicas` if it already
+    /// exists and `template`/`port` are both unchanged. Rejects a
+    /// `template` or `port` change on an existing service (only `replicas`
+    /// may change) -- both are as much a part of a service's identity as
+    /// each other, so both get the same immutable-once-created treatment.
+    pub fn apply(
+        &mut self,
+        name: String,
+        desired_replicas: u32,
+        template: JailTemplate,
+        port: u16,
+    ) -> Result<(), ApplyServiceError> {
         if let Some(existing) = self.by_name.get(&name) {
             if existing.template != template {
                 return Err(ApplyServiceError::TemplateChanged(name));
             }
+            if existing.port != port {
+                return Err(ApplyServiceError::PortChanged(name));
+            }
+            let vip = existing.vip;
+            self.by_name.insert(name, ServiceRecord { desired_replicas, template, vip, port });
+            return Ok(());
         }
-        self.by_name.insert(name, ServiceRecord { desired_replicas, template });
+
+        let taken: HashSet<Ipv4Addr> = self.by_name.values().map(|r| r.vip).collect();
+        let host_count: u32 = 1u32 << (32 - self.service_cidr.prefix_len());
+        let vip = (0..host_count)
+            .map(|attempt| crate::subnet::derive_service_vip(&name, &self.service_cidr, attempt))
+            .find(|addr| !taken.contains(addr))
+            .ok_or_else(|| ApplyServiceError::VipPoolExhausted(name.clone()))?;
+
+        self.by_name.insert(name, ServiceRecord { desired_replicas, template, vip, port });
         Ok(())
     }
 
@@ -159,6 +191,10 @@ mod tests {
     use super::*;
     use keel_spec::{ResourcesSpec, RestartPolicy, TemplateNetworkSpec};
 
+    fn test_service_cidr() -> Ipv4Net {
+        "10.0.250.0/24".parse().unwrap()
+    }
+
     fn template() -> JailTemplate {
         JailTemplate {
             image: "base/14.2-web".to_string(),
@@ -171,46 +207,88 @@ mod tests {
 
     #[test]
     fn apply_creates_a_new_service() {
-        let mut services = Services::new();
-        services.apply("web".to_string(), 3, template()).unwrap();
+        let mut services = Services::new(test_service_cidr());
+        services.apply("web".to_string(), 3, template(), 8080).unwrap();
         assert_eq!(services.get("web").unwrap().desired_replicas, 3);
+        assert_eq!(services.get("web").unwrap().port, 8080);
     }
 
     #[test]
-    fn apply_again_with_the_same_template_scales_up_or_down() {
-        let mut services = Services::new();
-        services.apply("web".to_string(), 3, template()).unwrap();
-        services.apply("web".to_string(), 5, template()).unwrap();
+    fn apply_again_with_the_same_template_and_port_scales_up_or_down() {
+        let mut services = Services::new(test_service_cidr());
+        services.apply("web".to_string(), 3, template(), 8080).unwrap();
+        services.apply("web".to_string(), 5, template(), 8080).unwrap();
         assert_eq!(services.get("web").unwrap().desired_replicas, 5);
-        services.apply("web".to_string(), 0, template()).unwrap();
+        services.apply("web".to_string(), 0, template(), 8080).unwrap();
         assert_eq!(services.get("web").unwrap().desired_replicas, 0);
     }
 
     #[test]
     fn apply_with_a_changed_template_is_rejected() {
-        let mut services = Services::new();
-        services.apply("web".to_string(), 3, template()).unwrap();
+        let mut services = Services::new(test_service_cidr());
+        services.apply("web".to_string(), 3, template(), 8080).unwrap();
         let mut changed = template();
         changed.image = "base/different-image".to_string();
         assert_eq!(
-            services.apply("web".to_string(), 3, changed),
+            services.apply("web".to_string(), 3, changed, 8080),
             Err(ApplyServiceError::TemplateChanged("web".to_string()))
         );
     }
 
     #[test]
+    fn apply_with_a_changed_port_is_rejected() {
+        let mut services = Services::new(test_service_cidr());
+        services.apply("web".to_string(), 3, template(), 8080).unwrap();
+        assert_eq!(
+            services.apply("web".to_string(), 3, template(), 9090),
+            Err(ApplyServiceError::PortChanged("web".to_string()))
+        );
+    }
+
+    #[test]
+    fn apply_preserves_the_same_vip_across_a_scale_only_reapply() {
+        let mut services = Services::new(test_service_cidr());
+        services.apply("web".to_string(), 1, template(), 8080).unwrap();
+        let first_vip = services.get("web").unwrap().vip;
+        services.apply("web".to_string(), 5, template(), 8080).unwrap();
+        assert_eq!(services.get("web").unwrap().vip, first_vip);
+    }
+
+    #[test]
+    fn apply_gives_two_different_services_two_different_vips() {
+        let mut services = Services::new(test_service_cidr());
+        services.apply("web".to_string(), 1, template(), 8080).unwrap();
+        services.apply("api".to_string(), 1, template(), 8080).unwrap();
+        assert_ne!(services.get("web").unwrap().vip, services.get("api").unwrap().vip);
+    }
+
+    #[test]
+    fn apply_on_a_fully_exhausted_service_cidr_is_rejected() {
+        // A /30 has exactly 4 host addresses; the 5th distinct service name
+        // must exhaust the pool.
+        let mut services = Services::new("10.0.250.0/30".parse().unwrap());
+        for i in 0..4 {
+            services.apply(format!("svc-{i}"), 1, template(), 8080).unwrap();
+        }
+        assert_eq!(
+            services.apply("one-too-many".to_string(), 1, template(), 8080),
+            Err(ApplyServiceError::VipPoolExhausted("one-too-many".to_string()))
+        );
+    }
+
+    #[test]
     fn remove_deletes_the_service() {
-        let mut services = Services::new();
-        services.apply("web".to_string(), 3, template()).unwrap();
+        let mut services = Services::new(test_service_cidr());
+        services.apply("web".to_string(), 3, template(), 8080).unwrap();
         assert!(services.remove("web").is_some());
         assert!(services.get("web").is_none());
     }
 
     #[test]
     fn list_is_sorted_by_name() {
-        let mut services = Services::new();
-        services.apply("web".to_string(), 1, template()).unwrap();
-        services.apply("api".to_string(), 1, template()).unwrap();
+        let mut services = Services::new(test_service_cidr());
+        services.apply("web".to_string(), 1, template(), 8080).unwrap();
+        services.apply("api".to_string(), 1, template(), 8080).unwrap();
         let names: Vec<&str> = services.list().iter().map(|(n, _)| *n).collect();
         assert_eq!(names, vec!["api", "web"]);
     }
@@ -236,7 +314,7 @@ mod tests {
     #[test]
     fn owner_of_an_unplaced_name_is_none() {
         let placements = Placements::new();
-        let services = Services::new();
+        let services = Services::new(test_service_cidr());
         assert_eq!(owner_of("web-0", &placements, &services), None);
     }
 
@@ -244,8 +322,8 @@ mod tests {
     fn owner_of_a_placed_name_matching_a_known_service_is_that_service() {
         let mut placements = Placements::new();
         placements.set("web-0".to_string(), "node-1".to_string());
-        let mut services = Services::new();
-        services.apply("web".to_string(), 1, template()).unwrap();
+        let mut services = Services::new(test_service_cidr());
+        services.apply("web".to_string(), 1, template(), 8080).unwrap();
         assert_eq!(owner_of("web-0", &placements, &services), Some(Owner::Service("web".to_string())));
     }
 
@@ -253,7 +331,7 @@ mod tests {
     fn owner_of_a_placed_name_matching_no_service_is_unmanaged() {
         let mut placements = Placements::new();
         placements.set("web-1".to_string(), "node-1".to_string());
-        let services = Services::new();
+        let services = Services::new(test_service_cidr());
         assert_eq!(owner_of("web-1", &placements, &services), Some(Owner::Unmanaged));
     }
 
