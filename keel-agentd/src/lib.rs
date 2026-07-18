@@ -2,6 +2,7 @@ pub mod backoff;
 pub mod capacity;
 pub mod http;
 pub mod podcidr;
+pub mod proxy;
 pub mod record;
 pub mod reconciler;
 pub mod registration;
