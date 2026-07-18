@@ -54,6 +54,7 @@ pub fn spawn(
     thread::spawn(move || {
         let mut registered = false;
         let mut installed_routes: HashMap<String, String> = HashMap::new();
+        let mut proxied_services: HashMap<String, crate::proxy::ProxiedService> = HashMap::new();
         loop {
             let client_config = reloading_tls.client_config();
             if !registered {
@@ -66,7 +67,7 @@ pub fn spawn(
                 }
             } else {
                 match heartbeat_once(&control_plane_addr, &node_id, &commands, &client_config) {
-                    Ok(()) => {}
+                    Ok(entries) => crate::proxy::reconcile_services(&entries, &mut proxied_services, &commands),
                     Err(e) => {
                         eprintln!("keel-agentd: heartbeat failed: {e}");
                         registered = false;
@@ -109,7 +110,7 @@ fn heartbeat_once(
     node_id: &str,
     commands: &Sender<crate::worker::Command>,
     client_config: &Arc<rustls::ClientConfig>,
-) -> Result<(), String> {
+) -> Result<Vec<keel_controlplane::wire::ServiceProxyEntry>, String> {
     let (resources_tx, resources_rx) = std::sync::mpsc::channel();
     commands
         .send(crate::worker::Command::CommittedResources(resources_tx))
@@ -128,8 +129,8 @@ fn heartbeat_once(
 
     let heartbeat = keel_controlplane::wire::Heartbeat { committed_cpu, committed_memory, jails };
     let body = serde_yaml::to_string(&heartbeat).map_err(|e| format!("failed to serialize heartbeat: {e}"))?;
-    send_request(control_plane_addr, "POST", &format!("/nodes/{node_id}/heartbeat"), &body, client_config)?;
-    Ok(())
+    let response_body = send_request(control_plane_addr, "POST", &format!("/nodes/{node_id}/heartbeat"), &body, client_config)?;
+    serde_yaml::from_slice(&response_body).map_err(|e| format!("malformed heartbeat response: {e}"))
 }
 
 fn fetch_nodes(control_plane_addr: &str, client_config: &Arc<rustls::ClientConfig>) -> Result<Vec<NodeStatus>, String> {
@@ -242,6 +243,7 @@ mod tests {
     use keel_controlplane::placements::Placements;
     use keel_controlplane::registry::Registry;
     use keel_controlplane::worker;
+    use keel_net::NetManager;
     use std::net::TcpListener;
     use std::sync::mpsc;
 
@@ -521,6 +523,67 @@ mod tests {
         let body = get_nodes(&control_plane_addr);
         assert!(body.contains("committed_cpu: 2"), "expected committed_cpu from the applied jail, got: {body}");
         assert!(body.contains("committed_memory: 536870912"), "expected committed_memory from the applied jail, got: {body}");
+    }
+
+    #[test]
+    fn a_heartbeat_aliases_and_proxies_an_applied_service() {
+        let control_plane_addr = start_test_control_plane();
+        let client_config = node_client_config();
+
+        let service_yaml = "apiVersion: keel/v1\nkind: Service\nmetadata:\n  name: web\nspec:\n  replicas: 1\n  port: 9999\n  template:\n    image: base/14.2-web\n    command: [\"/usr/local/bin/myapp\"]\n    network:\n      vnet: true\n      bridge: keel0\n    resources:\n      cpu: \"1\"\n      memory: \"256M\"\n    restartPolicy: Always\n";
+        send_request(&control_plane_addr, "PUT", "/services/web", service_yaml, &client_config).unwrap();
+
+        let net = keel_net::FakeNetManager::new();
+        net.ensure_bridge_exists("keel0").unwrap();
+        let (_worker_handle, commands) = crate::worker::spawn(
+            crate::Reconciler::new(
+                keel_jail::FakeJailRuntime::new(),
+                keel_zfs::FakeZfsManager::new(),
+                net.clone(),
+                "zroot".to_string(),
+                std::env::temp_dir().join("keel-agentd-registration-test-a_heartbeat_aliases_and_proxies_an_applied_service"),
+            )
+            .unwrap(),
+        );
+        let pod_cidr_slot = crate::PodCidrSlot::new();
+        // Port 1 on loopback: guaranteed nothing is listening there, so the
+        // control plane's own service-reconciliation forward attempt (it
+        // tries to schedule this service's one desired replica onto this
+        // node as part of every heartbeat) fails with an immediate
+        // connection-refused rather than blocking on `FORWARD_CONNECT_TIMEOUT`
+        // (2s, see keel-controlplane's `http.rs`) -- otherwise the very
+        // first heartbeat response wouldn't return within this test's sleep
+        // window below. The alias/proxy wiring under test here doesn't
+        // depend on that scheduling attempt succeeding: the heartbeat
+        // response's service-proxy entries come from the service table
+        // directly, independent of whether a replica ever got placed.
+        let _handle = spawn(
+            "node-1".to_string(),
+            "127.0.0.1:1".to_string(),
+            control_plane_addr.clone(),
+            Duration::from_millis(50),
+            4.0,
+            8 * 1024 * 1024 * 1024,
+            node_reloading_tls(),
+            commands,
+            pod_cidr_slot,
+        );
+
+        thread::sleep(Duration::from_millis(300));
+
+        // The service's VIP was derived from --service-cidr on the test
+        // control plane's own default; look it up rather than hardcoding it,
+        // and assert on the alias existing for that address specifically --
+        // this test only needs to prove the heartbeat -> proxy wiring works
+        // end to end. `bridge_address` isn't a usable signal here: it only
+        // reflects a jail's `attach_jail` gateway, a value `add_alias`
+        // deliberately never touches (see keel-net's own
+        // `a_bridges_gateway_and_its_service_alias_coexist_independently`).
+        let svc_body = send_request(&control_plane_addr, "GET", "/services", "", &client_config).unwrap();
+        let services: Vec<keel_controlplane::wire::ServiceSummary> =
+            serde_yaml::from_slice(&svc_body).expect("malformed /services response");
+        let vip = &services.iter().find(|s| s.name == "web").expect("expected the 'web' service to be listed").vip;
+        assert!(net.has_alias("keel0", vip), "expected keel0 to have the service's VIP ({vip}) aliased");
     }
 
     #[test]
