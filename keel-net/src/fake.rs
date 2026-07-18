@@ -10,6 +10,7 @@ pub struct FakeNetManager {
     bridge_addresses: Arc<Mutex<HashMap<String, String>>>,
     attachments: Arc<Mutex<HashMap<String, (String, String, String)>>>,
     routes: Arc<Mutex<HashMap<String, String>>>,
+    aliases: Arc<Mutex<HashMap<String, HashSet<String>>>>,
 }
 
 impl FakeNetManager {
@@ -23,6 +24,10 @@ impl FakeNetManager {
 
     pub fn bridge_address(&self, bridge: &str) -> Option<String> {
         self.bridge_addresses.lock().unwrap().get(bridge).cloned()
+    }
+
+    pub fn has_alias(&self, bridge: &str, address: &str) -> bool {
+        self.aliases.lock().unwrap().get(bridge).is_some_and(|set| set.contains(address))
     }
 }
 
@@ -57,6 +62,18 @@ impl NetManager for FakeNetManager {
 
     fn remove_route(&self, subnet: &str) -> Result<(), NetError> {
         self.routes.lock().unwrap().remove(subnet);
+        Ok(())
+    }
+
+    fn add_alias(&self, bridge: &str, address: &str) -> Result<(), NetError> {
+        self.aliases.lock().unwrap().entry(bridge.to_string()).or_default().insert(address.to_string());
+        Ok(())
+    }
+
+    fn remove_alias(&self, bridge: &str, address: &str) -> Result<(), NetError> {
+        if let Some(set) = self.aliases.lock().unwrap().get_mut(bridge) {
+            set.remove(address);
+        }
         Ok(())
     }
 }
@@ -156,5 +173,49 @@ mod tests {
         net.attach_jail("web-1", "keel0", "epair7", "10.0.60.5/24").unwrap();
         net.attach_jail("web-2", "keel0", "epair8", "10.0.60.6/24").unwrap();
         assert_eq!(net.bridge_address("keel0"), Some("10.0.60.1/24".to_string()));
+    }
+
+    #[test]
+    fn add_alias_then_has_alias_reflects_it() {
+        let net = FakeNetManager::new();
+        net.ensure_bridge_exists("keel0").unwrap();
+        assert!(!net.has_alias("keel0", "10.0.250.7"));
+        net.add_alias("keel0", "10.0.250.7").unwrap();
+        assert!(net.has_alias("keel0", "10.0.250.7"));
+    }
+
+    #[test]
+    fn add_alias_is_idempotent() {
+        let net = FakeNetManager::new();
+        net.ensure_bridge_exists("keel0").unwrap();
+        net.add_alias("keel0", "10.0.250.7").unwrap();
+        net.add_alias("keel0", "10.0.250.7").unwrap();
+        assert!(net.has_alias("keel0", "10.0.250.7"));
+    }
+
+    #[test]
+    fn remove_alias_on_a_never_added_address_is_a_no_op_success() {
+        let net = FakeNetManager::new();
+        net.ensure_bridge_exists("keel0").unwrap();
+        net.remove_alias("keel0", "10.0.250.7").unwrap();
+    }
+
+    #[test]
+    fn add_then_remove_alias_clears_it() {
+        let net = FakeNetManager::new();
+        net.ensure_bridge_exists("keel0").unwrap();
+        net.add_alias("keel0", "10.0.250.7").unwrap();
+        net.remove_alias("keel0", "10.0.250.7").unwrap();
+        assert!(!net.has_alias("keel0", "10.0.250.7"));
+    }
+
+    #[test]
+    fn a_bridges_gateway_and_its_service_alias_coexist_independently() {
+        let net = FakeNetManager::new();
+        net.ensure_bridge_exists("keel0").unwrap();
+        net.attach_jail("web-1", "keel0", "epair7", "10.0.60.5/24").unwrap();
+        net.add_alias("keel0", "10.0.250.7").unwrap();
+        assert_eq!(net.bridge_address("keel0"), Some("10.0.60.1/24".to_string()));
+        assert!(net.has_alias("keel0", "10.0.250.7"));
     }
 }

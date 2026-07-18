@@ -56,4 +56,17 @@ pub trait NetManager {
     /// Removes the route to `subnet` from the host's kernel routing table.
     /// Idempotent: removing a route that isn't present is a no-op success.
     fn remove_route(&self, subnet: &str) -> Result<(), NetError>;
+
+    /// Adds `address` as an additional ("alias") address on `bridge`,
+    /// alongside whatever address it already has -- unlike `attach_jail`'s
+    /// gateway address (the bridge's *first* address, set via a plain
+    /// `ifconfig <bridge> inet <addr>`), a service VIP is always a
+    /// *second* address on an already-configured bridge, requiring the
+    /// `alias` keyword. Idempotent: aliasing an address already present is
+    /// a no-op success.
+    fn add_alias(&self, bridge: &str, address: &str) -> Result<(), NetError>;
+
+    /// Removes `address` from `bridge`'s aliased addresses. Idempotent:
+    /// removing an address that isn't currently aliased is a no-op success.
+    fn remove_alias(&self, bridge: &str, address: &str) -> Result<(), NetError>;
 }

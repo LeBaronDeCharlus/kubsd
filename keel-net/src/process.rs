@@ -167,4 +167,30 @@ impl NetManager for ProcessNetManager {
             ))
         }
     }
+
+    fn add_alias(&self, bridge: &str, address: &str) -> Result<(), NetError> {
+        let output = Self::run("ifconfig", &[bridge, "alias", address])?;
+        if output.status.success() || Self::stderr_contains(&output, "File exists") {
+            Ok(())
+        } else {
+            Err(NetError::CommandFailed(
+                format!("ifconfig {bridge} alias {address}"),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ))
+        }
+    }
+
+    fn remove_alias(&self, bridge: &str, address: &str) -> Result<(), NetError> {
+        let output = Self::run("ifconfig", &[bridge, "-alias", address])?;
+        if output.status.success() || Self::stderr_contains(&output, "Can't assign requested address") {
+            Ok(())
+        } else {
+            Err(NetError::CommandFailed(
+                format!("ifconfig {bridge} -alias {address}"),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ))
+        }
+    }
 }
