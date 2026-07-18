@@ -843,6 +843,76 @@ deleting it and confirming every replica tears down, and confirming plain
 session (no VM/SSH access was available); it is deferred and will be run
 separately before this milestone is considered fully verified.
 
+### Milestone 16: service load balancing via a per-node virtual-IP proxy
+
+Milestone 15 closed with an explicit gap: replica sets and discovery, but
+nothing routes a request across replicas automatically, a caller had to
+call `GET /services/<name>` itself and pick one. This milestone, the
+second and closing milestone in Sub-Project 6, builds that mechanism: a
+`kind: Service` gets one stable, cluster-wide virtual IP that any jail can
+connect to and be transparently relayed to a currently-healthy replica,
+round-robin, with zero caller-side awareness of which node actually
+answers — the same job Kubernetes' Service/kube-proxy does, adapted to
+FreeBSD jails and this project's existing hand-rolled idioms.
+
+`kind: Service` gains one field, `spec.port: u16` (the port the proxy
+listens on and forwards to, same port both sides). `keel-controlplane`
+gains a new `--service-cidr` flag (a pool entirely distinct from any
+node's Milestone-14 `pod_cidr`) and allocates one VIP per service,
+derived deterministically from the service name via a genuinely new
+function, `derive_service_vip` — not a reuse of Milestone 14's
+`derive_pod_cidr`, which is hardcoded to whole-`/24`-block granularity and
+cannot produce a single host address; this distinction was caught during
+a design-review pass before implementation began, alongside three other
+spec corrections (`port`, like `vip`, needed to be immutable once
+created, rather than silently changeable on a routine re-apply; the
+"discover the VIP via `keelctl get services`" text described a command
+that doesn't exist, `keelctl` never gained a bare-collection verb for
+`GET /services`; and a fail-open heartbeat behavior was attributed to the
+wrong milestone). The existing 5-second heartbeat's response, previously
+always an empty `200`, now carries every known service's
+`{name, vip, port, replicas}`, the replica list computed by a single
+function shared with `GET /services/<name>`'s own filter so the two can
+never drift apart. Every node's `keel-agentd` diffs that table each tick:
+a new service gets its VIP aliased onto the node's own `keel0` bridge
+(FreeBSD's `ifconfig alias`, a mechanism this project had never needed
+before — every prior milestone's bridge only ever had one address) and a
+round-robin relay listener bound to `<vip>:<port>`; a known service gets
+its replica list hot-swapped; a disappeared service gets torn down. A
+failed connect retries the rotation's next replica exactly once.
+
+A final whole-branch review, after all eleven implementation tasks had
+already passed their own individual reviews, caught two problems neither
+narrower pass could see, both at the FreeBSD-networking boundary no unit
+test reaches. First: `add_alias` aliased the VIP with no explicit
+netmask, and FreeBSD's `ifconfig` defaults a bare alias to its address's
+*classful* mask — for a `10.x` VIP (this milestone's own worked example)
+that default is `/8`, which would install a connected route for the
+entire `10.0.0.0/8` range on that bridge, shadowing Milestone 14's
+per-node `/24` pod routing on the same node. Fixed by pinning an explicit
+`/32` host netmask, the only mask a single-address VIP alias should ever
+carry. Second: the relay's `TcpStream::connect` used the OS default
+timeout (~75 seconds on FreeBSD), which would stall failover for the
+exact scenario this milestone's failover story depends on — a replica
+whose node just died, reachable but not yet marked `Dead`, would hang the
+first connect attempt long enough that the retry-once path never got a
+chance to run. Fixed with an explicit 1-second `connect_timeout`. Both
+were verified by tracing the actual code paths (not just accepting the
+finding's prose) and re-reviewed after the fix.
+
+Verification so far is unit/integration-test-only: 366 tests pass across
+every workspace crate, and clippy is clean relative to the pre-existing
+baseline (34 warnings, all pre-dating this milestone). The real 3-node VM
+verification this design calls for — reading a service's VIP back via a
+direct `GET /services` call (no `keelctl` verb reaches it, see above),
+confirming it's aliased on every node's bridge, connecting from a jail and
+confirming both replicas get used, killing one replica's node and
+confirming the survivor keeps answering, deleting the service and
+confirming teardown — has not been run in this session (no VM/SSH access
+was available); it is deferred and will be run separately, with the
+netmask fix above (checking `netstat -rn` on `keel0`, not just `ifconfig`)
+as the first thing to confirm.
+
 ## Roadmap
 
 **Sub-project 1: single-node jail reconciliation daemon (complete)**
@@ -877,7 +947,7 @@ separately before this milestone is considered fully verified.
 **Sub-project 6: service discovery and load balancing (in progress)**
 
 15. Service discovery via replica sets: `kind: Service`, deterministic replica naming, same-service scheduler spreading, auto-assigned addressing, heartbeat-piggybacked self-healing, `GET /services/<name>` discovery — code complete and reviewed (332 tests passing, clippy clean); real 3-node VM verification not yet run
-- Load-balancing/traffic-distribution mechanism across a service's replicas (a proxy, DNS-based round robin, or client-side selection) — not yet designed, a distinct later milestone in this same sub-project
+16. Service load balancing via a per-node virtual-IP proxy: `spec.port`, `--service-cidr` VIP allocation, heartbeat-carried service table, `keel-net` bridge aliasing, per-node round-robin relay with retry-once — code complete and reviewed (366 tests passing, clippy clean); real 3-node VM verification not yet run
 
 **Not yet designed** (future sub-projects, each will get its own spec):
 
