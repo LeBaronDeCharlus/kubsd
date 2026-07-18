@@ -309,7 +309,7 @@ fn apply_get_delete_round_trip() {
 fn write_service_spec_file(test_name: &str, service_name: &str, replicas: u32) -> PathBuf {
     let path = std::env::temp_dir().join(format!("keelctl-test-service-spec-{test_name}.yaml"));
     let yaml = format!(
-        "apiVersion: keel/v1\nkind: Service\nmetadata:\n  name: {service_name}\nspec:\n  replicas: {replicas}\n  template:\n    image: base/14.2-web\n    command: [\"/usr/local/bin/myapp\"]\n    network:\n      vnet: true\n      bridge: keel0\n    resources:\n      cpu: \"1\"\n      memory: 256M\n    restartPolicy: Always\n"
+        "apiVersion: keel/v1\nkind: Service\nmetadata:\n  name: {service_name}\nspec:\n  replicas: {replicas}\n  port: 8080\n  template:\n    image: base/14.2-web\n    command: [\"/usr/local/bin/myapp\"]\n    network:\n      vnet: true\n      bridge: keel0\n    resources:\n      cpu: \"1\"\n      memory: 256M\n    restartPolicy: Always\n"
     );
     std::fs::write(&path, yaml).unwrap();
     path

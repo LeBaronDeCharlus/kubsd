@@ -1187,7 +1187,7 @@ mod tests {
 
     fn service_yaml(name: &str, replicas: u32) -> String {
         format!(
-            "apiVersion: keel/v1\nkind: Service\nmetadata:\n  name: {name}\nspec:\n  replicas: {replicas}\n  template:\n    image: base/14.2-web\n    command: [\"/usr/local/bin/myapp\"]\n    network:\n      vnet: true\n      bridge: keel0\n    resources:\n      cpu: \"1\"\n      memory: 256M\n    restartPolicy: Always\n"
+            "apiVersion: keel/v1\nkind: Service\nmetadata:\n  name: {name}\nspec:\n  replicas: {replicas}\n  port: 8080\n  template:\n    image: base/14.2-web\n    command: [\"/usr/local/bin/myapp\"]\n    network:\n      vnet: true\n      bridge: keel0\n    resources:\n      cpu: \"1\"\n      memory: 256M\n    restartPolicy: Always\n"
         )
     }
 
