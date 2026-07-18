@@ -62,6 +62,16 @@ pub struct ServiceReplica {
 pub struct ServiceSummary {
     pub name: String,
     pub desired_replicas: u32,
+    pub vip: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServiceProxyEntry {
+    pub name: String,
+    pub vip: String,
+    pub port: u16,
+    pub replicas: Vec<ServiceReplica>,
 }
 
 #[cfg(test)]
@@ -160,8 +170,44 @@ mod tests {
 
     #[test]
     fn service_summary_round_trips_through_yaml() {
-        let summary = ServiceSummary { name: "web".to_string(), desired_replicas: 3 };
+        let summary = ServiceSummary {
+            name: "web".to_string(),
+            desired_replicas: 3,
+            vip: "10.0.250.7".to_string(),
+            port: 8080,
+        };
         let yaml = serde_yaml::to_string(&summary).unwrap();
-        assert_eq!(serde_yaml::from_str::<ServiceSummary>(&yaml).unwrap(), summary);
+        let parsed: ServiceSummary = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed, summary);
+    }
+
+    #[test]
+    fn service_proxy_entry_round_trips_through_yaml() {
+        let entry = ServiceProxyEntry {
+            name: "web".to_string(),
+            vip: "10.0.250.7".to_string(),
+            port: 8080,
+            replicas: vec![ServiceReplica {
+                name: "web-0".to_string(),
+                node: "node-4".to_string(),
+                address: "10.0.60.5".to_string(),
+            }],
+        };
+        let yaml = serde_yaml::to_string(&entry).unwrap();
+        let parsed: ServiceProxyEntry = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed, entry);
+    }
+
+    #[test]
+    fn service_proxy_entry_with_no_replicas_still_round_trips() {
+        let entry = ServiceProxyEntry {
+            name: "web".to_string(),
+            vip: "10.0.250.7".to_string(),
+            port: 8080,
+            replicas: vec![],
+        };
+        let yaml = serde_yaml::to_string(&entry).unwrap();
+        let parsed: ServiceProxyEntry = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed, entry);
     }
 }
