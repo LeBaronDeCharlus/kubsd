@@ -310,7 +310,7 @@ mod tests {
         let (_worker_handle, commands) = worker::spawn(
             Registry::new("10.0.0.0/16".parse().unwrap()),
             Placements::new(),
-            keel_controlplane::Services::new(),
+            keel_controlplane::Services::new("10.0.250.0/24".parse().unwrap()),
             keel_controlplane::addresses::UsedAddresses::new(),
         );
         let reloading_tls = keel_controlplane::tls::ReloadingTls::spawn(

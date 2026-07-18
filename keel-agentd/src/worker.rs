@@ -16,6 +16,8 @@ pub enum Command {
     CommittedResources(Sender<(f64, u64)>),
     AddRoute(String, String, Sender<Result<(), keel_net::NetError>>),
     RemoveRoute(String, Sender<Result<(), keel_net::NetError>>),
+    AddServiceAlias(String, String, Sender<Result<(), keel_net::NetError>>),
+    RemoveServiceAlias(String, String, Sender<Result<(), keel_net::NetError>>),
 }
 
 pub fn spawn<J, Z, N>(mut reconciler: Reconciler<J, Z, N>) -> (JoinHandle<()>, Sender<Command>)
@@ -75,6 +77,12 @@ fn handle_command<J: JailRuntime, Z: ZfsManager, N: NetManager>(
         }
         Command::RemoveRoute(subnet, reply) => {
             let _ = reply.send(reconciler.remove_route(&subnet));
+        }
+        Command::AddServiceAlias(bridge, address, reply) => {
+            let _ = reply.send(reconciler.add_alias(&bridge, &address));
+        }
+        Command::RemoveServiceAlias(bridge, address, reply) => {
+            let _ = reply.send(reconciler.remove_alias(&bridge, &address));
         }
     }
 }
@@ -229,5 +237,30 @@ mod tests {
         let (rm_tx, rm_rx) = mpsc::channel();
         commands.send(Command::RemoveRoute("10.0.5.0/24".to_string(), rm_tx)).unwrap();
         assert!(rm_rx.recv().unwrap().is_ok());
+    }
+
+    #[test]
+    fn add_service_alias_command_round_trips() {
+        let reconciler = crate::Reconciler::new(
+            FakeJailRuntime::new(),
+            FakeZfsManager::new(),
+            FakeNetManager::new(),
+            "zroot".to_string(),
+            std::env::temp_dir().join("keel-agentd-worker-test-add_service_alias_command_round_trips"),
+        )
+        .unwrap();
+        let _net = FakeNetManager::new();
+        // Reconciler owns its own NetManager instance internally; assert
+        // through the command channel's observable success instead of a
+        // second handle to the same fake.
+        let (_worker_handle, commands) = spawn(reconciler);
+
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::AddServiceAlias("keel0".to_string(), "10.0.250.7".to_string(), tx)).unwrap();
+        assert!(rx.recv().unwrap().is_ok());
+
+        let (tx2, rx2) = mpsc::channel();
+        commands.send(Command::RemoveServiceAlias("keel0".to_string(), "10.0.250.7".to_string(), tx2)).unwrap();
+        assert!(rx2.recv().unwrap().is_ok());
     }
 }

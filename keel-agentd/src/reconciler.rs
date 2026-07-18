@@ -117,6 +117,14 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager> Reconciler<J, Z, N> {
         self.net.remove_route(subnet)
     }
 
+    pub fn add_alias(&self, bridge: &str, address: &str) -> Result<(), keel_net::NetError> {
+        self.net.add_alias(bridge, address)
+    }
+
+    pub fn remove_alias(&self, bridge: &str, address: &str) -> Result<(), keel_net::NetError> {
+        self.net.remove_alias(bridge, address)
+    }
+
     fn configure_networking_and_limits(&mut self, name: &str, record: &JailRecord) -> Result<(), ReconcileError> {
         let jail_name = record::jail_name(name);
         let epair_base = record::epair_base_name(record.epair_ordinal);
@@ -338,6 +346,17 @@ mod tests {
         let (cpu, memory) = reconciler.committed_resources();
         assert_eq!(cpu, 1.0);
         assert_eq!(memory, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn add_alias_then_remove_alias_round_trips_through_the_fake_net_manager() {
+        let dir = test_state_dir("add_alias_then_remove_alias_round_trips_through_the_fake_net_manager");
+        let reconciler = new_reconciler(dir);
+        reconciler.net.ensure_bridge_exists("keel0").unwrap();
+        reconciler.add_alias("keel0", "10.0.250.7").unwrap();
+        assert!(reconciler.net.has_alias("keel0", "10.0.250.7"));
+        reconciler.remove_alias("keel0", "10.0.250.7").unwrap();
+        assert!(!reconciler.net.has_alias("keel0", "10.0.250.7"));
     }
 
     #[test]
