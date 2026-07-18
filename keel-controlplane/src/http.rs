@@ -287,7 +287,10 @@ fn handle_apply_service(
     }
 
     let (reply_tx, reply_rx) = mpsc::channel();
-    if commands.send(Command::ApplyService(name.to_string(), spec.spec.replicas, spec.spec.template, reply_tx)).is_err() {
+    if commands
+        .send(Command::ApplyService(name.to_string(), spec.spec.replicas, spec.spec.template, spec.spec.port, reply_tx))
+        .is_err()
+    {
         return error_response(500, "control plane worker is not running".to_string());
     }
     match reply_rx.recv() {
@@ -296,7 +299,9 @@ fn handle_apply_service(
             (200, Vec::new())
         }
         Ok(Err(e @ crate::services::ApplyServiceError::TemplateChanged(_))) => error_response(409, e.to_string()),
+        Ok(Err(e @ crate::services::ApplyServiceError::PortChanged(_))) => error_response(409, e.to_string()),
         Ok(Err(e @ crate::services::ApplyServiceError::NameConflict { .. })) => error_response(400, e.to_string()),
+        Ok(Err(e @ crate::services::ApplyServiceError::VipPoolExhausted(_))) => error_response(503, e.to_string()),
         Err(_) => error_response(500, "control plane worker did not respond".to_string()),
     }
 }
@@ -460,7 +465,14 @@ fn handle_heartbeat(id: &str, body: &[u8], commands: &Sender<Command>, client_co
     match reply_rx.recv() {
         Ok(Ok(())) => {
             reconcile_and_execute(commands, client_config);
-            (200, Vec::new())
+            let (entries_tx, entries_rx) = mpsc::channel();
+            if commands.send(Command::ListServiceProxyEntries(entries_tx)).is_err() {
+                return error_response(500, "control plane worker is not running".to_string());
+            }
+            match entries_rx.recv() {
+                Ok(entries) => yaml_response(200, &entries),
+                Err(_) => error_response(500, "control plane worker did not respond".to_string()),
+            }
         }
         Ok(Err(e)) => error_response(404, e.to_string()),
         Err(_) => error_response(500, "control plane worker did not respond".to_string()),
@@ -597,7 +609,7 @@ mod tests {
         let (_worker_handle, commands) = worker::spawn(
             Registry::new("10.0.0.0/16".parse().unwrap()),
             Placements::new(),
-            crate::services::Services::new(),
+            crate::services::Services::new("10.0.250.0/24".parse().unwrap()),
             crate::addresses::UsedAddresses::new(),
         );
         let reloading_tls = tls::ReloadingTls::spawn(
@@ -1160,7 +1172,7 @@ mod tests {
         let (_worker_handle, commands) = worker::spawn(
             Registry::new("10.0.0.0/16".parse().unwrap()),
             Placements::new(),
-            crate::services::Services::new(),
+            crate::services::Services::new("10.0.250.0/24".parse().unwrap()),
             crate::addresses::UsedAddresses::new(),
         );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1188,6 +1200,12 @@ mod tests {
     fn service_yaml(name: &str, replicas: u32) -> String {
         format!(
             "apiVersion: keel/v1\nkind: Service\nmetadata:\n  name: {name}\nspec:\n  replicas: {replicas}\n  port: 8080\n  template:\n    image: base/14.2-web\n    command: [\"/usr/local/bin/myapp\"]\n    network:\n      vnet: true\n      bridge: keel0\n    resources:\n      cpu: \"1\"\n      memory: 256M\n    restartPolicy: Always\n"
+        )
+    }
+
+    fn service_yaml_with_port(name: &str, replicas: u32, port: u16) -> String {
+        format!(
+            "apiVersion: keel/v1\nkind: Service\nmetadata:\n  name: {name}\nspec:\n  replicas: {replicas}\n  port: {port}\n  template:\n    image: base/14.2-web\n    command: [\"/usr/local/bin/myapp\"]\n    network:\n      vnet: true\n      bridge: keel0\n    resources:\n      cpu: \"1\"\n      memory: \"256M\"\n    restartPolicy: Always\n"
         )
     }
 
@@ -1293,6 +1311,40 @@ mod tests {
     }
 
     #[test]
+    fn get_services_reports_the_applied_services_vip_and_port() {
+        let cp_addr = start_test_server();
+        send_request(&cp_addr, "PUT", "/services/web", &service_yaml_with_port("web", 1, 8080));
+
+        let (status, body) = send_request(&cp_addr, "GET", "/services", "");
+        assert_eq!(status, 200);
+        assert!(body.contains("port: 8080"), "expected port in body: {body}");
+        assert!(body.contains("vip:"), "expected a vip field in body: {body}");
+    }
+
+    #[test]
+    fn heartbeat_response_body_reflects_the_currently_healthy_replica_set() {
+        let cp_addr = start_test_server();
+        let (reg_status, _) = send_request(
+            &cp_addr,
+            "POST",
+            "/nodes/register",
+            "id: node-1\naddr: 10.0.0.1:7621\ncapacity_cpu: 4\ncapacity_memory: 8589934592\n",
+        );
+        assert_eq!(reg_status, 200);
+        send_request(&cp_addr, "PUT", "/services/web", &service_yaml_with_port("web", 1, 8080));
+
+        let (status, body) = send_request(
+            &cp_addr,
+            "POST",
+            "/nodes/node-1/heartbeat",
+            "committed_cpu: 0\ncommitted_memory: 0\njails: []\n",
+        );
+        assert_eq!(status, 200);
+        assert!(body.contains("name: web"), "expected the service table in the heartbeat response: {body}");
+        assert!(body.contains("port: 8080"), "expected port in heartbeat response: {body}");
+    }
+
+    #[test]
     fn delete_service_tears_down_every_placed_replica() {
         let cp_addr = start_test_server();
         let node_addr = start_fake_remote_tls_agentd(200, "running: true\n");
@@ -1358,7 +1410,7 @@ mod tests {
         let (_worker_handle, commands) = worker::spawn(
             Registry::new("10.0.0.0/16".parse().unwrap()),
             Placements::new(),
-            crate::services::Services::new(),
+            crate::services::Services::new("10.0.250.0/24".parse().unwrap()),
             crate::addresses::UsedAddresses::new(),
         );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
