@@ -56,6 +56,7 @@ pub struct ServiceSpec {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServiceSpecBody {
     pub replicas: u32,
+    pub port: u16,
     pub template: JailTemplate,
 }
 
@@ -148,6 +149,7 @@ metadata:
   name: web
 spec:
   replicas: 3
+  port: 8080
   template:
     image: base/14.2-web
     command: ["/usr/local/bin/myapp"]
@@ -167,6 +169,7 @@ spec:
         assert_eq!(spec.kind, "Service");
         assert_eq!(spec.metadata.name, "web");
         assert_eq!(spec.spec.replicas, 3);
+        assert_eq!(spec.spec.port, 8080);
         assert_eq!(spec.spec.template.image, "base/14.2-web");
         assert!(spec.spec.template.network.vnet);
         assert_eq!(spec.spec.template.network.bridge, "keel0");

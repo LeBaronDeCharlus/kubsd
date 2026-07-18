@@ -25,6 +25,9 @@ pub fn parse_and_validate_service(yaml: &str) -> Result<ServiceSpec, SpecError> 
     validate::validate_name(&spec.metadata.name)?;
     resources::parse_cpu_cores(&spec.spec.template.resources.cpu)?;
     resources::parse_memory_bytes(&spec.spec.template.resources.memory)?;
+    if spec.spec.port == 0 {
+        return Err(SpecError::InvalidPort(0));
+    }
     Ok(spec)
 }
 
@@ -51,6 +54,7 @@ metadata:
   name: web
 spec:
   replicas: 2
+  port: 8080
   template:
     image: base/14.2-web
     command: ["/usr/local/bin/myapp"]
@@ -80,6 +84,18 @@ spec:
     fn parse_and_validate_service_rejects_invalid_resources() {
         let yaml = VALID_SERVICE_YAML.replace("cpu: \"1\"", "cpu: \"0\"");
         assert!(matches!(parse_and_validate_service(&yaml), Err(SpecError::InvalidCpu(_))));
+    }
+
+    #[test]
+    fn parse_and_validate_service_accepts_the_port_field() {
+        let spec = parse_and_validate_service(VALID_SERVICE_YAML).unwrap();
+        assert_eq!(spec.spec.port, 8080);
+    }
+
+    #[test]
+    fn parse_and_validate_service_rejects_port_zero() {
+        let yaml = VALID_SERVICE_YAML.replace("port: 8080", "port: 0");
+        assert!(matches!(parse_and_validate_service(&yaml), Err(SpecError::InvalidPort(0))));
     }
 
     #[test]

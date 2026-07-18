@@ -12,6 +12,8 @@ pub enum SpecError {
     InvalidCpu(String),
     #[error("invalid memory value '{0}': expected a number optionally followed by K, M, or G")]
     InvalidMemory(String),
+    #[error("invalid port {0}: must be non-zero")]
+    InvalidPort(u16),
     #[error("field '{0}' cannot be changed after the jail is created; delete and re-apply instead")]
     ImmutableField(&'static str),
 }
