@@ -24,6 +24,11 @@ pub fn derive_pod_cidr(node_id: &str, cluster_cidr: &Ipv4Net) -> Ipv4Net {
 /// wrapping around the CIDR's host count until a free address is found or
 /// every address has been tried.
 pub fn derive_service_vip(service_name: &str, service_cidr: &Ipv4Net, attempt: u32) -> Ipv4Addr {
+    assert!(
+        service_cidr.prefix_len() > 0,
+        "service CIDR prefix length {} must be > 0 to avoid a shift overflow computing its host count",
+        service_cidr.prefix_len()
+    );
     let host_count: u32 = 1u32 << (32 - service_cidr.prefix_len());
     let index = fnv1a(service_name.as_bytes()).wrapping_add(attempt) % host_count;
     let base = u32::from(service_cidr.network());
@@ -85,6 +90,12 @@ mod tests {
     #[should_panic(expected = "must be <= 24")]
     fn panics_if_cluster_cidr_is_smaller_than_a_single_pod_block() {
         derive_pod_cidr("node-1", &cidr("10.0.0.0/28"));
+    }
+
+    #[test]
+    #[should_panic(expected = "must be > 0")]
+    fn panics_if_service_cidr_prefix_length_is_zero() {
+        derive_service_vip("web", &cidr("0.0.0.0/0"), 0);
     }
 
     #[test]
