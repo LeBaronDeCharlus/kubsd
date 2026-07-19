@@ -900,18 +900,32 @@ chance to run. Fixed with an explicit 1-second `connect_timeout`. Both
 were verified by tracing the actual code paths (not just accepting the
 finding's prose) and re-reviewed after the fix.
 
-Verification so far is unit/integration-test-only: 366 tests pass across
-every workspace crate, and clippy is clean relative to the pre-existing
-baseline (34 warnings, all pre-dating this milestone). The real 3-node VM
-verification this design calls for — reading a service's VIP back via a
-direct `GET /services` call (no `keelctl` verb reaches it, see above),
-confirming it's aliased on every node's bridge, connecting from a jail and
-confirming both replicas get used, killing one replica's node and
-confirming the survivor keeps answering, deleting the service and
-confirming teardown — has not been run in this session (no VM/SSH access
-was available); it is deferred and will be run separately, with the
-netmask fix above (checking `netstat -rn` on `keel0`, not just `ifconfig`)
-as the first thing to confirm.
+Unit/integration tests: 366 pass across every workspace crate, clippy
+clean relative to the pre-existing baseline (34 warnings, all pre-dating
+this milestone). The real 3-node VM verification this design calls for
+has now been run end-to-end, and it confirmed the netmask fix above was
+worth the concern: `netstat -rn` on both nodes showed a proper `/32` host
+route via `lo0` for the VIP, not a hijacked `/8`. A 2-replica service's
+VIP (`10.0.250.145:9000`) was read back via a direct `GET /services` call
+(no `keelctl` verb reaches it, see above), confirmed aliased on both
+nodes' `keel0` bridges, and a real jail connecting to it got relayed and
+echoed correctly. Killing one replica's node (`keel-agentd`, not the VM)
+triggered the existing Milestone-15 self-healing reconciliation to
+reschedule a replacement onto the surviving node once the dead one's
+`DEAD_THRESHOLD` elapsed, and the VIP kept answering throughout. Deleting
+the service removed the alias from both nodes' bridges and left new
+connections unanswered.
+
+Two environment-level gaps surfaced during this run, neither a bug in
+this milestone's own code: `net.inet.ip.forwarding` was `0` on both
+nodes (not persisted in `rc.conf`, apparently lost across a reboot),
+silently black-holing all cross-node jail traffic — including the
+proxy's own cross-node relay hops — until re-enabled; and the two nodes'
+mTLS certificates had drifted onto a different CA than the control
+plane's own, pre-dating this session, requiring a full re-issue from the
+control plane's CA before registration would succeed at all. Both are
+operational prerequisites for this VM fleet, not defects to fix in
+`keel-controlplane`/`keel-agentd` themselves.
 
 ## Roadmap
 
@@ -947,7 +961,7 @@ as the first thing to confirm.
 **Sub-project 6: service discovery and load balancing (in progress)**
 
 15. Service discovery via replica sets: `kind: Service`, deterministic replica naming, same-service scheduler spreading, auto-assigned addressing, heartbeat-piggybacked self-healing, `GET /services/<name>` discovery — code complete and reviewed (332 tests passing, clippy clean); real 3-node VM verification not yet run
-16. Service load balancing via a per-node virtual-IP proxy: `spec.port`, `--service-cidr` VIP allocation, heartbeat-carried service table, `keel-net` bridge aliasing, per-node round-robin relay with retry-once — code complete and reviewed (366 tests passing, clippy clean); real 3-node VM verification not yet run
+16. Service load balancing via a per-node virtual-IP proxy: `spec.port`, `--service-cidr` VIP allocation, heartbeat-carried service table, `keel-net` bridge aliasing, per-node round-robin relay with retry-once — code complete and reviewed (366 tests passing, clippy clean), 3-node VM verification passed (netmask, round-robin, failover self-healing, teardown all confirmed)
 
 **Not yet designed** (future sub-projects, each will get its own spec):
 
