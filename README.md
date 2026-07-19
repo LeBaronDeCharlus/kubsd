@@ -984,8 +984,12 @@ real/fake split this project already applies to every other OS-level
 operation, and a better fit than the raw syscall the design spec
 literally proposed.
 
-Unit/integration tests: 403 pass across every workspace crate. Clippy
-adds 7 warnings over Milestone 16's 34-warning baseline: 6 are the
+Unit/integration tests: 403 pass across every workspace crate on macOS
+against fakes, plus real `CliZfsManager`/`CliMountManager` tests added
+specifically for this milestone (`create_volume`, `destroy_dataset`'s
+busy-detection against a real still-mounted dataset, and the full
+`mount_nullfs`/`is_mounted`/`unmount` cycle against a real nullfs mount).
+Clippy adds 7 warnings over Milestone 16's 34-warning baseline: 6 are the
 existing `assert_eq!(x, true/false)` idiom in the new tests (matching
 this file's own established style rather than switching to `assert!`),
 and one is a new `large_enum_variant` lint on `keel-agentd`'s `Command`
@@ -994,12 +998,48 @@ field), noted rather than "fixed" by boxing, since restructuring an
 established, heavily-tested enum's variants is out of scope for what this
 milestone actually needed to change.
 
-Real 3-node VM verification (`zfs create zroot/keel/volumes` bootstrap,
-apply-with-volume/write/delete/re-apply/read-back, `keelctl delete-volume`
-success and 409-while-in-use, and a no-volumes jail's unaffected
-behavior) has not yet been run: this milestone was implemented and
-tested against fakes only in this environment, matching Milestone 15's
-own "code complete, VM verification pending" precedent below.
+Real 3-node VM verification found and fixed two more bugs, both only
+reachable against the actual `mount(8)`/`umount(8)` binaries, never
+against `FakeMountManager`: `CliMountManager::is_mounted` parsed `mount
+-p`'s output by splitting each line on a single literal tab character and
+indexing into the result, but a real FreeBSD 15.1 VM's `mount -p` pads
+its columns with a variable number of tabs for alignment (not exactly one
+tab per field), so splitting on any run of whitespace was needed instead;
+and `unmount`'s "already unmounted, tolerate it" check looked for the
+stderr text `not currently mounted`, but this FreeBSD release's real
+`umount` reports both a never-mounted path and an already-unmounted one
+as `not a file system root directory`, a different message than assumed.
+Both were caught immediately by the real-VM test files added for this
+milestone (`keel-zfs/tests/freebsd_zfs.rs`, `keel-jail/tests/
+freebsd_mount.rs`), fixed, and reverified green.
+
+The full verification chain then passed end-to-end on the real 3-node
+fleet, routed through `keel-controlplane`: applying a `kind: Jail` with a
+`spec.volumes` entry landed it on a node, created and quota-scoped the
+volume's dataset, and nullfs-mounted it onto the jail's `/data` before
+the jail started; a file written through the running jail was readable
+back the same way. Deleting the jail unmounted the volume and destroyed
+the rootfs dataset, but `zfs list` on that node still showed the volume
+dataset intact. Re-applying the same jail (sticky placement kept it on
+the same node) remounted the existing dataset without recreating it, and
+the earlier file was still there. `DELETE /nodes/<node>/volumes/<name>`
+while the jail still held it mounted returned `409` with the dataset
+untouched; deleting the jail first and retrying returned `200`, and a
+follow-up `GET` on the same name returned `404`, confirming the dataset
+was actually gone. A plain `kind: Jail` with no `spec.volumes` (`volumes:
+[]`) applied and ran with no behavior change. `cargo test --workspace` on
+the real VM passed (one unrelated pre-existing failure noted separately,
+below), clippy warnings unchanged from the count above.
+
+One pre-existing, unrelated test failure surfaced while running the full
+suite on the real VM: `keel-net`'s `add_route_and_remove_route_are_
+idempotent_against_the_real_kernel` fails consistently, expecting
+`route(8)`'s "already removed" tolerance to match a stderr substring that
+doesn't appear in this FreeBSD 15.1 release's actual `route delete`
+output (`route: route has not been found`, not whatever text that
+tolerance was written against). This is in a crate this milestone never
+touched and is left for a future session to fix, not folded into this
+milestone's own scope.
 
 ## Roadmap
 
@@ -1039,7 +1079,7 @@ own "code complete, VM verification pending" precedent below.
 
 **Sub-project 7: persistent storage (in progress)**
 
-17. Persistent volumes on a single node: `spec.volumes` on `kind: Jail`, `create_volume`/decoupled dataset lifecycle, `MountManager` (`mount -t nullfs`), `GET`/`DELETE /volumes/<name>`, `keelctl delete-volume` — code complete (403 tests passing); real 3-node VM verification not yet run
+17. Persistent volumes on a single node: `spec.volumes` on `kind: Jail`, `create_volume`/decoupled dataset lifecycle, `MountManager` (`mount -t nullfs`), `GET`/`DELETE /volumes/<name>`, `keelctl delete-volume` (403 tests passing), 3-node VM verification passed (create/write/delete/re-apply/read-back, 409-while-in-use, 404-after-delete, no-volumes jail unaffected)
 
 **Not yet designed** (future sub-projects, each will get its own spec):
 

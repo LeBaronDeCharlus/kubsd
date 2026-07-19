@@ -74,9 +74,30 @@ spec:
           <tr><td><code>spec.resources.cpu</code></td><td>string</td><td>CPU limit, parsed into an <code>rctl(8)</code> <code>pcpu</code> percentage (e.g. <code>"2"</code> means 2 cores' worth).</td></tr>
           <tr><td><code>spec.resources.memory</code></td><td>string</td><td>Memory limit, parsed into bytes for <code>rctl(8)</code> (e.g. <code>"512M"</code>).</td></tr>
           <tr><td><code>spec.restartPolicy</code></td><td><code>Always</code> | <code>OnFailure</code> | <code>Never</code></td><td>Whether the reconciler restarts the jail's command after it exits, and under what conditions.</td></tr>
+          <tr><td><code>spec.volumes</code></td><td>list of objects</td><td>Named persistent volumes; see <a href="#volumes">Volumes</a> below. Defaults to an empty list, so specs written before this field existed keep parsing unchanged. Immutable after first apply: changing the list on a re-apply is rejected with a 409, delete and re-apply instead.</td></tr>
         </tbody>
       </table>
       <p>Fields not listed as immutable above can change on a re-apply of the same <code>metadata.name</code>; the reconciler diffs the new spec against the running jail's state and reconciles the difference.</p>
+    </div>
+  </section>
+
+  <section id="volumes">
+    <div class="container">
+      <h2>Volumes</h2>
+      <p>Each entry in <code>spec.volumes</code> declares one named ZFS-backed directory whose dataset is created the first time a jail referencing it is provisioned, survives that jail being deleted, and is only ever destroyed by an explicit, separate <code>DELETE /volumes/&lt;name&gt;</code> (see the <a href="api.html#volumes">HTTP API reference</a>). Two jails referencing the same volume name on the same node share the same dataset; nothing coordinates concurrent writers, so single-writer is the only supported use today. A volume is single-node only, exactly the node the jail that first referenced it was scheduled onto by the existing scheduler; there is no cross-node volume movement yet, and <code>kind: Service</code>/<code>JailTemplate</code> never gain <code>volumes</code> at all, since a service replica can be rescheduled to any node and attaching node-local data to something that moves without its data is exactly the footgun this restriction avoids.</p>
+      <pre>spec:
+  volumes:
+    - name: web-data
+      mountPath: /data
+      size: 1G</pre>
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>name</code></td><td>string</td><td>The volume's name, validated the same way a jail name is (it becomes a ZFS dataset path component: <code>{pool}/keel/volumes/{name}</code>). Must be unique within this jail's own <code>volumes</code> list.</td></tr>
+          <tr><td><code>mountPath</code></td><td>string</td><td>Where the volume is mounted inside the jail's rootfs, e.g. <code>/data</code>.</td></tr>
+          <tr><td><code>size</code></td><td>string</td><td>A hard ZFS quota for the volume's dataset, same K/M/G-suffix grammar as <code>spec.resources.memory</code> (e.g. <code>"1G"</code>). What happens when an application fills it (<code>ENOSPC</code> surfaced directly to the jailed process) is left entirely to ZFS's own enforcement, the same way <code>resources.cpu</code>/<code>memory</code> already rely on <code>rctl</code>'s.</td></tr>
+        </tbody>
+      </table>
     </div>
   </section>
 

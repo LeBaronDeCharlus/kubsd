@@ -104,6 +104,21 @@
       <p>The VIP is reachable only from other jails/nodes inside the cluster, the same boundary <code>pod_cidr</code> already has; there is no NodePort/LoadBalancer equivalent yet. The proxy is a pure L4 TCP byte relay: it never inspects, parses, or terminates whatever protocol is inside the connection, and there is no session affinity (each new connection picks a healthy replica independently) and no load-balancing algorithm more sophisticated than round robin.</p>
     </div>
   </section>
+
+  <section id="volumes">
+    <div class="container">
+      <h2>Volumes</h2>
+      <p>A jail's declared <code>spec.volumes</code> (see the <a href="jailspec.html#volumes">JailSpec reference</a>) are created and mounted automatically as part of <code>PUT /jails/&lt;name&gt;</code>/<code>DELETE /jails/&lt;name&gt;</code> above; the two routes below act purely against ZFS, keyed only by dataset path, and never consult a jail record, since a volume can outlive every jail that ever referenced it.</p>
+      <table>
+        <thead><tr><th>Method &amp; path</th><th>Body</th><th>Success</th><th>Errors</th></tr></thead>
+        <tbody>
+          <tr><td><code>GET /volumes/&lt;name&gt;</code></td><td>none</td><td>200, YAML <code>{name}</code>, regardless of whether any jail currently has it mounted</td><td>404 the dataset was never created or has already been destroyed</td></tr>
+          <tr><td><code>DELETE /volumes/&lt;name&gt;</code></td><td>none</td><td>200, dataset destroyed for good</td><td>404 the dataset was never created or has already been destroyed; 409 still mounted by a running jail (ZFS itself refuses to destroy a mounted dataset; delete the jail first)</td></tr>
+        </tbody>
+      </table>
+      <p><code>keel-controlplane</code> forwards <code>GET</code>/<code>DELETE /nodes/&lt;id&gt;/volumes/&lt;name&gt;</code> to the named node's <code>keel-agentd</code>, byte-for-byte, the same <code>handle_forward</code> path <code>/nodes/&lt;id&gt;/jails/...</code> already uses; there is no scheduled (node-less) route for volumes, since a volume is never itself scheduled, it simply lives wherever the jail that first referenced it already landed. <code>keelctl delete-volume &lt;name&gt;</code> is the only <code>keelctl</code> verb that reaches this API; there is no <code>keelctl get-volume</code>, the same "operator surface is deliberately smaller than the full HTTP API" precedent <code>GET /services</code> already set.</p>
+    </div>
+  </section>
 </main>
 <footer class="site-footer">
   <div class="container">

@@ -49,7 +49,9 @@
         the multi-node control plane, resource-aware scheduling, mutual-TLS
         hardening with certificate revocation/rotation, cross-node overlay
         networking, and service discovery with a per-node virtual-IP proxy
-        for load balancing across a service's replicas.
+        for load balancing across a service's replicas. <strong>Sub-project 7</strong>
+        (persistent storage) has its first milestone done: a jail can declare
+        named ZFS-backed volumes that survive its own deletion.
         <a href="journey.html">See the full journey &rarr;</a>
       </div>
     </div>
@@ -84,6 +86,10 @@
           <h3>Services and load balancing</h3>
           <p>A <code>kind: Service</code> spec runs N replicas spread across nodes behind one stable virtual IP, transparently relayed round-robin to a currently-healthy replica.</p>
         </div>
+        <div class="card">
+          <h3>Persistent volumes</h3>
+          <p>A jail can declare named volumes backed by their own ZFS datasets, created on first use and surviving the jail's own deletion, mounted back in on re-apply with the data intact.</p>
+        </div>
       </div>
     </div>
   </section>
@@ -97,6 +103,7 @@
         <tbody>
           <tr><td>Workload unit</td><td>Pod (Linux containers)</td><td>Jail</td></tr>
           <tr><td>Filesystem</td><td>overlay/container images</td><td>ZFS clones of a base dataset</td></tr>
+          <tr><td>Storage</td><td>PersistentVolume/PVC, any node</td><td>named ZFS volumes, single node only</td></tr>
           <tr><td>Scope</td><td>multi-node cluster, resource-aware scheduler</td><td>multi-node, resource-aware scheduler (heuristic)</td></tr>
           <tr><td>Networking</td><td>CNI, overlay networks, Services</td><td>per-node kernel routing, per-service virtual IP + proxy</td></tr>
         </tbody>

@@ -61,13 +61,14 @@
           <tr><td>Workload unit</td><td>Pod (Linux containers)</td><td>Jail</td></tr>
           <tr><td>Isolation</td><td>namespaces + cgroups</td><td>jails + <code>rctl(8)</code></td></tr>
           <tr><td>Filesystem</td><td>overlay/container images</td><td>ZFS clones of a base dataset</td></tr>
+          <tr><td>Storage</td><td>PersistentVolume/PVC, follows a rescheduled pod across any node</td><td>named ZFS volumes (<code>spec.volumes</code>), decoupled from a jail's own lifecycle but pinned to the single node they were created on; no cross-node movement yet</td></tr>
           <tr><td>Networking</td><td>CNI, overlay networks, Services</td><td>VNET + <code>epair(4)</code> + <code>bridge(4)</code> per host, plain kernel routing between nodes' per-node subnets, no tunnel/overlay protocol</td></tr>
           <tr><td>Scope</td><td>multi-node cluster, resource-aware scheduler</td><td>multi-node, resource-aware scheduler (heuristic, no admission guarantee)</td></tr>
           <tr><td>Control plane</td><td>API server + etcd + scheduler</td><td>node registry + resource-aware scheduler + spec routing, mutual TLS with revocation/rotation</td></tr>
           <tr><td>Service / load balancing</td><td>Service + kube-proxy, ClusterIP/NodePort/LoadBalancer</td><td><code>kind: Service</code> replica sets + a per-node virtual-IP proxy, round-robin, cluster-internal only (no NodePort/LoadBalancer equivalent yet)</td></tr>
         </tbody>
       </table>
-      <p>In other words: what exists today spans a <strong>kubelet</strong> plus a multi-node control plane with a resource-aware scheduler, mutual-TLS-secured cluster membership, cross-node kernel routing between per-node subnets, and a Service abstraction with its own per-node load-balancing proxy, not a full cluster. There is still no external/outside-cluster reachability (a NodePort/LoadBalancer equivalent); see the <a href="journey.html">journey</a> for how the project got here and what's next.</p>
+      <p>In other words: what exists today spans a <strong>kubelet</strong> plus a multi-node control plane with a resource-aware scheduler, mutual-TLS-secured cluster membership, cross-node kernel routing between per-node subnets, a Service abstraction with its own per-node load-balancing proxy, and named persistent volumes scoped to a single node, not a full cluster. There is still no external/outside-cluster reachability (a NodePort/LoadBalancer equivalent) and no cross-node volume movement for a rescheduled stateful replica; see the <a href="journey.html">journey</a> for how the project got here and what's next.</p>
     </div>
   </section>
 

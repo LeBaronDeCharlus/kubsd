@@ -103,6 +103,16 @@ keelctl --control-plane-addr 10.0.0.2:7620 delete web    # falls back to the ser
     </div>
   </section>
 
+  <section id="delete-volume">
+    <div class="container">
+      <h2>keelctl delete-volume NAME</h2>
+      <p>Destroys a named volume's ZFS dataset for good (<code>DELETE /volumes/&lt;name&gt;</code>, or <code>DELETE /nodes/&lt;node&gt;/volumes/&lt;name&gt;</code> when routed with <code>--node</code>). A volume is never scheduled on its own, so there's no equivalent of automatic node selection here the way <code>apply</code> has: routed mode always needs an explicit <code>--node</code> naming the node the volume's dataset actually lives on. Fails with a clean error (rather than force-unmounting anything) if a jail still has the volume mounted; delete that jail first.</p>
+      <pre>keelctl delete-volume web-data
+keelctl --control-plane-addr 10.0.0.2:7620 --node node-4 delete-volume web-data</pre>
+      <p>There is no <code>keelctl get-volume</code> or bare-collection verb for volumes; see the <a href="api.html#volumes">HTTP API reference</a> for the full <code>GET</code>/<code>DELETE /volumes/&lt;name&gt;</code> surface, reachable directly over HTTP.</p>
+    </div>
+  </section>
+
   <section id="errors">
     <div class="container">
       <h2>Errors</h2>
