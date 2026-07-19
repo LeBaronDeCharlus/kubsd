@@ -52,6 +52,13 @@ impl ZfsManager for CliZfsManager {
         ))
     }
 
+    fn create_volume(&self, dataset: &str, quota: &str) -> Result<(), ZfsError> {
+        if self.dataset_exists(dataset)? {
+            return Ok(());
+        }
+        Self::run_checked(&["create", "-o", &format!("quota={quota}"), dataset])
+    }
+
     fn destroy_dataset(&self, dataset: &str) -> Result<(), ZfsError> {
         // Immediately after a jail using this dataset as its rootfs is torn
         // down (`jail -r`), the kernel can take a brief moment to release
@@ -64,6 +71,7 @@ impl ZfsManager for CliZfsManager {
         // `Reconciler::delete`) that chains this right after destroying
         // the owning jail.
         let mut last_err = None;
+        let mut last_was_busy = false;
         for _ in 0..10 {
             match Self::run_checked(&["destroy", dataset]) {
                 Ok(()) => return Ok(()),
@@ -83,6 +91,7 @@ impl ZfsManager for CliZfsManager {
                     }
                     let is_busy =
                         matches!(&e, ZfsError::CommandFailed(_, _, stderr) if stderr.contains("dataset is busy"));
+                    last_was_busy = is_busy;
                     last_err = Some(e);
                     if !is_busy {
                         break;
@@ -90,6 +99,9 @@ impl ZfsManager for CliZfsManager {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             }
+        }
+        if last_was_busy {
+            return Err(ZfsError::Busy(dataset.to_string()));
         }
         Err(last_err.unwrap())
     }

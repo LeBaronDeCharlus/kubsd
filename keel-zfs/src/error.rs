@@ -8,4 +8,6 @@ pub enum ZfsError {
     CommandFailed(String, std::process::ExitStatus, String),
     #[error("dataset '{0}' not found")]
     NotFound(String),
+    #[error("dataset '{0}' is busy")]
+    Busy(String),
 }
