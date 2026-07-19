@@ -53,11 +53,13 @@ impl MountManager for CliMountManager {
             return Ok(());
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // FreeBSD's `umount` prints `umount: <path>: not currently mounted`
-        // and exits non-zero for a target that isn't mounted — the same
-        // "already in the desired state" tolerance `Reconciler::delete`
-        // needs for volumes it never got as far as mounting.
-        if stderr.contains("not currently mounted") {
+        // Verified directly against a real FreeBSD 15.1 VM: `umount` prints
+        // `umount: <path>: not a file system root directory` and exits
+        // non-zero both for a path that was never a mount point and for one
+        // that already got unmounted (the exact tolerance `Reconciler::
+        // delete` needs for a volume it never got as far as mounting, or
+        // one it already unmounted on a prior, partially-completed delete).
+        if stderr.contains("not a file system root directory") {
             return Err(MountError::NotMounted(target.to_path_buf()));
         }
         Err(MountError::CommandFailed(
@@ -77,9 +79,16 @@ impl MountManager for CliMountManager {
             ));
         }
         let target_str = target.to_string_lossy();
-        // `mount -p`'s output is tab-separated: `device  mountpoint  fstype ...`.
+        // Verified directly against a real FreeBSD 15.1 VM: `mount -p`'s
+        // columns (`device mountpoint fstype options dump pass`) are
+        // tab-separated but padded with a variable number of tabs for
+        // alignment, not exactly one tab per field, so splitting on a
+        // literal single `\t` and indexing shifts fields on any
+        // short-enough entry (e.g. every nullfs mount this project creates).
+        // Splitting on any run of whitespace instead is safe here since
+        // none of these fields ever contain embedded whitespace themselves.
         Ok(String::from_utf8_lossy(&output.stdout)
             .lines()
-            .any(|line| line.split('\t').nth(1) == Some(target_str.as_ref())))
+            .any(|line| line.split_whitespace().nth(1) == Some(target_str.as_ref())))
     }
 }
