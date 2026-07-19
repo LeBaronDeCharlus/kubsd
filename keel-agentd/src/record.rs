@@ -28,6 +28,14 @@ pub fn epair_base_name(ordinal: u32) -> String {
     format!("epair{ordinal}")
 }
 
+pub fn volume_dataset_path(pool: &str, name: &str) -> String {
+    format!("{pool}/keel/volumes/{name}")
+}
+
+pub fn volume_mountpoint(pool: &str, name: &str) -> PathBuf {
+    PathBuf::from(format!("/{}", volume_dataset_path(pool, name)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,6 +84,16 @@ mod tests {
     #[test]
     fn epair_base_name_formats_the_ordinal() {
         assert_eq!(epair_base_name(7), "epair7");
+    }
+
+    #[test]
+    fn volume_dataset_path_uses_volumes_subdirectory() {
+        assert_eq!(volume_dataset_path("zroot", "web-data"), "zroot/keel/volumes/web-data");
+    }
+
+    #[test]
+    fn volume_mountpoint_is_leading_slash_plus_dataset_path() {
+        assert_eq!(volume_mountpoint("zroot", "web-data"), PathBuf::from("/zroot/keel/volumes/web-data"));
     }
 
     #[test]
