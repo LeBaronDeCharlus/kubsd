@@ -927,6 +927,80 @@ control plane's CA before registration would succeed at all. Both are
 operational prerequisites for this VM fleet, not defects to fix in
 `keel-controlplane`/`keel-agentd` themselves.
 
+### Milestone 17: persistent volumes on a single node
+
+Every milestone through 16 treated a jail's entire filesystem as
+disposable: `keel-agentd`'s `Reconciler::provision` clones a jail's rootfs
+dataset from a base image, and `Reconciler::delete` destroys that same
+dataset the instant the jail is deleted. This milestone, the first in
+Sub-Project 7, builds the foundation for data that outlives a jail
+*on one node*, deliberately stopping there: the cross-node questions
+(does a stateful service's data follow a rescheduled replica via
+node-pinning, or via `zfs send`/`receive` replication?) are left for a
+later milestone, mirroring how Milestone 15 built the replica-set concept
+before Milestone 16 added cross-node load balancing on top of it.
+
+`keel-spec`'s `Spec` (`kind: Jail` only: `kind: Service`/`JailTemplate`
+never gain volumes, since a service replica can be rescheduled to any
+node by Milestone 15's self-healing, and attaching node-local data to
+something that moves without its data is exactly the footgun this
+milestone avoids) gains `volumes: Vec<VolumeMount>`, each entry a `name`,
+`mountPath`, and ZFS-quota-style `size`, validated the same way a jail
+name and memory quantity already are, and rejected outright (not
+diffed/remounted) on any re-apply that changes the list. `keel-zfs` gains
+`create_volume` (a plain `zfs create -o quota=...`, independent of the
+rootfs-cloning path) and a new `ZfsError::Busy` variant so an
+exhausted-retries "dataset is busy" `destroy_dataset` failure is
+distinguishable, at the type level, from any other failure, needed to
+tell apart "still mounted, try again after deleting the jail" from
+"never existed" at the HTTP layer. `keel-jail` gains a new `MountManager`
+trait (`CliMountManager`/`FakeMountManager`, the same real/fake split
+every OS-interaction trait in this project already uses) for
+`mount -t nullfs`/`umount`/`mount -p`; a `FakeMountManager`-backed
+reconciler test surfaced a real bug during TDD (see below).
+
+`Reconciler::provision` now creates and nullfs-mounts each declared
+volume's dataset (idempotent: an already-existing dataset or an
+already-mounted target is left alone, so an agentd restart with the jail
+already running is a no-op) before starting the jail; `Reconciler::delete`
+unmounts every declared volume before destroying the rootfs dataset, but
+never destroys a volume's own dataset: that decoupled lifecycle is this
+milestone's entire point. `GetVolume`/`DeleteVolume` act purely against
+ZFS, keyed only by dataset path, never consulting a jail record, since a
+volume can outlive every jail that ever referenced it. `GET`/`DELETE
+/volumes/<name>` map `ZfsError::NotFound`/`Busy` to `404`/`409`.
+`keel-controlplane` gains two forwarding-only route arms reusing
+`handle_forward` verbatim; `keelctl` gains a `delete-volume <name>` verb.
+
+TDD surfaced one real deviation from the initial design: the design's own
+`std::fs::create_dir_all(&target)` call inside `provision`, run
+unconditionally against an absolute rootfs path like `/zroot/keel/jails/
+web-1/data`, broke every `FakeJailRuntime`/`FakeZfsManager`-backed
+reconciler test outright (`ReadOnlyFilesystem`, since `/zroot` doesn't
+exist as a real directory in a test environment). Moved behind a new
+`MountManager::ensure_mount_point` method instead (`CliMountManager`
+shells the real `create_dir_all`, `FakeMountManager` is a no-op), the same
+real/fake split this project already applies to every other OS-level
+operation, and a better fit than the raw syscall the design spec
+literally proposed.
+
+Unit/integration tests: 403 pass across every workspace crate. Clippy
+adds 7 warnings over Milestone 16's 34-warning baseline: 6 are the
+existing `assert_eq!(x, true/false)` idiom in the new tests (matching
+this file's own established style rather than switching to `assert!`),
+and one is a new `large_enum_variant` lint on `keel-agentd`'s `Command`
+(the enum's largest variant grew slightly once `Spec` gained a `Vec`
+field), noted rather than "fixed" by boxing, since restructuring an
+established, heavily-tested enum's variants is out of scope for what this
+milestone actually needed to change.
+
+Real 3-node VM verification (`zfs create zroot/keel/volumes` bootstrap,
+apply-with-volume/write/delete/re-apply/read-back, `keelctl delete-volume`
+success and 409-while-in-use, and a no-volumes jail's unaffected
+behavior) has not yet been run: this milestone was implemented and
+tested against fakes only in this environment, matching Milestone 15's
+own "code complete, VM verification pending" precedent below.
+
 ## Roadmap
 
 **Sub-project 1: single-node jail reconciliation daemon (complete)**
@@ -963,9 +1037,13 @@ operational prerequisites for this VM fleet, not defects to fix in
 15. Service discovery via replica sets: `kind: Service`, deterministic replica naming, same-service scheduler spreading, auto-assigned addressing, heartbeat-piggybacked self-healing, `GET /services/<name>` discovery — code complete and reviewed (332 tests passing, clippy clean); real 3-node VM verification not yet run
 16. Service load balancing via a per-node virtual-IP proxy: `spec.port`, `--service-cidr` VIP allocation, heartbeat-carried service table, `keel-net` bridge aliasing, per-node round-robin relay with retry-once — code complete and reviewed (366 tests passing, clippy clean), 3-node VM verification passed (netmask, round-robin, failover self-healing, teardown all confirmed)
 
+**Sub-project 7: persistent storage (in progress)**
+
+17. Persistent volumes on a single node: `spec.volumes` on `kind: Jail`, `create_volume`/decoupled dataset lifecycle, `MountManager` (`mount -t nullfs`), `GET`/`DELETE /volumes/<name>`, `keelctl delete-volume` — code complete (403 tests passing); real 3-node VM verification not yet run
+
 **Not yet designed** (future sub-projects, each will get its own spec):
 
-- Storage orchestration beyond a single host's ZFS pool
+- Stateful `kind: Service` (node-pinning or `zfs send`/`receive` replication for a rescheduled replica's data) and cross-node volume movement generally
 - bhyve VM workloads alongside jails
 
 ## Platform support

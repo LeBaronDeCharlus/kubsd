@@ -154,6 +154,18 @@ same existing idiom `clone_from_base` uses for its snapshot step.
 is reused unchanged for explicit volume deletion — no new destroy method
 needed.
 
+Like `clone_from_base` (whose own doc comment already notes "the
+target_dataset's parent must already exist — this method does not create
+parent datasets, no `-p`"), `create_volume` does not create
+`{pool}/keel/volumes` itself: that parent dataset must already exist on a
+node before any jail referencing a volume is first provisioned there,
+exactly the same out-of-band, one-time prerequisite `{pool}/keel/jails`
+already is for `clone_from_base` (created by hand during a node's initial
+ZFS bootstrap, per Milestone 2). This milestone's VM verification (below)
+must create `{pool}/keel/volumes` on the target node before exercising
+anything else, the same way earlier milestones' verification already
+assumes `{pool}/keel/jails` is present.
+
 ### `keel-jail`: `MountManager`, a new trait alongside `JailRuntime`
 
 Mounting is not jail-specific at the OS level (`mount(8)`/`umount(8)` know
@@ -216,12 +228,41 @@ point of this milestone.
 Two new `Command` variants, `GetVolume(String, Sender<Result<VolumeStatus, ReconcileError>>)`
 and `DeleteVolume(String, Sender<Result<(), ReconcileError>>)`, handled by
 the reconciler worker loop the same way `Command::Get`/`Command::Delete`
-already are. `DeleteVolume` calls `zfs.destroy_dataset` directly against
-`record::volume_dataset_path`; it does not consult `self.records` at all,
-since a volume can outlive every jail record that ever referenced it (that
-is, again, the entire point). `route()` dispatches `GET`/`DELETE
+already are. Neither consults `self.records` at all, since a volume can
+outlive every jail record that ever referenced it (that is, again, the
+entire point) — both act purely against ZFS, keyed only by
+`record::volume_dataset_path`.
+
+`GetVolume`'s handler calls `zfs.dataset_exists` on that path: `Ok(true)`
+replies with `VolumeStatus { name: String }` (this milestone has no
+per-volume state beyond existence to report — no live quota/usage query is
+added; see Non-Goals), `Ok(false)` replies with
+`Err(ReconcileError::Zfs(ZfsError::NotFound(dataset)))`, constructed
+directly by the handler rather than by `dataset_exists` itself (which
+reports absence as a plain `false`, not an error) so a never-created or
+already-deleted volume's `GET` surfaces through the same 404 path
+`DeleteVolume` uses for the identical case (see Error Handling).
+
+`DeleteVolume` calls `zfs.destroy_dataset` directly against
+`record::volume_dataset_path`. `route()` dispatches `GET`/`DELETE
 /volumes/<name>` to these, mirroring `handle_get`/`handle_delete`'s
 existing shape.
+
+Making the "still mounted" and "never existed" `DELETE` cases (Error
+Handling, below) actually distinguishable at the HTTP layer needs two
+small additions neither of which exists on `master` today:
+- `keel-zfs`'s `ZfsError` gains a `Busy(String)` variant. `destroy_dataset`'s
+  existing retry loop (`keel-zfs/src/cli.rs`) already detects a "dataset is
+  busy" stderr and retries, but today falls back to a plain
+  `CommandFailed` once retries are exhausted — indistinguishable, at the
+  type level, from any other command failure. It returns `Busy(dataset)`
+  in that exhausted-retries case instead.
+- `keel-agentd/src/http.rs`'s `status_for_error` gains two match arms:
+  `ReconcileError::Zfs(ZfsError::NotFound(_)) => 404` and
+  `ReconcileError::Zfs(ZfsError::Busy(_)) => 409`. Today `status_for_error`
+  has no arm for `ReconcileError::Zfs(_)` at all beyond the catch-all
+  `_ => 500`, so without this addition both cases below would incorrectly
+  surface as `500`.
 
 ### `keel-controlplane` + `keelctl`
 
@@ -266,14 +307,24 @@ node) destroys the dataset for good.
   best-effort teardown path `provision`'s caller already runs on failure.
 - `DELETE /volumes/<name>` on a still-mounted (i.e. still-referenced-by-a-
   running-jail) volume surfaces `zfs destroy`'s own "dataset is busy"
-  failure as a `409`-class error (mirroring how `status_for_error` already
-  maps `ImmutableField` to `409`) rather than force-unmounting anything —
-  an operator must delete the jail first, an explicit two-step teardown
-  rather than an implicit, surprising one.
+  failure as the new `ZfsError::Busy` variant, mapped by `status_for_error`'s
+  new arm to a `409`-class error (the same status `ImmutableField` already
+  gets, for the same "conflicts with current state, try a different
+  operation first" reason) rather than force-unmounting anything — an
+  operator must delete the jail first, an explicit two-step teardown rather
+  than an implicit, surprising one.
 - `DELETE /volumes/<name>` on a volume that was never created (typo'd name,
-  or never provisioned) returns the existing `ZfsError::NotFound` mapped to
-  `404`, the same mapping every other not-found case in this project
-  already gets.
+  or never provisioned) surfaces `ZfsError::NotFound`, mapped by
+  `status_for_error`'s other new arm to `404`, the same status every other
+  not-found case in this project already gets (both new arms are described
+  above, under `keel-agentd` HTTP + `Command` channel).
+- `GET /volumes/<name>` on a volume that was never created or has already
+  been destroyed returns that same `404`, via the same
+  `ZfsError::NotFound` path `GetVolume`'s handler constructs directly from
+  `dataset_exists` returning `Ok(false)` (see above); a volume that exists
+  returns `200` with its minimal `VolumeStatus` body regardless of whether
+  any jail currently has it mounted — existence, not current mount state,
+  is what `GET` reports.
 - A volume's `mount_nullfs`/`unmount` failing for a reason other than
   "already (un)mounted" propagates as a normal `ReconcileError`, failing
   that reconcile pass the same way a `JailError`/`ZfsError` already does —
@@ -290,10 +341,13 @@ node) destroys the dataset for good.
   changed `volumes` list is rejected via `ImmutableField("spec.volumes")`,
   mirroring the existing `image`/`network.address` immutability tests.
 - **`keel-zfs`:** `FakeZfsManager`-backed tests for `create_volume`
-  (idempotent on an already-existing dataset); real, FreeBSD-VM-verified
-  test for the actual `zfs create -o quota=...` invocation, matching every
-  prior milestone's "verify the one genuinely OS-level part for real"
-  discipline.
+  (idempotent on an already-existing dataset); a `destroy_dataset` test
+  confirming an exhausted-retries "dataset is busy" failure now returns
+  `ZfsError::Busy` rather than a generic `CommandFailed`; real,
+  FreeBSD-VM-verified tests for the actual `zfs create -o quota=...`
+  invocation and for `destroy_dataset`'s busy-detection against a real
+  still-mounted dataset, matching every prior milestone's "verify the one
+  genuinely OS-level part for real" discipline.
 - **`keel-jail`:** `FakeMountManager`-backed unit tests for `mount_nullfs`/
   `unmount`/`is_mounted`'s in-memory bookkeeping; real VM-verified test for
   `CliMountManager` against an actual nullfs mount.
@@ -303,15 +357,24 @@ node) destroys the dataset for good.
   no-op, not a duplicate `create_volume`/`mount_nullfs` call; deleting the
   jail unmounts but leaves `FakeZfsManager`'s dataset present; re-applying
   and re-provisioning the same jail name afterward finds the dataset still
-  there and remounts it without recreating it; an HTTP-layer test for
-  `GET`/`DELETE /volumes/<name>` including the "still mounted" and
-  "never existed" error-mapping cases above.
+  there and remounts it without recreating it; a `status_for_error` unit
+  test confirming its two new match arms (`ZfsError::NotFound` → `404`,
+  `ZfsError::Busy` → `409`); an HTTP-layer test for `GET`/`DELETE
+  /volumes/<name>` covering all three cases above: a present volume's `GET`
+  returning `200`, a still-mounted volume's `DELETE` returning `409`, and a
+  never-created (or already-deleted) volume's `GET` and `DELETE` both
+  returning `404`.
 - **`keel-controlplane`:** an HTTP-layer test confirming `DELETE
   /nodes/{id}/volumes/{name}` forwards to the right node exactly like the
   existing `/nodes/{id}/jails/{name}` forwarding test does.
 - **VM verification (single real node is sufficient; run against the
   existing 3-node fleet regardless, per this project's standing
-  discipline):** apply a jail with a volume, write a file into the mounted
+  discipline):** first, one-time per node, `zfs create zroot/keel/volumes`
+  (the same kind of manual bootstrap step `zroot/keel/jails` already needed
+  before Milestone 2's verification could run) — without it, this
+  milestone's first `create_volume` call fails outright, since
+  (per Architecture, above) `create_volume` never creates its own parent
+  dataset; apply a jail with a volume, write a file into the mounted
   path, delete the jail, confirm `zfs list` still shows the volume dataset,
   re-apply the same jail, confirm the file is still there; confirm
   `keelctl delete-volume` actually frees the dataset and fails cleanly
