@@ -7,9 +7,9 @@ pub use error::SpecError;
 pub use resources::{cores_to_pcpu_percent, parse_cpu_cores, parse_memory_bytes};
 pub use types::{
     JailSpec, JailTemplate, Metadata, NetworkSpec, RestartPolicy, ResourcesSpec, ServiceSpec,
-    ServiceSpecBody, Spec, TemplateNetworkSpec,
+    ServiceSpecBody, Spec, TemplateNetworkSpec, VolumeMount,
 };
-pub use validate::{validate_address, validate_name, validate_transition};
+pub use validate::{validate_address, validate_name, validate_transition, validate_volumes};
 
 pub fn parse_and_validate(yaml: &str) -> Result<JailSpec, SpecError> {
     let spec: JailSpec = serde_yaml::from_str(yaml).map_err(|e| SpecError::Yaml(e.to_string()))?;
@@ -17,6 +17,7 @@ pub fn parse_and_validate(yaml: &str) -> Result<JailSpec, SpecError> {
     validate::validate_address(&spec.spec.network.address)?;
     resources::parse_cpu_cores(&spec.spec.resources.cpu)?;
     resources::parse_memory_bytes(&spec.spec.resources.memory)?;
+    validate::validate_volumes(&spec.spec.volumes)?;
     Ok(spec)
 }
 

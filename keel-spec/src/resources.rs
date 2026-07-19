@@ -32,6 +32,13 @@ pub fn parse_memory_bytes(s: &str) -> Result<u64, SpecError> {
     value.checked_mul(multiplier).ok_or_else(invalid)
 }
 
+/// A ZFS quota and a memory size are the same kind of quantity (a plain
+/// byte count with an optional K/M/G suffix) — reuses `parse_memory_bytes`'s
+/// grammar directly rather than inventing a new one.
+pub fn parse_zfs_quota(s: &str) -> Result<u64, SpecError> {
+    parse_memory_bytes(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,5 +77,17 @@ mod tests {
         assert!(parse_memory_bytes("abc").is_err());
         assert!(parse_memory_bytes("-5M").is_err());
         assert!(parse_memory_bytes("999999999999G").is_err());
+    }
+
+    #[test]
+    fn parse_zfs_quota_accepts_the_same_grammar_as_memory() {
+        assert_eq!(parse_zfs_quota("1G"), Ok(1024 * 1024 * 1024));
+        assert_eq!(parse_zfs_quota("512M"), Ok(512 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parse_zfs_quota_rejects_the_same_malformed_input_as_memory() {
+        assert!(parse_zfs_quota("0G").is_err());
+        assert!(parse_zfs_quota("abc").is_err());
     }
 }

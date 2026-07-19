@@ -111,6 +111,7 @@ mod tests {
                 },
                 resources: ResourcesSpec { cpu: "2".to_string(), memory: "512M".to_string() },
                 restart_policy: RestartPolicy::Always,
+                volumes: vec![],
             },
         }
     }

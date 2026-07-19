@@ -21,12 +21,27 @@ pub fn validate_address(address: &str) -> Result<(), SpecError> {
         .map_err(|e| SpecError::InvalidAddress(address.to_string(), e.to_string()))
 }
 
+pub fn validate_volumes(volumes: &[crate::types::VolumeMount]) -> Result<(), SpecError> {
+    let mut seen = std::collections::HashSet::new();
+    for volume in volumes {
+        validate_name(&volume.name)?;
+        if !seen.insert(volume.name.clone()) {
+            return Err(SpecError::DuplicateVolumeName(volume.name.clone()));
+        }
+        crate::resources::parse_zfs_quota(&volume.size)?;
+    }
+    Ok(())
+}
+
 pub fn validate_transition(old: &crate::types::JailSpec, new: &crate::types::JailSpec) -> Result<(), SpecError> {
     if old.spec.image != new.spec.image {
         return Err(SpecError::ImmutableField("spec.image"));
     }
     if old.spec.network.address != new.spec.network.address {
         return Err(SpecError::ImmutableField("spec.network.address"));
+    }
+    if old.spec.volumes != new.spec.volumes {
+        return Err(SpecError::ImmutableField("spec.volumes"));
     }
     Ok(())
 }
@@ -77,6 +92,39 @@ mod tests {
         assert!(validate_address("10.0.0.5/33").is_err()); // prefix out of range
     }
 
+    fn volume(name: &str, mount_path: &str, size: &str) -> VolumeMount {
+        VolumeMount { name: name.to_string(), mount_path: mount_path.to_string(), size: size.to_string() }
+    }
+
+    #[test]
+    fn validate_volumes_accepts_an_empty_list() {
+        assert!(validate_volumes(&[]).is_ok());
+    }
+
+    #[test]
+    fn validate_volumes_accepts_well_formed_distinct_volumes() {
+        let volumes = vec![volume("web-data", "/data", "1G"), volume("web-cache", "/cache", "512M")];
+        assert!(validate_volumes(&volumes).is_ok());
+    }
+
+    #[test]
+    fn validate_volumes_rejects_a_malformed_name() {
+        let volumes = vec![volume("Invalid_Name", "/data", "1G")];
+        assert!(matches!(validate_volumes(&volumes), Err(SpecError::InvalidName(_))));
+    }
+
+    #[test]
+    fn validate_volumes_rejects_a_duplicate_name() {
+        let volumes = vec![volume("web-data", "/data", "1G"), volume("web-data", "/other", "2G")];
+        assert_eq!(validate_volumes(&volumes), Err(SpecError::DuplicateVolumeName("web-data".to_string())));
+    }
+
+    #[test]
+    fn validate_volumes_rejects_a_malformed_size() {
+        let volumes = vec![volume("web-data", "/data", "not-a-size")];
+        assert!(matches!(validate_volumes(&volumes), Err(SpecError::InvalidMemory(_))));
+    }
+
     fn sample_spec() -> JailSpec {
         JailSpec {
             api_version: "keel/v1".to_string(),
@@ -92,6 +140,7 @@ mod tests {
                 },
                 resources: ResourcesSpec { cpu: "2".to_string(), memory: "512M".to_string() },
                 restart_policy: RestartPolicy::Always,
+                volumes: vec![],
             },
         }
     }
@@ -125,5 +174,21 @@ mod tests {
             validate_transition(&old, &new),
             Err(SpecError::ImmutableField("spec.network.address"))
         );
+    }
+
+    #[test]
+    fn rejects_changing_volumes() {
+        let old = sample_spec();
+        let mut new = sample_spec();
+        new.spec.volumes = vec![volume("web-data", "/data", "1G")];
+        assert_eq!(validate_transition(&old, &new), Err(SpecError::ImmutableField("spec.volumes")));
+    }
+
+    #[test]
+    fn allows_reapplying_with_the_same_volumes() {
+        let mut old = sample_spec();
+        old.spec.volumes = vec![volume("web-data", "/data", "1G")];
+        let new = old.clone();
+        assert!(validate_transition(&old, &new).is_ok());
     }
 }

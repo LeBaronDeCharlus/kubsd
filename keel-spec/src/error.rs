@@ -14,6 +14,8 @@ pub enum SpecError {
     InvalidMemory(String),
     #[error("invalid port {0}: must be non-zero")]
     InvalidPort(u16),
+    #[error("duplicate volume name '{0}' in spec.volumes")]
+    DuplicateVolumeName(String),
     #[error("field '{0}' cannot be changed after the jail is created; delete and re-apply instead")]
     ImmutableField(&'static str),
 }

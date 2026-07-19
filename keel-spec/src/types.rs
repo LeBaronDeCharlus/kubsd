@@ -22,6 +22,16 @@ pub struct Spec {
     pub resources: ResourcesSpec,
     #[serde(rename = "restartPolicy")]
     pub restart_policy: RestartPolicy,
+    #[serde(default)]
+    pub volumes: Vec<VolumeMount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VolumeMount {
+    pub name: String,
+    #[serde(rename = "mountPath")]
+    pub mount_path: String,
+    pub size: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -99,6 +109,7 @@ impl JailTemplate {
                 },
                 resources: self.resources.clone(),
                 restart_policy: self.restart_policy,
+                volumes: Vec::new(),
             },
         }
     }
@@ -125,6 +136,43 @@ spec:
     memory: "512M"
   restartPolicy: Always
 "#;
+
+    const EXAMPLE_YAML_WITH_VOLUME: &str = r#"
+apiVersion: keel/v1
+kind: Jail
+metadata:
+  name: web-1
+spec:
+  image: base/14.2-web
+  command: ["/usr/local/bin/myapp"]
+  network:
+    vnet: true
+    bridge: keel0
+    address: 10.0.0.5/24
+  resources:
+    cpu: "2"
+    memory: "512M"
+  restartPolicy: Always
+  volumes:
+    - name: web-data
+      mountPath: /data
+      size: 1G
+"#;
+
+    #[test]
+    fn parses_a_jail_with_one_volume() {
+        let spec: JailSpec = serde_yaml::from_str(EXAMPLE_YAML_WITH_VOLUME).unwrap();
+        assert_eq!(spec.spec.volumes.len(), 1);
+        assert_eq!(spec.spec.volumes[0].name, "web-data");
+        assert_eq!(spec.spec.volumes[0].mount_path, "/data");
+        assert_eq!(spec.spec.volumes[0].size, "1G");
+    }
+
+    #[test]
+    fn a_jail_with_no_volumes_key_parses_with_an_empty_list() {
+        let spec: JailSpec = serde_yaml::from_str(EXAMPLE_YAML).unwrap();
+        assert_eq!(spec.spec.volumes, vec![]);
+    }
 
     #[test]
     fn parses_the_design_spec_example_yaml() {
