@@ -19,6 +19,11 @@ pub struct ErrorBody {
     pub error: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VolumeStatus {
+    pub name: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +77,13 @@ mod tests {
         let yaml = serde_yaml::to_string(&body).unwrap();
         let parsed: ErrorBody = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed, body);
+    }
+
+    #[test]
+    fn volume_status_round_trips_through_yaml() {
+        let status = VolumeStatus { name: "web-data".to_string() };
+        let yaml = serde_yaml::to_string(&status).unwrap();
+        let parsed: VolumeStatus = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed, status);
     }
 }

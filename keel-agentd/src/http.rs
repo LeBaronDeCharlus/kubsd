@@ -220,6 +220,8 @@ fn route(request: &ParsedRequest, commands: &Sender<Command>, pod_cidr_slot: &Po
         ("GET", ["jails"]) => handle_get(None, commands),
         ("GET", ["jails", name]) => handle_get(Some(name.to_string()), commands),
         ("DELETE", ["jails", name]) => handle_delete(name, commands),
+        ("GET", ["volumes", name]) => handle_get_volume(name, commands),
+        ("DELETE", ["volumes", name]) => handle_delete_volume(name, commands),
         _ => error_response(404, format!("no route for {} {}", request.method, request.path)),
     }
 }
@@ -297,11 +299,37 @@ fn handle_delete(name: &str, commands: &Sender<Command>) -> (u16, Vec<u8>) {
     }
 }
 
+fn handle_get_volume(name: &str, commands: &Sender<Command>) -> (u16, Vec<u8>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::GetVolume(name.to_string(), reply_tx)).is_err() {
+        return error_response(500, "reconciler worker is not running".to_string());
+    }
+    match reply_rx.recv() {
+        Ok(Ok(())) => yaml_response(200, &crate::wire::VolumeStatus { name: name.to_string() }),
+        Ok(Err(e)) => error_response(status_for_error(&e), e.to_string()),
+        Err(_) => error_response(500, "reconciler worker did not respond".to_string()),
+    }
+}
+
+fn handle_delete_volume(name: &str, commands: &Sender<Command>) -> (u16, Vec<u8>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::DeleteVolume(name.to_string(), reply_tx)).is_err() {
+        return error_response(500, "reconciler worker is not running".to_string());
+    }
+    match reply_rx.recv() {
+        Ok(Ok(())) => (200, Vec::new()),
+        Ok(Err(e)) => error_response(status_for_error(&e), e.to_string()),
+        Err(_) => error_response(500, "reconciler worker did not respond".to_string()),
+    }
+}
+
 fn status_for_error(error: &ReconcileError) -> u16 {
     match error {
         ReconcileError::InvalidSpec(keel_spec::SpecError::ImmutableField(_)) => 409,
         ReconcileError::InvalidSpec(_) => 400,
         ReconcileError::NotFound(_) => 404,
+        ReconcileError::Zfs(keel_zfs::ZfsError::NotFound(_)) => 404,
+        ReconcileError::Zfs(keel_zfs::ZfsError::Busy(_)) => 409,
         _ => 500,
     }
 }
@@ -467,6 +495,52 @@ mod tests {
 
         let (status, _) = send_request(&socket_path, "GET", "/jails/web-1", "");
         assert_eq!(status, 404, "deleted jail should no longer be found");
+    }
+
+    fn sample_spec_yaml_with_volume(name: &str, volume_name: &str) -> String {
+        format!(
+            "apiVersion: keel/v1\nkind: Jail\nmetadata:\n  name: {name}\nspec:\n  image: base/14.2-web\n  command: [\"/usr/local/bin/myapp\"]\n  network:\n    vnet: true\n    bridge: keel0\n    address: 10.0.0.5/24\n  resources:\n    cpu: \"2\"\n    memory: 512M\n  restartPolicy: Always\n  volumes:\n    - name: {volume_name}\n      mountPath: /data\n      size: 1G\n"
+        )
+    }
+
+    #[test]
+    fn get_volume_on_a_provisioned_volume_returns_200() {
+        let socket_path = start_test_server("get_volume_on_a_provisioned_volume_returns_200");
+        send_request(&socket_path, "PUT", "/jails/web-1", &sample_spec_yaml_with_volume("web-1", "web-data"));
+
+        let (status, body) = send_request(&socket_path, "GET", "/volumes/web-data", "");
+        assert_eq!(status, 200);
+        assert!(body.contains("web-data"));
+    }
+
+    #[test]
+    fn get_volume_on_an_unknown_name_returns_404() {
+        let socket_path = start_test_server("get_volume_on_an_unknown_name_returns_404");
+        let (status, _) = send_request(&socket_path, "GET", "/volumes/missing", "");
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn delete_volume_on_an_unknown_name_returns_404() {
+        let socket_path = start_test_server("delete_volume_on_an_unknown_name_returns_404");
+        let (status, _) = send_request(&socket_path, "DELETE", "/volumes/missing", "");
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn delete_volume_survives_the_owning_jails_deletion_then_succeeds() {
+        let socket_path = start_test_server("delete_volume_survives_the_owning_jails_deletion_then_succeeds");
+        send_request(&socket_path, "PUT", "/jails/web-1", &sample_spec_yaml_with_volume("web-1", "web-data"));
+        send_request(&socket_path, "DELETE", "/jails/web-1", "");
+
+        let (status, _) = send_request(&socket_path, "GET", "/volumes/web-data", "");
+        assert_eq!(status, 200, "the volume dataset must survive the jail's deletion");
+
+        let (status, _) = send_request(&socket_path, "DELETE", "/volumes/web-data", "");
+        assert_eq!(status, 200);
+
+        let (status, _) = send_request(&socket_path, "GET", "/volumes/web-data", "");
+        assert_eq!(status, 404, "the volume should be gone for good now");
     }
 
     #[test]
