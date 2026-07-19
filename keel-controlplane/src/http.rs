@@ -154,6 +154,12 @@ fn route(
             }
             (status, body)
         }
+        ("GET", ["nodes", id, "volumes", name]) => {
+            handle_forward(id, "GET", &format!("/volumes/{name}"), &[], commands, client_config)
+        }
+        ("DELETE", ["nodes", id, "volumes", name]) => {
+            handle_forward(id, "DELETE", &format!("/volumes/{name}"), &[], commands, client_config)
+        }
         ("PUT", ["jails", name]) => {
             if let Some(response) = reject_if_service_owned(name, commands) {
                 return response;
@@ -985,6 +991,34 @@ mod tests {
         let (status, body) = send_request(&cp_addr, "GET", "/nodes/missing/jails", "");
         assert_eq!(status, 404);
         assert!(body.contains("unknown node"), "expected 'unknown node' in body: {body}");
+    }
+
+    #[test]
+    fn get_node_volume_forwards_to_the_right_node() {
+        let cp_addr = start_test_server();
+        let node_addr = start_fake_remote_tls_agentd(200, "name: web-data\n");
+        register_node(&cp_addr, "node-1", &node_addr);
+
+        let (status, body) = send_request(&cp_addr, "GET", "/nodes/node-1/volumes/web-data", "");
+        assert_eq!(status, 200);
+        assert!(body.contains("web-data"), "expected relayed body, got: {body}");
+    }
+
+    #[test]
+    fn delete_node_volume_forwards_to_the_right_node() {
+        let cp_addr = start_test_server();
+        let node_addr = start_fake_remote_tls_agentd(200, "");
+        register_node(&cp_addr, "node-1", &node_addr);
+
+        let (status, _) = send_request(&cp_addr, "DELETE", "/nodes/node-1/volumes/web-data", "");
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn delete_node_volume_on_an_unregistered_node_returns_404() {
+        let cp_addr = start_test_server();
+        let (status, _) = send_request(&cp_addr, "DELETE", "/nodes/missing/volumes/web-data", "");
+        assert_eq!(status, 404);
     }
 
     #[test]
