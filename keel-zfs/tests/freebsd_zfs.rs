@@ -72,3 +72,65 @@ fn clone_from_base_reuses_existing_snapshot_on_second_call() {
     zfs.destroy_dataset(target_a).expect("cleanup a should succeed");
     zfs.destroy_dataset(target_b).expect("cleanup b should succeed");
 }
+
+// Milestone 17: persistent volumes.
+//
+// Requires `zroot/keel/volumes` to already exist (the one-time, per-node
+// bootstrap `create_volume` deliberately never does itself, mirroring
+// `clone_from_base`'s own "does not create parent datasets" contract):
+//   zfs create zroot/keel/volumes
+
+#[test]
+fn create_volume_creates_a_quota_scoped_dataset_and_is_idempotent() {
+    let zfs = CliZfsManager::new();
+    let dataset = "zroot/keel/volumes/create-volume-test-scratch";
+    let _ = zfs.destroy_dataset(dataset);
+
+    zfs.create_volume(dataset, "64M").expect("create_volume should succeed");
+    assert_eq!(zfs.dataset_exists(dataset).unwrap(), true);
+
+    let output = std::process::Command::new("zfs")
+        .args(["get", "-H", "-o", "value", "quota", dataset])
+        .output()
+        .expect("zfs get should run");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "64M");
+
+    // Idempotent: a second call against an already-existing dataset must
+    // not fail (and must not need to touch the quota again).
+    zfs.create_volume(dataset, "64M").expect("create_volume should be idempotent");
+
+    zfs.destroy_dataset(dataset).expect("cleanup destroy should succeed");
+}
+
+#[test]
+fn destroy_dataset_on_a_still_mounted_volume_returns_busy_not_command_failed() {
+    // Reproduces, against the real kernel, the exact scenario
+    // `DELETE /volumes/<name>` must distinguish from "never existed":
+    // ZFS refuses to destroy a dataset that's still nullfs-mounted
+    // elsewhere, and that refusal must surface as `ZfsError::Busy`, not a
+    // generic `CommandFailed` (indistinguishable, at the type level, from
+    // any other failure — the exact gap this milestone's `Busy` variant
+    // closes).
+    let zfs = CliZfsManager::new();
+    let dataset = "zroot/keel/volumes/busy-test-scratch";
+    let mount_target = std::path::Path::new("/tmp/keel-busy-test-scratch-mount");
+    let _ = std::process::Command::new("umount").arg(mount_target).output();
+    let _ = zfs.destroy_dataset(dataset);
+    std::fs::create_dir_all(mount_target).unwrap();
+
+    zfs.create_volume(dataset, "64M").expect("create_volume should succeed");
+    let mountpoint = format!("/{dataset}");
+    let mount_status = std::process::Command::new("mount")
+        .args(["-t", "nullfs", &mountpoint, &mount_target.to_string_lossy()])
+        .status()
+        .expect("mount should run");
+    assert!(mount_status.success(), "expected the nullfs mount to succeed");
+
+    match zfs.destroy_dataset(dataset) {
+        Err(keel_zfs::ZfsError::Busy(d)) => assert_eq!(d, dataset),
+        other => panic!("expected Busy for a still-mounted dataset, got: {other:?}"),
+    }
+
+    std::process::Command::new("umount").arg(mount_target).status().expect("umount should run");
+    zfs.destroy_dataset(dataset).expect("destroy should succeed once unmounted");
+}
