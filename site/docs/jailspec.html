@@ -32,7 +32,7 @@
   <section class="page-header">
     <div class="container">
       <h1>JailSpec reference</h1>
-      <p class="lead">The YAML schema for a Keel jail, defined in <code>keel-spec</code>.</p>
+      <p class="lead">The YAML schemas for a single Keel jail (<code>kind: Jail</code>) and a self-healing, load-balanced replica set (<code>kind: Service</code>), both defined in <code>keel-spec</code>.</p>
     </div>
   </section>
 
@@ -77,6 +77,39 @@ spec:
         </tbody>
       </table>
       <p>Fields not listed as immutable above can change on a re-apply of the same <code>metadata.name</code>; the reconciler diffs the new spec against the running jail's state and reconciles the difference.</p>
+    </div>
+  </section>
+
+  <section id="service">
+    <div class="container">
+      <h2>kind: Service</h2>
+      <p>A <code>kind: Service</code> spec describes <code>N</code> interchangeable replicas of a jail template, spread across nodes, self-healed, and load-balanced behind one stable virtual IP. Applying one produces deterministically-named jails <code>&lt;name&gt;-0</code> through <code>&lt;name&gt;-{N-1}</code>; those replica names share the same flat namespace as plain <code>kind: Jail</code> jails, so a name already in use, by either kind, is rejected.</p>
+      <pre>apiVersion: keel/v1
+kind: Service
+metadata:
+  name: web
+spec:
+  replicas: 2
+  port: 8080
+  template:
+    image: base/14.2-web
+    command: ["/usr/local/bin/myapp"]
+    network:
+      vnet: true
+      bridge: keel0
+    resources:
+      cpu: "1"
+      memory: "256M"
+    restartPolicy: Always</pre>
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>spec.replicas</code></td><td>integer</td><td>Desired replica count. <code>0</code> is valid (scaled to zero), never an error. May change on any re-apply; this is the only field that may.</td></tr>
+          <tr><td><code>spec.port</code></td><td>integer</td><td>The port the service's virtual IP listens on, and the port it forwards to on every replica (same port both sides, no separate "target port"). Must be non-zero. Immutable after first apply, the same way <code>spec.template</code> is: a re-apply that changes it is rejected with a 409, requiring delete and re-apply instead.</td></tr>
+          <tr><td><code>spec.template</code></td><td>object</td><td>The same fields <code>kind: Jail</code>'s <code>spec</code> has, minus <code>network.address</code>: a replica's address is always auto-assigned from its node's <code>pod_cidr</code>, never given directly. Immutable after first apply.</td></tr>
+        </tbody>
+      </table>
+      <p>A service's virtual IP is allocated once, deterministically, from the cluster's <code>--service-cidr</code> pool on first creation, and never changes for the life of the service (a scale-only re-apply preserves it exactly). See the <a href="api.html#services">HTTP API reference</a> for how to read a service's VIP back, and <a href="architecture.html#services">Architecture</a> for how replica placement, self-healing, and the load-balancing proxy fit together.</p>
     </div>
   </section>
 </main>

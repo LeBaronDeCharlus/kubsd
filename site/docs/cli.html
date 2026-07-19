@@ -71,31 +71,35 @@
   <section id="apply">
     <div class="container">
       <h2>keelctl apply -f FILE</h2>
-      <p>Reads a <code>JailSpec</code> YAML file, validates it locally, and sends it as a <code>PUT /jails/&lt;name&gt;</code> request (the name comes from the spec's own <code>metadata.name</code>). Routed through a control plane with no <code>--node</code>, that same <code>PUT /jails/&lt;name&gt;</code> path is scheduled automatically onto the least-loaded alive node; with <code>--node</code>, it's <code>PUT /nodes/&lt;node&gt;/jails/&lt;name&gt;</code> instead, landing on exactly that node.</p>
+      <p>Reads a spec YAML file, validates it locally, and sniffs <code>kind</code> to decide where it goes: a <code>kind: Jail</code> sends <code>PUT /jails/&lt;name&gt;</code>; a <code>kind: Service</code> sends <code>PUT /services/&lt;name&gt;</code> instead (the name comes from the spec's own <code>metadata.name</code> either way). Routed through a control plane with no <code>--node</code>, a <code>kind: Jail</code>'s <code>PUT /jails/&lt;name&gt;</code> is scheduled automatically onto the least-loaded alive node; with <code>--node</code>, it's <code>PUT /nodes/&lt;node&gt;/jails/&lt;name&gt;</code> instead, landing on exactly that node. A <code>kind: Service</code> always goes through the control plane's own scheduler and same-service spreading; <code>--node</code> does not apply to it.</p>
       <pre>keelctl apply -f jail.yaml
 keelctl --control-plane-addr 10.0.0.2:7620 apply -f jail.yaml
-keelctl --control-plane-addr 10.0.0.2:7620 --node node-4 apply -f jail.yaml</pre>
+keelctl --control-plane-addr 10.0.0.2:7620 --node node-4 apply -f jail.yaml
+keelctl --control-plane-addr 10.0.0.2:7620 apply -f service.yaml</pre>
     </div>
   </section>
 
   <section id="get">
     <div class="container">
       <h2>keelctl get [name]</h2>
-      <p>With no argument, lists every jail keel-agentd (or the routed-to node) is tracking (<code>GET /jails</code>, or <code>GET /nodes/&lt;node&gt;/jails</code> when routed by name). With a name, fetches just that one: <code>GET /jails/&lt;name&gt;</code> directly, or through a control plane with no <code>--node</code>, the same path resolved against whichever node the jail was placed on; with <code>--node</code>, <code>GET /nodes/&lt;node&gt;/jails/&lt;name&gt;</code>.</p>
+      <p>With no argument, lists every jail keel-agentd (or the routed-to node) is tracking (<code>GET /jails</code>, or <code>GET /nodes/&lt;node&gt;/jails</code> when routed by name) &mdash; this never lists services, see the note below. With a name, fetches just that one: tries <code>GET /jails/&lt;name&gt;</code> first, and on a <code>404</code> falls back to <code>GET /services/&lt;name&gt;</code> (a service's currently-healthy replicas), since jail and service names share one flat namespace and a <code>404</code> on one path is a cheap, unambiguous signal to try the other. Through a control plane with no <code>--node</code>, the jail-path lookup resolves against whichever node the jail was placed on; with <code>--node</code>, <code>GET /nodes/&lt;node&gt;/jails/&lt;name&gt;</code>.</p>
       <pre>keelctl get
 keelctl get web-1
 keelctl --control-plane-addr 10.0.0.2:7620 get web-1
-keelctl --control-plane-addr 10.0.0.2:7620 --node node-4 get web-1</pre>
+keelctl --control-plane-addr 10.0.0.2:7620 --node node-4 get web-1
+keelctl --control-plane-addr 10.0.0.2:7620 get web       # falls back to the service, if web-1 above doesn't exist</pre>
+      <p><strong>No bare-collection verb for services.</strong> <code>keel-controlplane</code>'s <code>GET /services</code> (every known service, including each one's virtual IP and port, see the <a href="api.html#services">HTTP API reference</a>) has no corresponding <code>keelctl</code> command: <code>get</code> either lists jails (no argument) or resolves a single name (jail, falling back to service). Reaching a service's VIP today means a direct HTTP call against the control plane.</p>
     </div>
   </section>
 
   <section id="delete">
     <div class="container">
       <h2>keelctl delete NAME</h2>
-      <p>Tears down the named jail, its ZFS dataset, its network attachment, and its resource limits (<code>DELETE /jails/&lt;name&gt;</code>, or <code>DELETE /nodes/&lt;node&gt;/jails/&lt;name&gt;</code> when routed by name). Through a control plane with no <code>--node</code>, deleting also clears the jail's recorded placement.</p>
+      <p>Tears down the named jail, its ZFS dataset, its network attachment, and its resource limits (<code>DELETE /jails/&lt;name&gt;</code>, or <code>DELETE /nodes/&lt;node&gt;/jails/&lt;name&gt;</code> when routed by name), falling back to <code>DELETE /services/&lt;name&gt;</code> on a <code>404</code> the same way <code>get</code> does, tearing down every one of that service's replicas (and, once its next heartbeat lands on every node, its virtual IP alias). Through a control plane with no <code>--node</code>, deleting a jail also clears its recorded placement.</p>
       <pre>keelctl delete web-1
 keelctl --control-plane-addr 10.0.0.2:7620 delete web-1
-keelctl --control-plane-addr 10.0.0.2:7620 --node node-4 delete web-1</pre>
+keelctl --control-plane-addr 10.0.0.2:7620 --node node-4 delete web-1
+keelctl --control-plane-addr 10.0.0.2:7620 delete web    # falls back to the service, if web-1 above doesn't exist</pre>
     </div>
   </section>
 
