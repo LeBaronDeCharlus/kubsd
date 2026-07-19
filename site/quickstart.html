@@ -31,8 +31,8 @@
 <main>
   <section class="page-header">
     <div class="container">
-      <h1>Quickstart</h1>
-      <p class="lead">Build Keel from source and apply your first jail spec against a real FreeBSD host.</p>
+      <h1>Quickstart: deploy a small static website</h1>
+      <p class="lead">Build Keel from source, prepare a base image with a tiny web server and some HTML, and get a self-healing jail serving real traffic on a real FreeBSD host.</p>
     </div>
   </section>
 
@@ -43,7 +43,7 @@
         <li>A FreeBSD 15.1 host or VM with jails, ZFS, and VNET already usable (a ZFS pool such as <code>zroot</code>, and <code>vnet</code>/<code>if_bridge</code>/<code>if_epair</code> kernel support).</li>
         <li>Root access on that host (jail/ZFS/<code>rctl(8)</code> management requires it).</li>
         <li>The Rust toolchain (<a href="https://rustup.rs" target="_blank" rel="noopener">rustup</a>) installed on the host, or cross-compiled binaries copied over.</li>
-        <li>A populated base dataset for at least one jail image, e.g. <code>zroot/keel/base/14.2-web</code>, containing a FreeBSD userland and your application.</li>
+        <li>Outbound network access from the host, to fetch a FreeBSD base distribution and a package for the base image below.</li>
       </ul>
     </div>
   </section>
@@ -58,32 +58,52 @@ cargo build --release --workspace</pre>
     </div>
   </section>
 
+  <section id="base-image">
+    <div class="container">
+      <h2>2. Prepare a base image</h2>
+      <p>Keel clones every jail's root filesystem from a ZFS dataset you populate yourself; provisioning that dataset is out of scope for Keel itself (see <a href="docs/architecture.html">Architecture</a>). For a static site, that dataset just needs a FreeBSD userland plus a tiny web server and your HTML:</p>
+      <pre># as root
+fetch https://download.freebsd.org/ftp/releases/amd64/amd64/15.1-RELEASE/base.txz
+zfs create -p zroot/keel/base/14.2-web
+tar -xf base.txz -C /zroot/keel/base/14.2-web
+cp /etc/resolv.conf /zroot/keel/base/14.2-web/etc/resolv.conf
+pkg -c /zroot/keel/base/14.2-web install -y python3
+
+mkdir -p /zroot/keel/base/14.2-web/srv/www
+cat <<'HTML' > /zroot/keel/base/14.2-web/srv/www/index.html
+&lt;!doctype html&gt;
+&lt;html&gt;&lt;body&gt;&lt;h1&gt;Hello from Keel&lt;/h1&gt;&lt;/body&gt;&lt;/html&gt;
+HTML</pre>
+      <p>Python's standard library ships a static file server, which is all a small static site needs; swap in nginx or any other web server the same way if you'd rather. The <code>resolv.conf</code> copy is only there so <code>pkg</code> can resolve its repository inside the chroot.</p>
+    </div>
+  </section>
+
   <section id="spec">
     <div class="container">
-      <h2>2. Write a jail spec</h2>
-      <p>Save the following as <code>jail.yaml</code>. This is the same example used in <code>keel-spec</code>'s own tests:</p>
+      <h2>3. Write a jail spec</h2>
+      <p>Save the following as <code>jail.yaml</code>:</p>
       <pre>apiVersion: keel/v1
 kind: Jail
 metadata:
   name: web-1
 spec:
   image: base/14.2-web
-  command: ["/usr/local/bin/myapp"]
+  command: ["/usr/local/bin/python3", "-m", "http.server", "8080", "--directory", "/srv/www", "--bind", "10.0.0.5"]
   network:
     vnet: true
     bridge: keel0
     address: 10.0.0.5/24
   resources:
-    cpu: "2"
-    memory: "512M"
+    cpu: "1"
+    memory: "256M"
   restartPolicy: Always</pre>
-      <p><code>image</code> must match an existing base dataset: with the default <code>--pool zroot</code>, <code>image: base/14.2-web</code> resolves to <code>zroot/keel/base/14.2-web</code>.</p>
+      <p><code>image</code> must match an existing base dataset: with the default <code>--pool zroot</code>, <code>image: base/14.2-web</code> resolves to <code>zroot/keel/base/14.2-web</code>, the dataset prepared in step 2. The server binds to the jail's own VNET address, not <code>0.0.0.0</code>, since that's the address anything else on the network will actually reach it on.</p>
     </div>
   </section>
 
   <section id="run">
     <div class="container">
-      <h2>3. Run keel-agentd</h2>
+      <h2>4. Run keel-agentd</h2>
       <pre># as root
 ./target/release/keel-agentd</pre>
       <p>By default this reconciles against pool <code>zroot</code>, keeps its state under <code>/var/db/keel</code>, and serves its API on the Unix socket <code>/var/run/keel-agentd.sock</code>. Override any of these with <code>--pool</code>, <code>--state-dir</code>, or <code>--socket</code>.</p>
@@ -92,28 +112,29 @@ spec:
 
   <section id="apply">
     <div class="container">
-      <h2>4. Apply and inspect the jail</h2>
+      <h2>5. Apply and visit the site</h2>
       <pre># from another shell, as root
 ./target/release/keelctl apply -f jail.yaml
-./target/release/keelctl get
 ./target/release/keelctl get web-1</pre>
-      <p>Confirm it's really running:</p>
-      <pre>jls -j keel-web-1</pre>
-      <p>Keel prefixes every jail it manages with <code>keel-</code>, so the spec named <code>web-1</code> becomes the jail <code>keel-web-1</code>.</p>
+      <p>Confirm it's really running, then fetch the page:</p>
+      <pre>jls -j keel-web-1
+curl http://10.0.0.5:8080/</pre>
+      <p>The <code>curl</code> should print back the <code>index.html</code> from step 2. Keel prefixes every jail it manages with <code>keel-</code>, so the spec named <code>web-1</code> becomes the jail <code>keel-web-1</code>.</p>
     </div>
   </section>
 
   <section id="cleanup">
     <div class="container">
-      <h2>5. Clean up</h2>
+      <h2>6. Clean up</h2>
       <pre>./target/release/keelctl delete web-1</pre>
     </div>
   </section>
 
-  <section id="automated">
+  <section id="next-steps">
     <div class="container">
-      <h2>The automated version</h2>
-      <p><code>scripts/smoke-test.sh</code> in the repository runs this entire lifecycle end-to-end against a real <code>rc.d</code>-managed <code>keel-agentd</code> service, including killing the daemon mid-flight to prove the automatic restart and state recovery both work, then a clean teardown. See that script and <a href="docs/architecture.html">Architecture</a> for how the pieces fit together.</p>
+      <h2>Next steps</h2>
+      <p>This walkthrough deploys one jail on one node. A static site is also a natural fit for <code>kind: Service</code>: N replicas of the same base image, spread across a cluster, reachable through one load-balanced virtual IP, self-healing if a node goes down. See the <a href="docs/jailspec.html">JailSpec reference</a> and <a href="docs/api.html#services">HTTP API reference</a> for how to describe and reach one.</p>
+      <p><code>scripts/smoke-test.sh</code> in the repository runs a jail's full lifecycle end-to-end against a real <code>rc.d</code>-managed <code>keel-agentd</code> service, including killing the daemon mid-flight to prove the automatic restart and state recovery both work, then a clean teardown. See that script and <a href="docs/architecture.html">Architecture</a> for how the pieces fit together.</p>
     </div>
   </section>
 </main>
