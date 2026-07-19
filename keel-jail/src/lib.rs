@@ -1,12 +1,24 @@
 pub mod error;
 pub mod fake;
+pub mod mount_cli;
+pub mod mount_error;
+pub mod mount_fake;
 pub mod process;
 
 pub use error::JailError;
 pub use fake::FakeJailRuntime;
+pub use mount_cli::CliMountManager;
+pub use mount_error::MountError;
+pub use mount_fake::FakeMountManager;
 pub use process::ProcessJailRuntime;
 
 use std::path::Path;
+
+pub trait MountManager {
+    fn mount_nullfs(&self, source: &Path, target: &Path) -> Result<(), MountError>;
+    fn unmount(&self, target: &Path) -> Result<(), MountError>;
+    fn is_mounted(&self, target: &Path) -> Result<bool, MountError>;
+}
 
 pub trait JailRuntime {
     /// Creates a persistent, empty jail with no command running yet
