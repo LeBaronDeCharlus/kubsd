@@ -322,7 +322,7 @@ mod tests {
     use super::*;
     use crate::reconciler::Reconciler;
     use crate::worker;
-    use keel_jail::FakeJailRuntime;
+    use keel_jail::{FakeJailRuntime, FakeMountManager};
     use keel_net::FakeNetManager;
     use keel_zfs::FakeZfsManager;
     use std::path::PathBuf;
@@ -350,6 +350,7 @@ mod tests {
             FakeJailRuntime::new(),
             zfs,
             FakeNetManager::new(),
+            FakeMountManager::new(),
             "zroot".to_string(),
             state_dir,
         )
@@ -368,7 +369,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state_dir);
         let zfs = FakeZfsManager::new();
         zfs.seed_dataset("zroot/keel/base/14.2-web");
-        let reconciler = Reconciler::new(FakeJailRuntime::new(), zfs, FakeNetManager::new(), "zroot".to_string(), state_dir).unwrap();
+        let reconciler = Reconciler::new(FakeJailRuntime::new(), zfs, FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), state_dir).unwrap();
         let (_worker_handle, commands) = worker::spawn(reconciler);
 
         let pod_cidr_slot = PodCidrSlot::new();
@@ -542,6 +543,7 @@ mod tests {
             FakeJailRuntime::new(),
             zfs,
             FakeNetManager::new(),
+            FakeMountManager::new(),
             "zroot".to_string(),
             state_dir,
         )
@@ -735,7 +737,7 @@ mod tests {
         let zfs = FakeZfsManager::new();
         zfs.seed_dataset("zroot/keel/base/14.2-web");
         let reconciler =
-            Reconciler::new(FakeJailRuntime::new(), zfs, FakeNetManager::new(), "zroot".to_string(), state_dir).unwrap();
+            Reconciler::new(FakeJailRuntime::new(), zfs, FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), state_dir).unwrap();
         let (_worker_handle, commands) = worker::spawn(reconciler);
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -780,7 +782,7 @@ mod tests {
         let zfs = FakeZfsManager::new();
         zfs.seed_dataset("zroot/keel/base/14.2-web");
         let reconciler =
-            Reconciler::new(FakeJailRuntime::new(), zfs, FakeNetManager::new(), "zroot".to_string(), state_dir).unwrap();
+            Reconciler::new(FakeJailRuntime::new(), zfs, FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), state_dir).unwrap();
         let (_worker_handle, commands) = worker::spawn(reconciler);
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

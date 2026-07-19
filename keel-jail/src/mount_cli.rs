@@ -38,6 +38,11 @@ impl Default for CliMountManager {
 }
 
 impl MountManager for CliMountManager {
+    fn ensure_mount_point(&self, target: &Path) -> Result<(), MountError> {
+        std::fs::create_dir_all(target)?;
+        Ok(())
+    }
+
     fn mount_nullfs(&self, source: &Path, target: &Path) -> Result<(), MountError> {
         Self::run_checked("mount", &["-t", "nullfs", &source.to_string_lossy(), &target.to_string_lossy()])
     }

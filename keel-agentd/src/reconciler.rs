@@ -2,7 +2,7 @@ use crate::backoff::BackoffState;
 use crate::record::{self, JailRecord};
 use crate::store::{self, StoreError};
 use crate::wire::JailStatus;
-use keel_jail::JailRuntime;
+use keel_jail::{JailRuntime, MountManager};
 use keel_net::NetManager;
 use keel_spec::JailSpec;
 use keel_zfs::ZfsManager;
@@ -23,16 +23,19 @@ pub enum ReconcileError {
     Zfs(#[from] keel_zfs::ZfsError),
     #[error("network error: {0}")]
     Net(#[from] keel_net::NetError),
+    #[error("mount error: {0}")]
+    Mount(#[from] keel_jail::MountError),
     #[error("jail '{0}' not found in desired state")]
     NotFound(String),
     #[error("base image dataset '{0}' does not exist")]
     BaseImageNotFound(String),
 }
 
-pub struct Reconciler<J: JailRuntime, Z: ZfsManager, N: NetManager> {
+pub struct Reconciler<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> {
     jails: J,
     zfs: Z,
     net: N,
+    mounts: M,
     pool: String,
     state_dir: PathBuf,
     records: HashMap<String, JailRecord>,
@@ -40,8 +43,8 @@ pub struct Reconciler<J: JailRuntime, Z: ZfsManager, N: NetManager> {
     next_epair_ordinal: u32,
 }
 
-impl<J: JailRuntime, Z: ZfsManager, N: NetManager> Reconciler<J, Z, N> {
-    pub fn new(jails: J, zfs: Z, net: N, pool: String, state_dir: PathBuf) -> Result<Self, ReconcileError> {
+impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J, Z, N, M> {
+    pub fn new(jails: J, zfs: Z, net: N, mounts: M, pool: String, state_dir: PathBuf) -> Result<Self, ReconcileError> {
         let loaded = store::load_all(&state_dir)?;
         let next_epair_ordinal = loaded.iter().map(|r| r.epair_ordinal).max().map(|m| m + 1).unwrap_or(1);
         let records = loaded.into_iter().map(|r| (r.spec.metadata.name.clone(), r)).collect();
@@ -49,6 +52,7 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager> Reconciler<J, Z, N> {
             jails,
             zfs,
             net,
+            mounts,
             pool,
             state_dir,
             records,
@@ -83,6 +87,7 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager> Reconciler<J, Z, N> {
         let jail_name = record::jail_name(name);
         let epair_base = record::epair_base_name(record.epair_ordinal);
         let jail_dataset = record::jail_dataset_path(&self.pool, name);
+        let rootfs = record::jail_rootfs_path(&self.pool, name);
 
         self.net.detach_jail(&epair_base)?;
         // A record can reach `delete` having only gone through `apply`
@@ -93,6 +98,19 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager> Reconciler<J, Z, N> {
         match self.jails.destroy(&jail_name) {
             Ok(()) | Err(keel_jail::JailError::NotFound(_)) => {}
             Err(e) => return Err(e.into()),
+        }
+        // Unmount every declared volume before destroying the rootfs
+        // dataset (avoids the exact "device busy" class of failure this
+        // crate's own `destroy_dataset` retry loop was written against for
+        // the rootfs mount itself) — but never destroy a volume's own
+        // dataset here; that is this milestone's entire "decoupled
+        // lifecycle" guarantee.
+        for volume in &record.spec.spec.volumes {
+            let target = rootfs.join(volume.mount_path.trim_start_matches('/'));
+            match self.mounts.unmount(&target) {
+                Ok(()) | Err(keel_jail::MountError::NotMounted(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         match self.zfs.destroy_dataset(&jail_dataset) {
             Ok(()) | Err(keel_zfs::ZfsError::NotFound(_)) => {}
@@ -125,6 +143,25 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager> Reconciler<J, Z, N> {
         self.net.remove_alias(bridge, address)
     }
 
+    /// Never consults `self.records` — a volume can outlive every jail
+    /// record that ever referenced it, which is this milestone's whole
+    /// point. `Ok(())` means the dataset exists; the caller (HTTP layer)
+    /// maps that to a 200 with a minimal body.
+    pub fn get_volume(&self, name: &str) -> Result<(), ReconcileError> {
+        let dataset = record::volume_dataset_path(&self.pool, name);
+        if self.zfs.dataset_exists(&dataset)? {
+            Ok(())
+        } else {
+            Err(ReconcileError::Zfs(keel_zfs::ZfsError::NotFound(dataset)))
+        }
+    }
+
+    pub fn delete_volume(&mut self, name: &str) -> Result<(), ReconcileError> {
+        let dataset = record::volume_dataset_path(&self.pool, name);
+        self.zfs.destroy_dataset(&dataset)?;
+        Ok(())
+    }
+
     fn configure_networking_and_limits(&mut self, name: &str, record: &JailRecord) -> Result<(), ReconcileError> {
         let jail_name = record::jail_name(name);
         let epair_base = record::epair_base_name(record.epair_ordinal);
@@ -152,6 +189,17 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager> Reconciler<J, Z, N> {
         }
         self.zfs.clone_from_base(&base_dataset, &jail_dataset)?;
         self.jails.create(&jail_name, &rootfs, record.spec.spec.network.vnet)?;
+        for volume in &record.spec.spec.volumes {
+            let dataset = record::volume_dataset_path(&self.pool, &volume.name);
+            let target = rootfs.join(volume.mount_path.trim_start_matches('/'));
+            self.mounts.ensure_mount_point(&target)?;
+            if !self.zfs.dataset_exists(&dataset)? {
+                self.zfs.create_volume(&dataset, &volume.size)?;
+            }
+            if !self.mounts.is_mounted(&target)? {
+                self.mounts.mount_nullfs(&record::volume_mountpoint(&self.pool, &volume.name), &target)?;
+            }
+        }
         self.configure_networking_and_limits(name, record)?;
         self.jails.start_command(&jail_name, &record.spec.spec.command)?;
         Ok(())
@@ -261,7 +309,7 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager> Reconciler<J, Z, N> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use keel_jail::FakeJailRuntime;
+    use keel_jail::{FakeJailRuntime, FakeMountManager};
     use keel_net::FakeNetManager;
     use keel_spec::{Metadata, NetworkSpec, RestartPolicy, ResourcesSpec, Spec};
     use keel_zfs::FakeZfsManager;
@@ -294,15 +342,26 @@ mod tests {
         dir
     }
 
-    fn new_reconciler(state_dir: PathBuf) -> Reconciler<FakeJailRuntime, FakeZfsManager, FakeNetManager> {
+    fn new_reconciler(state_dir: PathBuf) -> Reconciler<FakeJailRuntime, FakeZfsManager, FakeNetManager, FakeMountManager> {
         Reconciler::new(
             FakeJailRuntime::new(),
             FakeZfsManager::new(),
             FakeNetManager::new(),
+            FakeMountManager::new(),
             "zroot".to_string(),
             state_dir,
         )
         .unwrap()
+    }
+
+    fn sample_spec_with_volume(name: &str, volume_name: &str, mount_path: &str, size: &str) -> JailSpec {
+        let mut spec = sample_spec(name);
+        spec.spec.volumes = vec![keel_spec::VolumeMount {
+            name: volume_name.to_string(),
+            mount_path: mount_path.to_string(),
+            size: size.to_string(),
+        }];
+        spec
     }
 
     #[test]
@@ -480,6 +539,111 @@ mod tests {
 
         let result = reconciler.provision("web-1", &record);
         assert!(matches!(result, Err(ReconcileError::BaseImageNotFound(_))));
+    }
+
+    #[test]
+    fn provision_creates_and_mounts_a_declared_volume() {
+        let dir = test_state_dir("provision_creates_and_mounts_a_declared_volume");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/keel/base/14.2-web");
+        reconciler.apply(sample_spec_with_volume("web-1", "web-data", "/data", "1G")).unwrap();
+        let record = reconciler.records["web-1"].clone();
+
+        reconciler.provision("web-1", &record).unwrap();
+
+        assert!(reconciler.zfs.dataset_exists("zroot/keel/volumes/web-data").unwrap());
+        let target = record::jail_rootfs_path("zroot", "web-1").join("data");
+        assert!(reconciler.mounts.is_mounted(&target).unwrap());
+    }
+
+    #[test]
+    fn reprovisioning_after_a_restart_does_not_recreate_or_remount_the_volume() {
+        let dir = test_state_dir("reprovisioning_after_a_restart_does_not_recreate_or_remount_the_volume");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/keel/base/14.2-web");
+        reconciler.apply(sample_spec_with_volume("web-1", "web-data", "/data", "1G")).unwrap();
+        let record = reconciler.records["web-1"].clone();
+        reconciler.provision("web-1", &record).unwrap();
+
+        // Simulate an agentd restart with the jail already provisioned:
+        // re-running provision must be a no-op for the volume (still
+        // exactly one dataset, still mounted, no error).
+        reconciler.jails.destroy(&record::jail_name("web-1")).unwrap();
+        reconciler.provision("web-1", &record).unwrap();
+
+        assert!(reconciler.zfs.dataset_exists("zroot/keel/volumes/web-data").unwrap());
+        let target = record::jail_rootfs_path("zroot", "web-1").join("data");
+        assert!(reconciler.mounts.is_mounted(&target).unwrap());
+    }
+
+    #[test]
+    fn delete_unmounts_the_volume_but_leaves_its_dataset_present() {
+        let dir = test_state_dir("delete_unmounts_the_volume_but_leaves_its_dataset_present");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/keel/base/14.2-web");
+        reconciler.apply(sample_spec_with_volume("web-1", "web-data", "/data", "1G")).unwrap();
+        let record = reconciler.records["web-1"].clone();
+        reconciler.provision("web-1", &record).unwrap();
+
+        reconciler.delete("web-1").unwrap();
+
+        assert!(reconciler.zfs.dataset_exists("zroot/keel/volumes/web-data").unwrap(), "volume dataset must survive jail deletion");
+        let target = record::jail_rootfs_path("zroot", "web-1").join("data");
+        assert!(!reconciler.mounts.is_mounted(&target).unwrap());
+    }
+
+    #[test]
+    fn reapplying_and_reprovisioning_the_same_name_finds_the_dataset_and_remounts_it() {
+        let dir = test_state_dir("reapplying_and_reprovisioning_the_same_name_finds_the_dataset_and_remounts_it");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/keel/base/14.2-web");
+        reconciler.apply(sample_spec_with_volume("web-1", "web-data", "/data", "1G")).unwrap();
+        let record = reconciler.records["web-1"].clone();
+        reconciler.provision("web-1", &record).unwrap();
+        reconciler.delete("web-1").unwrap();
+
+        reconciler.apply(sample_spec_with_volume("web-1", "web-data", "/data", "1G")).unwrap();
+        let record = reconciler.records["web-1"].clone();
+        reconciler.provision("web-1", &record).unwrap();
+
+        assert!(reconciler.zfs.dataset_exists("zroot/keel/volumes/web-data").unwrap());
+        let target = record::jail_rootfs_path("zroot", "web-1").join("data");
+        assert!(reconciler.mounts.is_mounted(&target).unwrap());
+    }
+
+    #[test]
+    fn get_volume_reports_existence() {
+        let dir = test_state_dir("get_volume_reports_existence");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/keel/base/14.2-web");
+        reconciler.apply(sample_spec_with_volume("web-1", "web-data", "/data", "1G")).unwrap();
+        let record = reconciler.records["web-1"].clone();
+        reconciler.provision("web-1", &record).unwrap();
+
+        assert!(reconciler.get_volume("web-data").is_ok());
+        assert!(matches!(reconciler.get_volume("missing"), Err(ReconcileError::Zfs(keel_zfs::ZfsError::NotFound(_)))));
+    }
+
+    #[test]
+    fn delete_volume_destroys_the_dataset_once_the_jail_is_gone() {
+        let dir = test_state_dir("delete_volume_destroys_the_dataset_once_the_jail_is_gone");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/keel/base/14.2-web");
+        reconciler.apply(sample_spec_with_volume("web-1", "web-data", "/data", "1G")).unwrap();
+        let record = reconciler.records["web-1"].clone();
+        reconciler.provision("web-1", &record).unwrap();
+        reconciler.delete("web-1").unwrap();
+
+        reconciler.delete_volume("web-data").unwrap();
+
+        assert!(matches!(reconciler.get_volume("web-data"), Err(ReconcileError::Zfs(keel_zfs::ZfsError::NotFound(_)))));
+    }
+
+    #[test]
+    fn delete_volume_on_a_never_created_name_is_not_found() {
+        let dir = test_state_dir("delete_volume_on_a_never_created_name_is_not_found");
+        let mut reconciler = new_reconciler(dir);
+        assert!(matches!(reconciler.delete_volume("missing"), Err(ReconcileError::Zfs(keel_zfs::ZfsError::NotFound(_)))));
     }
 
     #[test]

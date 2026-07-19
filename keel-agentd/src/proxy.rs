@@ -153,7 +153,7 @@ mod tests {
     use super::*;
     use crate::worker;
     use keel_controlplane::wire::{ServiceProxyEntry, ServiceReplica};
-    use keel_jail::FakeJailRuntime;
+    use keel_jail::{FakeJailRuntime, FakeMountManager};
     use keel_net::FakeNetManager;
     use keel_zfs::FakeZfsManager;
     use std::io::{Read, Write};
@@ -161,11 +161,12 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    fn test_reconciler(name: &str) -> crate::Reconciler<FakeJailRuntime, FakeZfsManager, FakeNetManager> {
+    fn test_reconciler(name: &str) -> crate::Reconciler<FakeJailRuntime, FakeZfsManager, FakeNetManager, FakeMountManager> {
         crate::Reconciler::new(
             FakeJailRuntime::new(),
             FakeZfsManager::new(),
             FakeNetManager::new(),
+            FakeMountManager::new(),
             "zroot".to_string(),
             std::env::temp_dir().join(format!("keel-agentd-proxy-test-{name}")),
         )

@@ -85,6 +85,7 @@ fn main() {
         ProcessJailRuntime::new(),
         CliZfsManager::new(),
         ProcessNetManager::new(),
+        keel_jail::CliMountManager::new(),
         config.pool.clone(),
         config.state_dir.clone(),
     )

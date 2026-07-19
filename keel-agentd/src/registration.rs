@@ -443,6 +443,7 @@ mod tests {
                 keel_jail::FakeJailRuntime::new(),
                 keel_zfs::FakeZfsManager::new(),
                 keel_net::FakeNetManager::new(),
+                keel_jail::FakeMountManager::new(),
                 "zroot".to_string(),
                 std::env::temp_dir().join("keel-agentd-registration-test-registers_and_then_keeps_heartbeating"),
             )
@@ -476,6 +477,7 @@ mod tests {
             keel_jail::FakeJailRuntime::new(),
             zfs,
             keel_net::FakeNetManager::new(),
+            keel_jail::FakeMountManager::new(),
             "zroot".to_string(),
             std::env::temp_dir().join("keel-agentd-registration-test-heartbeats_report_the_reconcilers_committed_resources"),
         )
@@ -541,6 +543,7 @@ mod tests {
                 keel_jail::FakeJailRuntime::new(),
                 keel_zfs::FakeZfsManager::new(),
                 net.clone(),
+                keel_jail::FakeMountManager::new(),
                 "zroot".to_string(),
                 std::env::temp_dir().join("keel-agentd-registration-test-a_heartbeat_aliases_and_proxies_an_applied_service"),
             )
@@ -612,6 +615,7 @@ mod tests {
                 keel_jail::FakeJailRuntime::new(),
                 keel_zfs::FakeZfsManager::new(),
                 keel_net::FakeNetManager::new(),
+                keel_jail::FakeMountManager::new(),
                 "zroot".to_string(),
                 std::env::temp_dir().join("keel-agentd-registration-test-registration_with_a_wrong_ca_certificate_never_registers"),
             )
@@ -642,6 +646,7 @@ mod tests {
                 keel_jail::FakeJailRuntime::new(),
                 keel_zfs::FakeZfsManager::new(),
                 keel_net::FakeNetManager::new(),
+                keel_jail::FakeMountManager::new(),
                 "zroot".to_string(),
                 std::env::temp_dir().join("keel-agentd-registration-test-a_successful_registration_stores_the_returned_pod_cidr_in_the_slot"),
             )
@@ -719,6 +724,7 @@ mod tests {
                 keel_jail::FakeJailRuntime::new(),
                 keel_zfs::FakeZfsManager::new(),
                 net.clone(),
+                keel_jail::FakeMountManager::new(),
                 "zroot".to_string(),
                 std::env::temp_dir().join("keel-agentd-registration-test-route_reconciliation_adds_a_route_for_a_peer"),
             )
@@ -779,6 +785,7 @@ mod tests {
                 keel_jail::FakeJailRuntime::new(),
                 keel_zfs::FakeZfsManager::new(),
                 net.clone(),
+                keel_jail::FakeMountManager::new(),
                 "zroot".to_string(),
                 std::env::temp_dir().join("keel-agentd-registration-test-route_reconciliation_withdraws_a_route_once_the_peer_is_reported_dead"),
             )

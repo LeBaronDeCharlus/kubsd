@@ -16,6 +16,10 @@ impl FakeMountManager {
 }
 
 impl MountManager for FakeMountManager {
+    fn ensure_mount_point(&self, _target: &Path) -> Result<(), MountError> {
+        Ok(())
+    }
+
     fn mount_nullfs(&self, _source: &Path, target: &Path) -> Result<(), MountError> {
         self.mounted.lock().unwrap().insert(target.to_path_buf());
         Ok(())

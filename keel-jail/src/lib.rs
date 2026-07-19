@@ -15,6 +15,12 @@ pub use process::ProcessJailRuntime;
 use std::path::Path;
 
 pub trait MountManager {
+    /// Creates `target` (and any missing parent directories) if it doesn't
+    /// already exist. Routed through this trait rather than a raw
+    /// `std::fs::create_dir_all` call so a `FakeMountManager`-backed test
+    /// never touches the real filesystem at an absolute rootfs path that
+    /// doesn't exist outside a real ZFS-backed node.
+    fn ensure_mount_point(&self, target: &Path) -> Result<(), MountError>;
     fn mount_nullfs(&self, source: &Path, target: &Path) -> Result<(), MountError>;
     fn unmount(&self, target: &Path) -> Result<(), MountError>;
     fn is_mounted(&self, target: &Path) -> Result<bool, MountError>;

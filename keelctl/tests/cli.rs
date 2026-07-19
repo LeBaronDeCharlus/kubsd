@@ -1,5 +1,5 @@
 use keel_agentd::{worker, Reconciler};
-use keel_jail::FakeJailRuntime;
+use keel_jail::{FakeJailRuntime, FakeMountManager};
 use keel_net::FakeNetManager;
 use keel_zfs::FakeZfsManager;
 use std::io::{Read, Write};
@@ -17,9 +17,15 @@ fn start_test_server(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&state_dir);
     let zfs = FakeZfsManager::new();
     zfs.seed_dataset("zroot/keel/base/14.2-web");
-    let reconciler =
-        Reconciler::new(FakeJailRuntime::new(), zfs, FakeNetManager::new(), "zroot".to_string(), state_dir)
-            .unwrap();
+    let reconciler = Reconciler::new(
+        FakeJailRuntime::new(),
+        zfs,
+        FakeNetManager::new(),
+        FakeMountManager::new(),
+        "zroot".to_string(),
+        state_dir,
+    )
+    .unwrap();
     let (_worker_handle, commands) = worker::spawn(reconciler);
 
     // A short, non-descriptive filename (not the full test name) — macOS/BSD
@@ -67,9 +73,15 @@ fn start_test_agentd_tcp(name: &str) -> String {
     let _ = std::fs::remove_dir_all(&state_dir);
     let zfs = FakeZfsManager::new();
     zfs.seed_dataset("zroot/keel/base/14.2-web");
-    let reconciler =
-        Reconciler::new(FakeJailRuntime::new(), zfs, FakeNetManager::new(), "zroot".to_string(), state_dir)
-            .unwrap();
+    let reconciler = Reconciler::new(
+        FakeJailRuntime::new(),
+        zfs,
+        FakeNetManager::new(),
+        FakeMountManager::new(),
+        "zroot".to_string(),
+        state_dir,
+    )
+    .unwrap();
     let (_worker_handle, commands) = worker::spawn(reconciler);
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

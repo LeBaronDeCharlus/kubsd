@@ -9,4 +9,6 @@ pub enum MountError {
     CommandFailed(String, std::process::ExitStatus, String),
     #[error("'{0}' is not currently mounted")]
     NotMounted(PathBuf),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }

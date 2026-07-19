@@ -1,6 +1,6 @@
 use crate::reconciler::{ReconcileError, Reconciler};
 use crate::wire::JailStatus;
-use keel_jail::JailRuntime;
+use keel_jail::{JailRuntime, MountManager};
 use keel_net::NetManager;
 use keel_spec::JailSpec;
 use keel_zfs::ZfsManager;
@@ -18,13 +18,16 @@ pub enum Command {
     RemoveRoute(String, Sender<Result<(), keel_net::NetError>>),
     AddServiceAlias(String, String, Sender<Result<(), keel_net::NetError>>),
     RemoveServiceAlias(String, String, Sender<Result<(), keel_net::NetError>>),
+    GetVolume(String, Sender<Result<(), ReconcileError>>),
+    DeleteVolume(String, Sender<Result<(), ReconcileError>>),
 }
 
-pub fn spawn<J, Z, N>(mut reconciler: Reconciler<J, Z, N>) -> (JoinHandle<()>, Sender<Command>)
+pub fn spawn<J, Z, N, M>(mut reconciler: Reconciler<J, Z, N, M>) -> (JoinHandle<()>, Sender<Command>)
 where
     J: JailRuntime + Send + 'static,
     Z: ZfsManager + Send + 'static,
     N: NetManager + Send + 'static,
+    M: MountManager + Send + 'static,
 {
     let (tx, rx) = mpsc::channel::<Command>();
     let handle = thread::spawn(move || {
@@ -35,8 +38,8 @@ where
     (handle, tx)
 }
 
-fn handle_command<J: JailRuntime, Z: ZfsManager, N: NetManager>(
-    reconciler: &mut Reconciler<J, Z, N>,
+fn handle_command<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager>(
+    reconciler: &mut Reconciler<J, Z, N, M>,
     command: Command,
 ) {
     match command {
@@ -84,13 +87,19 @@ fn handle_command<J: JailRuntime, Z: ZfsManager, N: NetManager>(
         Command::RemoveServiceAlias(bridge, address, reply) => {
             let _ = reply.send(reconciler.remove_alias(&bridge, &address));
         }
+        Command::GetVolume(name, reply) => {
+            let _ = reply.send(reconciler.get_volume(&name));
+        }
+        Command::DeleteVolume(name, reply) => {
+            let _ = reply.send(reconciler.delete_volume(&name));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use keel_jail::FakeJailRuntime;
+    use keel_jail::{FakeJailRuntime, FakeMountManager};
     use keel_net::FakeNetManager;
     use keel_spec::{Metadata, NetworkSpec, RestartPolicy, ResourcesSpec, Spec};
     use keel_zfs::FakeZfsManager;
@@ -129,6 +138,7 @@ mod tests {
             FakeJailRuntime::new(),
             zfs,
             FakeNetManager::new(),
+            FakeMountManager::new(),
             "zroot".to_string(),
             test_state_dir(name),
         )
@@ -246,6 +256,7 @@ mod tests {
             FakeJailRuntime::new(),
             FakeZfsManager::new(),
             FakeNetManager::new(),
+            FakeMountManager::new(),
             "zroot".to_string(),
             std::env::temp_dir().join("keel-agentd-worker-test-add_service_alias_command_round_trips"),
         )
@@ -263,5 +274,18 @@ mod tests {
         let (tx2, rx2) = mpsc::channel();
         commands.send(Command::RemoveServiceAlias("keel0".to_string(), "10.0.250.7".to_string(), tx2)).unwrap();
         assert!(rx2.recv().unwrap().is_ok());
+    }
+
+    #[test]
+    fn get_volume_and_delete_volume_commands_round_trip() {
+        let commands = spawn_test_worker("get_volume_and_delete_volume_commands_round_trip");
+
+        let (get_tx, get_rx) = mpsc::channel();
+        commands.send(Command::GetVolume("web-data".to_string(), get_tx)).unwrap();
+        assert!(matches!(get_rx.recv().unwrap(), Err(ReconcileError::Zfs(keel_zfs::ZfsError::NotFound(_)))));
+
+        let (del_tx, del_rx) = mpsc::channel();
+        commands.send(Command::DeleteVolume("web-data".to_string(), del_tx)).unwrap();
+        assert!(matches!(del_rx.recv().unwrap(), Err(ReconcileError::Zfs(keel_zfs::ZfsError::NotFound(_)))));
     }
 }
