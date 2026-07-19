@@ -318,6 +318,42 @@ fn apply_get_delete_round_trip() {
     assert!(stderr.contains("not found"), "expected 'not found' in stderr, got: {stderr}");
 }
 
+fn write_spec_file_with_volume(test_name: &str, jail_name: &str, volume_name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!("keelctl-test-spec-{test_name}.yaml"));
+    let yaml = format!(
+        "apiVersion: keel/v1\nkind: Jail\nmetadata:\n  name: {jail_name}\nspec:\n  image: base/14.2-web\n  command: [\"/usr/local/bin/myapp\"]\n  network:\n    vnet: true\n    bridge: keel0\n    address: 10.0.0.5/24\n  resources:\n    cpu: \"2\"\n    memory: 512M\n  restartPolicy: Always\n  volumes:\n    - name: {volume_name}\n      mountPath: /data\n      size: 1G\n"
+    );
+    std::fs::write(&path, yaml).unwrap();
+    path
+}
+
+#[test]
+fn delete_volume_survives_the_jails_deletion_then_frees_the_dataset() {
+    let socket_path = start_test_server("delete_volume_survives_the_jails_deletion_then_frees_the_dataset");
+    let spec_path = write_spec_file_with_volume(
+        "delete_volume_survives_the_jails_deletion_then_frees_the_dataset",
+        "web-1",
+        "web-data",
+    );
+
+    let (ok, _, stderr) = run_keelctl(&socket_path, &["apply", "-f", spec_path.to_str().unwrap()]);
+    assert!(ok, "apply failed: {stderr}");
+
+    let (ok, _, stderr) = run_keelctl(&socket_path, &["delete", "web-1"]);
+    assert!(ok, "delete failed: {stderr}");
+
+    let (ok, _, stderr) = run_keelctl(&socket_path, &["delete-volume", "web-data"]);
+    assert!(ok, "delete-volume failed: {stderr}");
+}
+
+#[test]
+fn delete_volume_on_a_never_created_name_fails_with_not_found() {
+    let socket_path = start_test_server("delete_volume_on_a_never_created_name_fails_with_not_found");
+    let (ok, _, stderr) = run_keelctl(&socket_path, &["delete-volume", "missing"]);
+    assert!(!ok, "expected delete-volume on a never-created volume to fail");
+    assert!(stderr.contains("not found"), "expected 'not found' in stderr, got: {stderr}");
+}
+
 fn write_service_spec_file(test_name: &str, service_name: &str, replicas: u32) -> PathBuf {
     let path = std::env::temp_dir().join(format!("keelctl-test-service-spec-{test_name}.yaml"));
     let yaml = format!(

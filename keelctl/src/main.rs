@@ -53,9 +53,10 @@ fn main() -> ExitCode {
         Some((cmd, rest)) if cmd == "apply" => run_apply(&target, rest),
         Some((cmd, rest)) if cmd == "get" => run_get(&target, rest),
         Some((cmd, rest)) if cmd == "delete" => run_delete(&target, rest),
+        Some((cmd, rest)) if cmd == "delete-volume" => run_delete_volume(&target, rest),
         _ => {
             eprintln!(
-                "usage: keelctl <apply -f FILE|get [name]|delete NAME> [--socket PATH|--control-plane-addr ADDR --node ID]"
+                "usage: keelctl <apply -f FILE|get [name]|delete NAME|delete-volume NAME> [--socket PATH|--control-plane-addr ADDR --node ID]"
             );
             return ExitCode::FAILURE;
         }
@@ -167,6 +168,12 @@ fn run_get(target: &Target, args: &[String]) -> Result<String, String> {
 fn run_delete(target: &Target, args: &[String]) -> Result<String, String> {
     let name = args.first().ok_or("delete requires a jail name")?;
     get_or_delete_with_service_fallback(target, "DELETE", name).map(|_| String::new())
+}
+
+fn run_delete_volume(target: &Target, args: &[String]) -> Result<String, String> {
+    let name = args.first().ok_or("delete-volume requires a volume name")?;
+    let path = jails_path(target, &format!("/volumes/{name}"));
+    success_body(dispatch(target, "DELETE", &path, "")).map(|_| String::new())
 }
 
 /// Tries `/jails/<name>` first; on a `404`, retries against
