@@ -107,14 +107,13 @@ When `provision` creates a `JailRecord` whose spec has both `volumes` and `repli
 
 `keelctl force-repin <replica-name>` → a new control-plane route, handled synchronously like every other client-facing route (the same `forward()`-based pattern `handle_scheduled_delete` already uses, no new async machinery):
 
-1. Look up the replica's current node in `Placements` and its standby in `Standbys`. **400** if there's no `Standbys` entry (not a stateful replica, or nothing to promote to).
-2. `registry.resolve(current_node)` must fail (`Dead`/unresolvable). **409** if the current primary still resolves `Alive` — the split-brain guard.
-3. Check the standby's `ReplicaTarget.last_snapshot` is `Some`. **409** if `None` (never completed a first full replication — nothing real to promote).
-4. Pick a fresh standby (any `Alive` node other than the promoted node and the now-fenced old node, via the same selection logic used at initial scheduling).
-5. Forward the replica's `JailSpec` to the (former) standby node's normal provision route, with `replicate_to` set to the fresh standby's address, and with volume creation skipped — the dataset already exists via `ReplicaTarget`, going through the same "don't recreate if present" idempotent path `create_volume` already has. The node starts the jail against the existing dataset and immediately begins a full-send baseline to its new standby (which has nothing yet).
-6. On success: `Placements[replica_name] = new_node`, remove the old `Standbys` entry and set `Standbys[replica_name] = fresh_standby`, and add `PendingFences[replica_name] = old_node`.
-
-**404** if `replica_name` isn't a currently-placed name at all, matching the existing "unplaced name" response shape everywhere else in this codebase.
+1. Look up the replica's current node in `Placements`. **404** if `replica_name` isn't a currently-placed name at all, matching the existing "unplaced name" response shape everywhere else in this codebase.
+2. Look up its standby in `Standbys`. **400** if there's no entry (not a stateful replica — a plain `kind: Jail` or stateless-service name never gets one).
+3. `registry.resolve(current_node)` must fail (`Dead`/unresolvable). **409** if the current primary still resolves `Alive` — the split-brain guard.
+4. Check the standby's `ReplicaTarget.last_snapshot` is `Some`. **409** if `None` (never completed a first full replication — nothing real to promote).
+5. Pick a fresh standby (any `Alive` node other than the promoted node and the now-fenced old node, via the same selection logic used at initial scheduling).
+6. Forward the replica's `JailSpec` to the (former) standby node's normal provision route, with `replicate_to` set to the fresh standby's address, and with volume creation skipped — the dataset already exists via `ReplicaTarget`, going through the same "don't recreate if present" idempotent path `create_volume` already has. The node starts the jail against the existing dataset and immediately begins a full-send baseline to its new standby (which has nothing yet).
+7. On success: `Placements[replica_name] = new_node`, remove the old `Standbys` entry and set `Standbys[replica_name] = fresh_standby`, and add `PendingFences[replica_name] = old_node`.
 
 ### Fencing
 
