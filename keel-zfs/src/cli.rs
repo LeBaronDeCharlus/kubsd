@@ -129,18 +129,18 @@ impl ZfsManager for CliZfsManager {
             .spawn()
             .map_err(|e| ZfsError::Spawn("zfs".to_string(), e))?;
         let mut stdout = child.stdout.take().expect("stdout was piped");
-        std::io::copy(&mut stdout, out).map_err(|e| ZfsError::Spawn("zfs send".to_string(), e))?;
+        let copy_result = std::io::copy(&mut stdout, out);
         drop(stdout);
         let status = child.wait().map_err(|e| ZfsError::Spawn("zfs".to_string(), e))?;
-        if status.success() {
-            Ok(())
-        } else {
-            let mut stderr = String::new();
-            if let Some(mut s) = child.stderr.take() {
-                let _ = s.read_to_string(&mut stderr);
-            }
-            Err(ZfsError::CommandFailed(format!("zfs {}", args.join(" ")), status, stderr))
+        let mut stderr = String::new();
+        if let Some(mut s) = child.stderr.take() {
+            let _ = s.read_to_string(&mut stderr);
         }
+        if !status.success() {
+            return Err(ZfsError::CommandFailed(format!("zfs {}", args.join(" ")), status, stderr));
+        }
+        copy_result.map_err(|e| ZfsError::Spawn("zfs send".to_string(), e))?;
+        Ok(())
     }
 
     fn receive_snapshot(&self, dataset: &str, input: &mut dyn Read) -> Result<(), ZfsError> {
@@ -151,18 +151,18 @@ impl ZfsManager for CliZfsManager {
             .spawn()
             .map_err(|e| ZfsError::Spawn("zfs".to_string(), e))?;
         let mut stdin = child.stdin.take().expect("stdin was piped");
-        std::io::copy(input, &mut stdin).map_err(|e| ZfsError::Spawn("zfs receive".to_string(), e))?;
+        let copy_result = std::io::copy(input, &mut stdin);
         drop(stdin);
         let status = child.wait().map_err(|e| ZfsError::Spawn("zfs".to_string(), e))?;
-        if status.success() {
-            Ok(())
-        } else {
-            let mut stderr = String::new();
-            if let Some(mut s) = child.stderr.take() {
-                let _ = s.read_to_string(&mut stderr);
-            }
-            Err(ZfsError::CommandFailed(format!("zfs receive {dataset}"), status, stderr))
+        let mut stderr = String::new();
+        if let Some(mut s) = child.stderr.take() {
+            let _ = s.read_to_string(&mut stderr);
         }
+        if !status.success() {
+            return Err(ZfsError::CommandFailed(format!("zfs receive {dataset}"), status, stderr));
+        }
+        copy_result.map_err(|e| ZfsError::Spawn("zfs receive".to_string(), e))?;
+        Ok(())
     }
 
     fn clone_from_base(&self, base_dataset: &str, target_dataset: &str) -> Result<(), ZfsError> {

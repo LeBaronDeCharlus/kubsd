@@ -91,14 +91,33 @@ impl ZfsManager for FakeZfsManager {
     fn receive_snapshot(&self, dataset: &str, input: &mut dyn Read) -> Result<(), ZfsError> {
         let mut buf = String::new();
         input.read_to_string(&mut buf).map_err(|e| ZfsError::Spawn("fake zfs receive".to_string(), e))?;
-        if !buf.starts_with("keel-zfs-fake-send:") {
+        let marker = buf.strip_prefix("keel-zfs-fake-send:");
+        let parsed = marker.and_then(|rest| {
+            let rest = rest.strip_suffix('\n').unwrap_or(rest);
+            let (sent, base_part) = rest.split_once(":base=")?;
+            let (_sender_dataset, snapshot) = sent.split_once('@')?;
+            let base = if base_part == "none" { None } else { Some(base_part.to_string()) };
+            Some((snapshot.to_string(), base))
+        });
+        let Some((snapshot, base)) = parsed else {
             return Err(ZfsError::CommandFailed(
                 "zfs receive (fake)".to_string(),
                 std::process::ExitStatus::from_raw(256),
                 "malformed stream".to_string(),
             ));
+        };
+        if let Some(b) = &base {
+            let base_key = format!("{dataset}@{b}");
+            if !self.snapshots.lock().unwrap().contains(&base_key) {
+                return Err(ZfsError::CommandFailed(
+                    "zfs receive (fake)".to_string(),
+                    std::process::ExitStatus::from_raw(256),
+                    format!("cannot receive incremental stream: base snapshot {base_key} does not exist"),
+                ));
+            }
         }
         self.datasets.lock().unwrap().insert(dataset.to_string());
+        self.snapshots.lock().unwrap().insert(format!("{dataset}@{snapshot}"));
         Ok(())
     }
 }
@@ -232,6 +251,50 @@ mod tests {
         let mut garbage: &[u8] = b"not a real send stream";
         assert!(matches!(zfs.receive_snapshot("zroot/keel/volumes/web-0-data", &mut garbage), Err(ZfsError::CommandFailed(_, _, _))));
         assert!(!zfs.dataset_exists("zroot/keel/volumes/web-0-data").unwrap());
+    }
+
+    #[test]
+    fn receive_snapshot_incremental_rejects_when_base_was_never_received_on_target() {
+        let source = FakeZfsManager::new();
+        source.seed_dataset("zroot/keel/volumes/web-data");
+        source.snapshot("zroot/keel/volumes/web-data", "keel-repl-1").unwrap();
+        source.snapshot("zroot/keel/volumes/web-data", "keel-repl-2").unwrap();
+
+        let mut stream = Vec::new();
+        source
+            .send_snapshot("zroot/keel/volumes/web-data", "keel-repl-2", Some("keel-repl-1"), &mut stream)
+            .unwrap();
+
+        // Target never received keel-repl-1, so an incremental receive based on it must fail,
+        // mirroring real `zfs receive -i` refusing a stream whose base doesn't match.
+        let target = FakeZfsManager::new();
+        assert!(matches!(
+            target.receive_snapshot("zroot/keel/volumes/web-0-data", &mut stream.as_slice()),
+            Err(ZfsError::CommandFailed(_, _, _))
+        ));
+        assert!(!target.dataset_exists("zroot/keel/volumes/web-0-data").unwrap());
+    }
+
+    #[test]
+    fn receive_snapshot_incremental_succeeds_once_the_base_was_received_first() {
+        let source = FakeZfsManager::new();
+        source.seed_dataset("zroot/keel/volumes/web-data");
+        source.snapshot("zroot/keel/volumes/web-data", "keel-repl-1").unwrap();
+        source.snapshot("zroot/keel/volumes/web-data", "keel-repl-2").unwrap();
+
+        let mut full_stream = Vec::new();
+        source.send_snapshot("zroot/keel/volumes/web-data", "keel-repl-1", None, &mut full_stream).unwrap();
+        let mut incremental_stream = Vec::new();
+        source
+            .send_snapshot("zroot/keel/volumes/web-data", "keel-repl-2", Some("keel-repl-1"), &mut incremental_stream)
+            .unwrap();
+
+        let target = FakeZfsManager::new();
+        target.receive_snapshot("zroot/keel/volumes/web-0-data", &mut full_stream.as_slice()).unwrap();
+        target
+            .receive_snapshot("zroot/keel/volumes/web-0-data", &mut incremental_stream.as_slice())
+            .unwrap();
+        assert!(target.dataset_exists("zroot/keel/volumes/web-0-data").unwrap());
     }
 
     #[test]
