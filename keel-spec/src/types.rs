@@ -24,6 +24,8 @@ pub struct Spec {
     pub restart_policy: RestartPolicy,
     #[serde(default)]
     pub volumes: Vec<VolumeMount>,
+    #[serde(rename = "replicateTo", default)]
+    pub replicate_to: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -120,6 +122,7 @@ impl JailTemplate {
                         size: v.size.clone(),
                     })
                     .collect(),
+                replicate_to: None,
             },
         }
     }
@@ -321,5 +324,47 @@ spec:
 
         let jail1 = service.spec.template.to_jail_spec("web-1", "10.0.60.3/24");
         assert_eq!(jail1.spec.volumes[0].name, "web-1-data");
+    }
+
+    const EXAMPLE_YAML_WITH_REPLICATE_TO: &str = r#"
+apiVersion: keel/v1
+kind: Jail
+metadata:
+  name: db-0
+spec:
+  image: base/14.2-web
+  command: ["/usr/local/bin/myapp"]
+  network:
+    vnet: true
+    bridge: keel0
+    address: 10.0.0.5/24
+  resources:
+    cpu: "2"
+    memory: "512M"
+  restartPolicy: Always
+  volumes:
+    - name: db-0-data
+      mountPath: /var/db
+      size: 5G
+  replicateTo: "10.0.0.9:7622"
+"#;
+
+    #[test]
+    fn parses_replicate_to_when_present() {
+        let spec: JailSpec = serde_yaml::from_str(EXAMPLE_YAML_WITH_REPLICATE_TO).unwrap();
+        assert_eq!(spec.spec.replicate_to, Some("10.0.0.9:7622".to_string()));
+    }
+
+    #[test]
+    fn replicate_to_defaults_to_none_when_absent() {
+        let spec: JailSpec = serde_yaml::from_str(EXAMPLE_YAML).unwrap();
+        assert_eq!(spec.spec.replicate_to, None);
+    }
+
+    #[test]
+    fn to_jail_spec_always_starts_with_no_replicate_to() {
+        let service: ServiceSpec = serde_yaml::from_str(SERVICE_EXAMPLE_YAML).unwrap();
+        let jail = service.spec.template.to_jail_spec("web-0", "10.0.60.2/24");
+        assert_eq!(jail.spec.replicate_to, None);
     }
 }

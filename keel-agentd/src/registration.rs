@@ -502,6 +502,7 @@ mod tests {
                         resources: keel_spec::ResourcesSpec { cpu: "2".to_string(), memory: "512M".to_string() },
                         restart_policy: keel_spec::RestartPolicy::Always,
                         volumes: vec![],
+                        replicate_to: None,
                     },
                 },
                 apply_tx,
