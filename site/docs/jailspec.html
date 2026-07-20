@@ -84,7 +84,7 @@ spec:
   <section id="volumes">
     <div class="container">
       <h2>Volumes</h2>
-      <p>Each entry in <code>spec.volumes</code> declares one named ZFS-backed directory whose dataset is created the first time a jail referencing it is provisioned, survives that jail being deleted, and is only ever destroyed by an explicit, separate <code>DELETE /volumes/&lt;name&gt;</code> (see the <a href="api.html#volumes">HTTP API reference</a>). Two jails referencing the same volume name on the same node share the same dataset; nothing coordinates concurrent writers, so single-writer is the only supported use today. A volume is single-node only, exactly the node the jail that first referenced it was scheduled onto by the existing scheduler; there is no cross-node volume movement yet, and <code>kind: Service</code>/<code>JailTemplate</code> never gain <code>volumes</code> at all, since a service replica can be rescheduled to any node and attaching node-local data to something that moves without its data is exactly the footgun this restriction avoids.</p>
+      <p>Each entry in <code>spec.volumes</code> declares one named ZFS-backed directory whose dataset is created the first time a jail referencing it is provisioned, survives that jail being deleted, and is only ever destroyed by an explicit, separate <code>DELETE /volumes/&lt;name&gt;</code> (see the <a href="api.html#volumes">HTTP API reference</a>). Two jails referencing the same volume name on the same node share the same dataset; nothing coordinates concurrent writers, so single-writer is the only supported use today. A volume is single-node only, exactly the node the jail that first referenced it was scheduled onto; there is no cross-node volume movement yet. A <code>kind: Service</code>'s <code>template</code> can declare volumes too (see <a href="#service">below</a>), in which case every replica is pinned to its first-placement node for life rather than rescheduled on node failure, exactly to avoid attaching node-local data to something that could otherwise move without it.</p>
       <pre>spec:
   volumes:
     - name: web-data
@@ -121,13 +121,18 @@ spec:
     resources:
       cpu: "1"
       memory: "256M"
-    restartPolicy: Always</pre>
+    restartPolicy: Always
+    volumes:
+      - name: data
+        mountPath: /var/db
+        size: 5G</pre>
       <table>
         <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
         <tbody>
           <tr><td><code>spec.replicas</code></td><td>integer</td><td>Desired replica count. <code>0</code> is valid (scaled to zero), never an error. May change on any re-apply; this is the only field that may.</td></tr>
           <tr><td><code>spec.port</code></td><td>integer</td><td>The port the service's virtual IP listens on, and the port it forwards to on every replica (same port both sides, no separate "target port"). Must be non-zero. Immutable after first apply, the same way <code>spec.template</code> is: a re-apply that changes it is rejected with a 409, requiring delete and re-apply instead.</td></tr>
           <tr><td><code>spec.template</code></td><td>object</td><td>The same fields <code>kind: Jail</code>'s <code>spec</code> has, minus <code>network.address</code>: a replica's address is always auto-assigned from its node's <code>pod_cidr</code>, never given directly. Immutable after first apply.</td></tr>
+          <tr><td><code>spec.template.volumes</code></td><td>list of objects</td><td>Same shape as <code>kind: Jail</code>'s <a href="#volumes">volumes</a>. Defaults to an empty list. Presence of any entries makes every replica of this service stateful: each gets its own volume (the template's volume name suffixed with the replica's own name, e.g. <code>data</code> becomes <code>web-0-data</code>), and is pinned to whichever node it was first placed on for the rest of its life, no automatic failover if that node goes permanently <code>Dead</code>. Either every replica is stateful or none are; there is no per-replica opt-out.</td></tr>
         </tbody>
       </table>
       <p>A service's virtual IP is allocated once, deterministically, from the cluster's <code>--service-cidr</code> pool on first creation, and never changes for the life of the service (a scale-only re-apply preserves it exactly). See the <a href="api.html#services">HTTP API reference</a> for how to read a service's VIP back, and <a href="architecture.html#services">Architecture</a> for how replica placement, self-healing, and the load-balancing proxy fit together.</p>

@@ -221,12 +221,23 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J
     /// failure for a reason other than "already gone" is handled by the
     /// normal per-jail backoff on the next reconciliation pass, not
     /// specially here.
+    ///
+    /// Declared volumes are unmounted first, the same ordering `delete()`
+    /// already uses: a provision failure that happens after the
+    /// volume-mount step would otherwise leave the mount sitting on top of
+    /// the rootfs dataset, making `destroy_dataset` fail silently (busy)
+    /// and wedging every later retry's `zfs clone` on "already exists".
     fn rollback_provision(&mut self, name: &str, record: &JailRecord) {
         let jail_name = record::jail_name(name);
         let epair_base = record::epair_base_name(record.epair_ordinal);
         let jail_dataset = record::jail_dataset_path(&self.pool, name);
+        let rootfs = record::jail_rootfs_path(&self.pool, name);
         let _ = self.net.detach_jail(&epair_base);
         let _ = self.jails.destroy(&jail_name);
+        for volume in &record.spec.spec.volumes {
+            let target = rootfs.join(volume.mount_path.trim_start_matches('/'));
+            let _ = self.mounts.unmount(&target);
+        }
         let _ = self.zfs.destroy_dataset(&jail_dataset);
         let _ = self.jails.remove_resource_limits(&jail_name);
     }
@@ -644,6 +655,36 @@ mod tests {
         let dir = test_state_dir("delete_volume_on_a_never_created_name_is_not_found");
         let mut reconciler = new_reconciler(dir);
         assert!(matches!(reconciler.delete_volume("missing"), Err(ReconcileError::Zfs(keel_zfs::ZfsError::NotFound(_)))));
+    }
+
+    #[test]
+    fn rollback_provision_unmounts_a_declared_volume() {
+        // A provision failure that happens after the volume-mount step (a
+        // real `configure_networking_and_limits`/`start_command` failure,
+        // not reproducible against these in-memory fakes) must not leave
+        // the volume's nullfs mount sitting on top of the rootfs dataset:
+        // an un-unmounted volume is exactly the "device busy" class of
+        // failure `delete()`'s own unmount-before-destroy ordering already
+        // exists to avoid, and leaving it in place would make every
+        // subsequent retry's `zfs clone` fail with "already exists"
+        // forever, wedging the reconciler's own backoff-retry loop. Since
+        // the fakes can't force that failure directly, this instead
+        // reproduces rollback_provision's required cleanup contract the
+        // same way the test below does: run a fully successful provision
+        // (which mounts the volume for real, against the fakes), then call
+        // rollback_provision directly, exactly the state it must also
+        // handle after a genuine partial failure.
+        let dir = test_state_dir("rollback_provision_unmounts_a_declared_volume");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/keel/base/14.2-web");
+        reconciler.apply(sample_spec_with_volume("web-1", "web-data", "/data", "1G")).unwrap();
+        let record = reconciler.records["web-1"].clone();
+
+        reconciler.provision("web-1", &record).unwrap();
+        reconciler.rollback_provision("web-1", &record);
+
+        let target = record::jail_rootfs_path("zroot", "web-1").join("data");
+        assert_eq!(reconciler.mounts.is_mounted(&target).unwrap(), false, "volume mount must be undone by rollback");
     }
 
     #[test]

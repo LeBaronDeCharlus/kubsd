@@ -243,11 +243,26 @@ fn handle_command(
                 // own Alive+running check (unchanged, see DiscoverService)
                 // still excludes a crash-looping replica from what's
                 // actually advertised as usable.
-                let present_indices: BTreeSet<u32> = placed
-                    .iter()
-                    .filter(|(_, _, node_id)| registry.resolve(node_id, now).is_ok())
-                    .map(|(idx, _, _)| *idx)
-                    .collect();
+                let present_indices: BTreeSet<u32> = if record.template.volumes.is_empty() {
+                    placed
+                        .iter()
+                        .filter(|(_, _, node_id)| registry.resolve(node_id, now).is_ok())
+                        .map(|(idx, _, _)| *idx)
+                        .collect()
+                } else {
+                    // Stateful: a placement is "present" regardless of
+                    // whether its node currently resolves. A replica pinned
+                    // to a Dead node is neither torn down nor replaced
+                    // elsewhere, it simply waits for that node to come
+                    // back, since keel-agentd persists its own jail records
+                    // to disk and will reconcile the replica back to
+                    // running on its own once its process (or the node)
+                    // returns, with no control-plane involvement. This is
+                    // the entire node-pinning mechanism: everything
+                    // downstream (diff_replicas, to_add/to_remove,
+                    // ReplicaAction execution) is unchanged.
+                    placed.iter().map(|(idx, _, _)| *idx).collect()
+                };
 
                 let (to_add, to_remove) = services::diff_replicas(record.desired_replicas, &present_indices);
                 let mut busy = services::nodes_hosting_service(service_name, placements);
@@ -377,7 +392,7 @@ mod tests {
     use super::*;
     use crate::addresses::UsedAddresses;
     use crate::services::{ApplyServiceError, Owner, Services};
-    use keel_spec::{JailTemplate, ResourcesSpec, RestartPolicy, TemplateNetworkSpec};
+    use keel_spec::{JailTemplate, ResourcesSpec, RestartPolicy, TemplateNetworkSpec, VolumeMount};
 
     fn test_cluster_cidr() -> ipnet::Ipv4Net {
         "10.0.0.0/16".parse().unwrap()
@@ -394,6 +409,7 @@ mod tests {
             network: TemplateNetworkSpec { vnet: true, bridge: "keel0".to_string() },
             resources: ResourcesSpec { cpu: "1".to_string(), memory: "256M".to_string() },
             restart_policy: RestartPolicy::Always,
+            volumes: vec![],
         }
     }
 
@@ -715,6 +731,24 @@ mod tests {
         rx.recv().unwrap().unwrap();
     }
 
+    fn stateful_template() -> JailTemplate {
+        let mut t = template();
+        t.volumes = vec![VolumeMount { name: "data".to_string(), mount_path: "/data".to_string(), size: "1G".to_string() }];
+        t
+    }
+
+    fn apply_service_with_template(commands: &Sender<Command>, name: &str, replicas: u32, template: JailTemplate) {
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::ApplyService(name.to_string(), replicas, template, 8080, tx)).unwrap();
+        rx.recv().unwrap().unwrap();
+    }
+
+    fn record_placement(commands: &Sender<Command>, jail_name: &str, node_id: &str) {
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::RecordPlacement(jail_name.to_string(), node_id.to_string(), tx)).unwrap();
+        rx.recv().unwrap();
+    }
+
     fn reconcile(commands: &Sender<Command>) -> Vec<ReplicaAction> {
         let (tx, rx) = mpsc::channel();
         commands.send(Command::ReconcileServices(tx)).unwrap();
@@ -807,6 +841,68 @@ mod tests {
             matches!(&actions[0], ReplicaAction::Schedule { replica_name, node_id, .. } if replica_name == "web-0" && node_id == "node-1"),
             "expected web-0 rescheduled onto the one real Alive node, got: {actions:?}"
         );
+    }
+
+    #[test]
+    fn reconcile_services_leaves_a_stateful_replica_pinned_to_a_dead_node_alone() {
+        // Same "node never registered" trick as the stateless-unreachable
+        // test above: registry.resolve() fails for it exactly like a
+        // genuinely Dead node, without waiting out the real heartbeat
+        // timeout.
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(test_service_cidr()), UsedAddresses::new()).1;
+        register_node(&commands, "node-1", "10.0.0.1", 4.0, 8 * 1024 * 1024 * 1024);
+        apply_service_with_template(&commands, "db", 1, stateful_template());
+        record_placement(&commands, "db-0", "node-unreachable");
+
+        assert_eq!(
+            reconcile(&commands),
+            vec![],
+            "a stateful replica pinned to an unreachable node must be neither torn down nor rescheduled"
+        );
+    }
+
+    #[test]
+    fn reconcile_services_stateful_scale_down_skips_a_dead_pinned_replica_until_its_node_is_alive_again() {
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(test_service_cidr()), UsedAddresses::new()).1;
+        register_node(&commands, "node-1", "10.0.0.1", 4.0, 8 * 1024 * 1024 * 1024);
+        apply_service_with_template(&commands, "db", 2, stateful_template());
+        record_placement(&commands, "db-0", "node-1");
+        record_placement(&commands, "db-1", "node-unreachable");
+        heartbeat_with_jails(&commands, "node-1", vec![running("db-0")]);
+
+        apply_service_with_template(&commands, "db", 1, stateful_template()); // scale down to 1, removing index 1
+        assert_eq!(
+            reconcile(&commands),
+            vec![],
+            "scale-down of a stateful replica pinned to an unreachable node must be skipped this tick, not errored"
+        );
+
+        register_node(&commands, "node-unreachable", "10.0.0.9", 4.0, 8 * 1024 * 1024 * 1024);
+        let actions = reconcile(&commands);
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(&actions[0], ReplicaAction::TearDown { replica_name, node_id, .. } if replica_name == "db-1" && node_id == "node-unreachable"),
+            "expected db-1 torn down once its pinned node is reachable again, got: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn reconcile_services_schedules_a_brand_new_stateful_service_across_distinct_nodes() {
+        let commands = spawn(Registry::new(test_cluster_cidr()), Placements::new(), Services::new(test_service_cidr()), UsedAddresses::new()).1;
+        register_node(&commands, "node-1", "10.0.0.1", 4.0, 8 * 1024 * 1024 * 1024);
+        register_node(&commands, "node-2", "10.0.0.2", 4.0, 8 * 1024 * 1024 * 1024);
+        apply_service_with_template(&commands, "db", 2, stateful_template());
+
+        let actions = reconcile(&commands);
+        assert_eq!(actions.len(), 2);
+        let node_ids: std::collections::HashSet<String> = actions
+            .iter()
+            .map(|a| match a {
+                ReplicaAction::Schedule { node_id, .. } => node_id.clone(),
+                ReplicaAction::TearDown { .. } => panic!("expected only Schedule actions"),
+            })
+            .collect();
+        assert_eq!(node_ids.len(), 2, "expected the two replicas spread across two distinct nodes, got: {actions:?}");
     }
 
     #[test]

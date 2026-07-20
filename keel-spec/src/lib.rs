@@ -26,6 +26,7 @@ pub fn parse_and_validate_service(yaml: &str) -> Result<ServiceSpec, SpecError> 
     validate::validate_name(&spec.metadata.name)?;
     resources::parse_cpu_cores(&spec.spec.template.resources.cpu)?;
     resources::parse_memory_bytes(&spec.spec.template.resources.memory)?;
+    validate::validate_volumes(&spec.spec.template.volumes)?;
     if spec.spec.port == 0 {
         return Err(SpecError::InvalidPort(0));
     }
@@ -113,5 +114,14 @@ spec:
     #[test]
     fn sniff_kind_on_malformed_yaml_is_an_error() {
         assert!(sniff_kind("not: valid: yaml: [").is_err());
+    }
+
+    #[test]
+    fn parse_and_validate_service_rejects_a_malformed_template_volume() {
+        let yaml = VALID_SERVICE_YAML.replace(
+            "    restartPolicy: Always\n",
+            "    restartPolicy: Always\n    volumes:\n      - name: Invalid_Name\n        mountPath: /data\n        size: 1G\n",
+        );
+        assert!(matches!(parse_and_validate_service(&yaml), Err(SpecError::InvalidName(_))));
     }
 }

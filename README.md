@@ -1041,6 +1041,131 @@ tolerance was written against). This is in a crate this milestone never
 touched and is left for a future session to fix, not folded into this
 milestone's own scope.
 
+### Milestone 18: stateful services via node-pinning
+
+Milestone 17 stopped `kind: Service`/`JailTemplate` short of a `volumes`
+field at all, leaving the choice between two candidate mechanisms
+(scheduler node-pinning, or `zfs send`/`receive` replication) as an open
+question for "a later milestone in this sub-project to decide, once this
+foundation has been used in practice." This milestone, the second and
+closing milestone in Sub-Project 7, answers that question with
+node-pinning: a `kind: Service` whose `template` declares volumes gets
+each replica pinned to whichever node it was first placed on for the life
+of that replica, trading automatic failover away in exchange for never
+silently creating a fresh, empty volume on a different node in place of
+one that still holds real data. `zfs send`/`receive` replication remains
+a distinct, undesigned, later effort.
+
+`JailTemplate` gains `volumes: Vec<VolumeMount>` (`#[serde(default)]`,
+the exact `VolumeMount` type Milestone 17 already defined), validated by
+the same `validate_volumes` Milestone 17 already built and tested, now
+also called from `parse_and_validate_service`. `JailTemplate::to_jail_spec`
+maps each template volume into that replica's own volume, rewriting only
+`name` to `format!("{name}-{volume_name}")` (e.g. replica `web-0`'s
+template volume `data` becomes `web-0-data`); since replica names are
+already globally unique, the derived per-replica volume names are
+automatically unique too, no new collision-checking logic anywhere. Since
+`Services::apply` already rejects any `template` change on an existing
+service via derived `PartialEq`, a stateful service's `volumes` were
+already immutable once created with no code change needed.
+
+The entire runtime mechanism is one conditional in
+`keel-controlplane`'s `Command::ReconcileServices` handler: computing
+`present_indices` now branches on whether a service's template has any
+volumes. Stateless services keep today's behavior unchanged (an index
+counts as present only if its node currently resolves as reachable, so a
+`Dead`-node replica drops out and gets rescheduled). A stateful service's
+every placed index counts as present regardless of whether its node
+resolves, so a replica pinned to a `Dead` node is neither torn down nor
+replaced; it simply waits for `keel-agentd`'s own crash-safe on-disk
+`JailRecord` to reconcile it back to running once its node returns, with
+no control-plane involvement. Everything downstream (`diff_replicas`,
+`to_add`/`to_remove`, `ReplicaAction::Schedule`/`TearDown` execution) is
+unchanged code. No `keel-agentd` changes at all: `spec.volumes` handling
+in `Reconciler::provision`/`delete` already works for any `JailSpec`
+regardless of how it arrived. No new HTTP routes, no new `keelctl` verbs:
+`keelctl delete-volume` already cleans up an orphaned per-replica volume
+after a scale-down.
+
+Implementation matched the design spec exactly, with one correction made
+to the spec itself first (not the code): the spec's Non-Goals and Error
+Handling sections had claimed that manually deleting a replica pinned to
+an unreachable node "forwards to the recorded node and fails (500)."
+Tracing `handle_scheduled_delete` showed the request never reaches the
+forward step at all — `resolve_placement` fails first against
+`registry.resolve` and returns `404`, the same response an unplaced name
+would get. The spec was corrected before implementation began.
+
+Unit tests: 411 pass across every workspace crate on macOS against
+fakes (8 new: `keel-spec` gained template-volume (de)serialization,
+`to_jail_spec` per-replica renaming, and `parse_and_validate_service`
+validation tests; `keel-controlplane` gained the core pinning regression
+test — a stateful replica pinned to a `Dead` node produces neither a
+`Schedule` nor a `TearDown` — plus a stateful scale-down-while-dead test
+and a brand-new-stateful-service spread test). Clippy warnings unchanged
+from Milestone 17's count (41): every new test's code follows this
+project's existing conventions with no new lint categories introduced.
+
+Real 3-node VM verification surfaced one genuine, pre-existing bug, in
+Milestone 17's own code rather than anything Milestone 18 added:
+`Reconciler::rollback_provision` never unmounted a jail's declared
+volumes before calling `destroy_dataset` on its rootfs, unlike `delete()`,
+which already gets this ordering right. A provision failure occurring
+after the volume-mount step (surfaced here by one node's stripped-down
+test image initially lacking `/sbin/route`, needed by Milestone 14's
+default-route setup, an environment gap rather than a product bug) left
+the mount sitting on the rootfs dataset, so `destroy_dataset` failed
+silently and every later retry's `zfs clone` was permanently wedged on
+"already exists", the exact "device busy" class of failure `delete()`'s
+own ordering exists to avoid. Fixed by unmounting declared volumes first
+in `rollback_provision` too, mirroring `delete()` exactly, with a new
+fake-backed regression test (`rollback_provision` can't be made to fail
+mid-`provision` against the fakes, so the test instead runs a fully
+successful `provision` with a volume, calls `rollback_provision` directly
+on top of it, and confirms the mount is gone, the same "verify the
+cleanup contract directly" pattern this file's own existing
+`rollback_provision_cleans_up_after_partial_failure` test already uses).
+412 tests pass with this fix, clippy at 42 warnings (41 inherited plus
+one new `assert_eq!` literal-bool in the new test, this file's own
+established idiom).
+
+Real 3-node VM verification then passed in full, on the actual node
+topology (`node-2` co-located with the control plane, `node-4`, `node-5`):
+a 2-replica stateful service ("db", one volume mounted at `/var/db`)
+scheduled its replicas onto two distinct nodes with their own separate,
+correctly-quota-scoped volume datasets; distinct data written into each
+was readable back through the jail's own mount point. Killing `db-0`'s
+node's `keel-agentd` (not the VM) and waiting past the 15-second `Dead`
+threshold left `db-0`'s jail running untouched on its own node, confirmed
+`GET /services/db` reporting only the surviving `db-1` as healthy, and
+confirmed `db-0`'s index was not recreated on the cluster's third node;
+its volume dataset and data were untouched throughout. Restarting that
+node's `keel-agentd` found the pinned replica already running (a jail
+outlives its node's daemon, unaffected by the whole episode) with its
+data intact and no control-plane action taken. Scaling the service down
+by one tore down the removed replica's jail while its volume dataset
+survived by default; scaling back up rescheduled it onto the same node
+(the scheduler's own headroom ranking, not the pinning mechanism, which
+does not track history across a full teardown/recreate cycle) and found
+the old data intact rather than starting empty, exactly the Non-Goals
+section's documented consequence of "a volume is only ever destroyed by
+an explicit, separate operation." A second scale-down/`keelctl
+delete-volume`/scale-up cycle confirmed the contrasting explicit-cleanup
+path: after `delete-volume`, the next scale-up landed on a genuinely
+fresh, empty volume instead.
+
+Two environment-level gaps surfaced during the run, neither a bug in
+this milestone's own code, both matching the same class of fleet-drift
+issue Milestone 16's own VM verification already ran into: one node's
+minimal test image was missing `/sbin/ifconfig`/`/sbin/route` entirely
+(fixed by copying both binaries in from another node's image and
+refreshing the base dataset's `@keel` snapshot so clones pick them up),
+and two of the three nodes were still serving requests with a stale,
+already-revoked `operator` client certificate left over from an earlier
+session, rejected by their own TLS listener with a `certificate revoked`
+alert on first use (fixed by redistributing the current certificate from
+the control-plane host).
+
 ## Roadmap
 
 **Sub-project 1: single-node jail reconciliation daemon (complete)**
@@ -1077,13 +1202,14 @@ milestone's own scope.
 15. Service discovery via replica sets: `kind: Service`, deterministic replica naming, same-service scheduler spreading, auto-assigned addressing, heartbeat-piggybacked self-healing, `GET /services/<name>` discovery — code complete and reviewed (332 tests passing, clippy clean); real 3-node VM verification not yet run
 16. Service load balancing via a per-node virtual-IP proxy: `spec.port`, `--service-cidr` VIP allocation, heartbeat-carried service table, `keel-net` bridge aliasing, per-node round-robin relay with retry-once — code complete and reviewed (366 tests passing, clippy clean), 3-node VM verification passed (netmask, round-robin, failover self-healing, teardown all confirmed)
 
-**Sub-project 7: persistent storage (in progress)**
+**Sub-project 7: persistent storage (complete)**
 
 17. Persistent volumes on a single node: `spec.volumes` on `kind: Jail`, `create_volume`/decoupled dataset lifecycle, `MountManager` (`mount -t nullfs`), `GET`/`DELETE /volumes/<name>`, `keelctl delete-volume` (403 tests passing), 3-node VM verification passed (create/write/delete/re-apply/read-back, 409-while-in-use, 404-after-delete, no-volumes jail unaffected)
+18. Stateful services via node-pinning: `volumes` on `kind: Service`'s `template`, per-replica volume naming, `ReconcileServices` health-blind `present_indices` for stateful services (no automatic failover, no cross-node replication) (412 tests passing, clippy clean), 3-node VM verification passed (pinned-replica survival on a dead node, no rescheduling, self-healing recovery with data intact, scale-down/up volume durability, explicit `keelctl delete-volume` cleanup); also fixed a real pre-existing Milestone 17 bug, `rollback_provision` not unmounting volumes before destroying a failed provision's rootfs dataset
 
 **Not yet designed** (future sub-projects, each will get its own spec):
 
-- Stateful `kind: Service` (node-pinning or `zfs send`/`receive` replication for a rescheduled replica's data) and cross-node volume movement generally
+- Cross-node volume movement: `zfs send`/`receive` replication (or another mechanism) so a stateful replica's data can follow it off a permanently-gone node, plus an operator "force re-pin" verb
 - bhyve VM workloads alongside jails
 
 ## Platform support

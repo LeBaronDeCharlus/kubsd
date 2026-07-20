@@ -202,6 +202,7 @@ mod tests {
             network: TemplateNetworkSpec { vnet: true, bridge: "keel0".to_string() },
             resources: ResourcesSpec { cpu: "1".to_string(), memory: "256M".to_string() },
             restart_policy: RestartPolicy::Always,
+            volumes: vec![],
         }
     }
 
