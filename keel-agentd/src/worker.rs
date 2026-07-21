@@ -21,6 +21,11 @@ pub enum Command {
     GetVolume(String, Sender<Result<(), ReconcileError>>),
     DeleteVolume(String, Sender<Result<(), ReconcileError>>),
     SetReplicateTo(String, Option<String>, Sender<Result<(), ReconcileError>>),
+    /// Re-spawns a replication loop for every stateful+replicated jail whose
+    /// record was loaded from on-disk state without ever going through
+    /// `Command::Apply` in this process (i.e. right after a restart). Sent
+    /// once at startup by `main.rs`, right after `worker::spawn` returns.
+    ResumeReplicationLoops(Sender<()>),
 }
 
 pub fn spawn<J, Z, N, M>(mut reconciler: Reconciler<J, Z, N, M>, zfs: Z, pool: String) -> (JoinHandle<()>, Sender<Command>)
@@ -110,6 +115,17 @@ fn handle_command<J: JailRuntime, Z: ZfsManager + Clone + Send + 'static, N: Net
         Command::SetReplicateTo(name, replicate_to, reply) => {
             let _ = reply.send(reconciler.set_replicate_to(&name, replicate_to));
         }
+        Command::ResumeReplicationLoops(reply) => {
+            for status in reconciler.list(Instant::now()) {
+                let spec = &status.record.spec.spec;
+                let name = status.record.spec.metadata.name.clone();
+                if !spec.volumes.is_empty() && spec.replicate_to.is_some() && replicating.insert(name.clone()) {
+                    let volume_name = format!("{name}-data");
+                    crate::replication_loop::spawn(name, volume_name, pool.to_string(), zfs.clone(), commands.clone(), Duration::from_secs(30));
+                }
+            }
+            let _ = reply.send(());
+        }
     }
 }
 
@@ -118,7 +134,7 @@ mod tests {
     use super::*;
     use keel_jail::{FakeJailRuntime, FakeMountManager};
     use keel_net::FakeNetManager;
-    use keel_spec::{Metadata, NetworkSpec, RestartPolicy, ResourcesSpec, Spec};
+    use keel_spec::{Metadata, NetworkSpec, RestartPolicy, ResourcesSpec, Spec, VolumeMount};
     use keel_zfs::FakeZfsManager;
     use std::path::PathBuf;
 
@@ -306,5 +322,102 @@ mod tests {
         let (del_tx, del_rx) = mpsc::channel();
         commands.send(Command::DeleteVolume("web-data".to_string(), del_tx)).unwrap();
         assert!(matches!(del_rx.recv().unwrap(), Err(ReconcileError::Zfs(keel_zfs::ZfsError::NotFound(_)))));
+    }
+
+    fn stateful_replicated_spec(name: &str, replicate_to: &str) -> JailSpec {
+        JailSpec {
+            api_version: "keel/v1".to_string(),
+            kind: "Jail".to_string(),
+            metadata: Metadata { name: name.to_string() },
+            spec: Spec {
+                image: "base/14.2-web".to_string(),
+                command: vec!["/usr/local/bin/myapp".to_string()],
+                network: NetworkSpec { vnet: true, bridge: "keel0".to_string(), address: "10.0.0.6/24".to_string() },
+                resources: ResourcesSpec { cpu: "1".to_string(), memory: "256M".to_string() },
+                restart_policy: RestartPolicy::Always,
+                volumes: vec![VolumeMount { name: format!("{name}-data"), mount_path: "/var/db".to_string(), size: "1G".to_string() }],
+                replicate_to: Some(replicate_to.to_string()),
+            },
+        }
+    }
+
+    #[test]
+    fn resume_replication_loops_starts_a_loop_for_a_record_persisted_before_a_restart() {
+        // Proves the fix for "replication never resumes after a restart":
+        // apply a stateful+replicated spec directly against a `Reconciler`
+        // (bypassing `worker::spawn`'s `Command::Apply` path entirely, so
+        // no replication loop is spawned yet -- simulating a record that
+        // was already on disk from a previous process), then build a
+        // *fresh* `worker::spawn` over a *fresh* `Reconciler::new` pointed
+        // at that same state_dir (so it loads the persisted record with an
+        // empty `replicating` set, exactly as a real restart would), send
+        // `Command::ResumeReplicationLoops`, and confirm a replication loop
+        // actually starts and completes a real send.
+        let dir = test_state_dir("resume_replication_loops_starts_a_loop_for_a_record_persisted_before_a_restart");
+        let zfs = FakeZfsManager::new();
+        zfs.seed_dataset("zroot/keel/base/14.2-web");
+
+        let receiver_zfs = FakeZfsManager::new();
+        let receiver_dir = std::env::temp_dir()
+            .join("keel-agentd-worker-test-receiver-resume_replication_loops_starts_a_loop_for_a_record_persisted_before_a_restart");
+        let _ = std::fs::remove_dir_all(&receiver_dir);
+        let targets = crate::ReplicaTargetRegistry::load(receiver_dir).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let receiver_zfs_clone = receiver_zfs.clone();
+        let targets_clone = targets.clone();
+        std::thread::spawn(move || crate::replication::run(listener, receiver_zfs_clone, "zroot".to_string(), targets_clone));
+
+        // The "previous process": apply and reconcile directly against a
+        // `Reconciler`, never touching `worker::spawn` or `Command::Apply`,
+        // so nothing spawns a replication loop here.
+        {
+            let mut reconciler = crate::reconciler::Reconciler::new(
+                FakeJailRuntime::new(),
+                zfs.clone(),
+                FakeNetManager::new(),
+                FakeMountManager::new(),
+                "zroot".to_string(),
+                dir.clone(),
+            )
+            .unwrap();
+            reconciler.apply(stateful_replicated_spec("db-resume", &addr)).unwrap();
+            let failures = reconciler.reconcile(Instant::now());
+            assert!(failures.is_empty(), "expected the initial reconcile to provision the jail and its volume cleanly: {failures:?}");
+        }
+
+        // "The restart": a fresh `Reconciler::new` over the same state_dir
+        // (loads the persisted record with an empty `replicating` set) and
+        // a fresh `worker::spawn` over it.
+        let restarted_reconciler = crate::reconciler::Reconciler::new(
+            FakeJailRuntime::new(),
+            zfs.clone(),
+            FakeNetManager::new(),
+            FakeMountManager::new(),
+            "zroot".to_string(),
+            dir,
+        )
+        .unwrap();
+        let (_worker_handle, commands) = spawn(restarted_reconciler, zfs.clone(), "zroot".to_string());
+
+        let (resume_tx, resume_rx) = mpsc::channel();
+        commands.send(Command::ResumeReplicationLoops(resume_tx)).unwrap();
+        resume_rx.recv().unwrap();
+
+        // The resumed loop uses the same 30s tick interval as a
+        // freshly-`Apply`'d replica's loop, so poll for the send's effect
+        // (rather than a single blind sleep) with a generous upper bound.
+        let deadline = std::time::Instant::now() + Duration::from_secs(45);
+        loop {
+            if receiver_zfs.dataset_exists("zroot/keel/volumes/db-resume-data").unwrap_or(false) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected a replication loop resumed after a simulated restart to complete a real send within the deadline"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(targets.get("db-resume").is_some_and(|t| t.last_snapshot.is_some()));
     }
 }

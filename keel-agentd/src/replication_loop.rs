@@ -51,8 +51,16 @@ pub fn spawn<Z: ZfsManager + Clone + Send + 'static>(
                 continue;
             }
 
-            match send_once(&zfs, &dataset, &snapshot_id, last_confirmed_sent.as_deref(), &replicate_to) {
+            match send_once(&zfs, &replica_name, &dataset, &snapshot_id, last_confirmed_sent.as_deref(), &replicate_to) {
                 Ok(()) => {
+                    // Prune the previous incremental base now that a new one
+                    // has been confirmed: keep exactly one snapshot per
+                    // replica at steady state, no unbounded growth.
+                    if let Some(previous) = last_confirmed_sent.as_deref() {
+                        if let Err(e) = zfs.destroy_snapshot(&dataset, previous) {
+                            eprintln!("keel-agentd: failed to prune previous snapshot '{previous}' for '{dataset}': {e}");
+                        }
+                    }
                     last_confirmed_sent = Some(snapshot_id);
                 }
                 Err(SendOnceError::NeedFull) => {
@@ -72,9 +80,9 @@ enum SendOnceError {
     Io(String),
 }
 
-fn send_once<Z: ZfsManager>(zfs: &Z, dataset: &str, snapshot_id: &str, base: Option<&str>, replicate_to: &str) -> Result<(), SendOnceError> {
+fn send_once<Z: ZfsManager>(zfs: &Z, replica_name: &str, dataset: &str, snapshot_id: &str, base: Option<&str>, replicate_to: &str) -> Result<(), SendOnceError> {
     let mut stream = TcpStream::connect(replicate_to).map_err(|e| SendOnceError::Io(e.to_string()))?;
-    replication::write_header(&mut stream, dataset_replica_name(dataset), snapshot_id, base).map_err(|e| SendOnceError::Io(e.to_string()))?;
+    replication::write_header(&mut stream, replica_name, snapshot_id, base).map_err(|e| SendOnceError::Io(e.to_string()))?;
     let mut ack = [0u8; 1];
     stream.read_exact(&mut ack).map_err(|e| SendOnceError::Io(e.to_string()))?;
     if ack[0] == ACK_NEED_FULL {
@@ -83,14 +91,6 @@ fn send_once<Z: ZfsManager>(zfs: &Z, dataset: &str, snapshot_id: &str, base: Opt
     zfs.send_snapshot(dataset, snapshot_id, base, &mut stream).map_err(|e| SendOnceError::Io(e.to_string()))?;
     stream.shutdown(std::net::Shutdown::Write).ok();
     Ok(())
-}
-
-/// `dataset` is `<pool>/keel/volumes/<replica_name>`; the receiver keys its
-/// `ReplicaTarget` by the final path component (the volume name), not the
-/// replica name -- see `replication::handle_connection`'s own use of
-/// `header.replica_name` to build `record::volume_dataset_path`.
-fn dataset_replica_name(dataset: &str) -> &str {
-    dataset.rsplit('/').next().unwrap_or(dataset)
 }
 
 #[cfg(test)]
@@ -157,12 +157,62 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(300));
         assert!(receiver_zfs.dataset_exists("zroot/keel/volumes/db-0-data").unwrap());
-        // The wire protocol's `replica_name` header field is keyed by the
-        // dataset's final path segment (see `dataset_replica_name` above and
-        // `replication::handle_connection`'s own `volume_dataset_path(pool,
-        // &header.replica_name)`), i.e. the *volume* name ("db-0-data"), not
-        // the jail/replica name ("db-0").
-        assert!(targets.get("db-0-data").is_some_and(|t| t.last_snapshot.is_some()));
+        // The wire protocol's `replica_name` header field carries the plain
+        // replica/jail name ("db-0"), matching `Standbys`, `PendingFences`,
+        // `Placements`, and force-repin's own probe -- see
+        // `replication::handle_connection`, which reconstructs the volume
+        // name ("db-0-data") from this same field.
+        assert!(targets.get("db-0").is_some_and(|t| t.last_snapshot.is_some()));
+    }
+
+    #[test]
+    fn a_successful_send_prunes_the_previous_confirmed_snapshot() {
+        // After two successful ticks, exactly one snapshot should survive on
+        // the sender's dataset: the second tick's send (which used tick 1's
+        // snapshot as its incremental base) must prune tick 1's snapshot
+        // once it's confirmed no longer needed, per the design spec's "keep
+        // exactly one" invariant.
+        let dir = test_state_dir("a_successful_send_prunes_the_previous_confirmed_snapshot");
+        let zfs = FakeZfsManager::new();
+        zfs.seed_dataset("zroot/keel/base/14.2-web");
+        let reconciler = Reconciler::new(FakeJailRuntime::new(), zfs.clone(), FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), dir).unwrap();
+        let (_worker_handle, commands) = worker::spawn(reconciler, zfs.clone(), "zroot".to_string());
+
+        let (apply_tx, apply_rx) = std::sync::mpsc::channel();
+        commands.send(Command::Apply(stateful_spec("db-2"), apply_tx)).unwrap();
+        apply_rx.recv().unwrap().unwrap();
+
+        let receiver_zfs = FakeZfsManager::new();
+        let receiver_dir = std::env::temp_dir().join("keel-agentd-replication-loop-test-receiver-a_successful_send_prunes_the_previous_confirmed_snapshot");
+        let _ = std::fs::remove_dir_all(&receiver_dir);
+        let targets = crate::ReplicaTargetRegistry::load(receiver_dir).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let receiver_zfs_clone = receiver_zfs.clone();
+        let targets_clone = targets.clone();
+        std::thread::spawn(move || crate::replication::run(listener, receiver_zfs_clone, "zroot".to_string(), targets_clone));
+
+        let (rt_tx, rt_rx) = std::sync::mpsc::channel();
+        commands.send(Command::SetReplicateTo("db-2".to_string(), Some(addr), rt_tx)).unwrap();
+        rt_rx.recv().unwrap().unwrap();
+
+        // 200ms interval: ticks land at ~200ms and ~400ms. Asserting at
+        // 450ms falls comfortably after the second tick's send completes
+        // but well before the third (~600ms), so exactly two successful
+        // sends have happened.
+        let _handle = spawn("db-2".to_string(), "db-2-data".to_string(), "zroot".to_string(), zfs.clone(), commands.clone(), Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(450));
+
+        let dataset = "zroot/keel/volumes/db-2-data";
+        let mut discard = Vec::new();
+        assert!(
+            matches!(zfs.send_snapshot(dataset, "keel-repl-1", None, &mut discard), Err(keel_zfs::ZfsError::NotFound(_))),
+            "expected the first tick's snapshot to have been pruned after the second tick's successful send"
+        );
+        assert!(
+            zfs.send_snapshot(dataset, "keel-repl-2", None, &mut discard).is_ok(),
+            "expected the second tick's snapshot to still exist as the current incremental base"
+        );
     }
 
     #[test]

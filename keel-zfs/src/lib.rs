@@ -26,6 +26,11 @@ pub trait ZfsManager {
 
     fn snapshot(&self, dataset: &str, snapshot: &str) -> Result<(), ZfsError>;
 
+    /// Destroys `dataset@snapshot`. Used to prune the previous incremental
+    /// base once a new one has been confirmed, keeping exactly one snapshot
+    /// per replicated volume at steady state.
+    fn destroy_snapshot(&self, dataset: &str, snapshot: &str) -> Result<(), ZfsError>;
+
     /// Streams a `zfs send` (full if `base` is `None`, incremental `-i <base>`
     /// otherwise) of `dataset@snapshot` into `out`.
     fn send_snapshot(&self, dataset: &str, snapshot: &str, base: Option<&str>, out: &mut dyn Write) -> Result<(), ZfsError>;

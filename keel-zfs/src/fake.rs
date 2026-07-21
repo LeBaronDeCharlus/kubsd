@@ -70,6 +70,15 @@ impl ZfsManager for FakeZfsManager {
         Ok(())
     }
 
+    fn destroy_snapshot(&self, dataset: &str, snapshot: &str) -> Result<(), ZfsError> {
+        let key = format!("{dataset}@{snapshot}");
+        if self.snapshots.lock().unwrap().remove(&key) {
+            Ok(())
+        } else {
+            Err(ZfsError::NotFound(key))
+        }
+    }
+
     fn send_snapshot(&self, dataset: &str, snapshot: &str, base: Option<&str>, out: &mut dyn Write) -> Result<(), ZfsError> {
         let key = format!("{dataset}@{snapshot}");
         if !self.snapshots.lock().unwrap().contains(&key) {
@@ -295,6 +304,45 @@ mod tests {
             .receive_snapshot("zroot/keel/volumes/web-0-data", &mut incremental_stream.as_slice())
             .unwrap();
         assert!(target.dataset_exists("zroot/keel/volumes/web-0-data").unwrap());
+    }
+
+    #[test]
+    fn destroy_snapshot_removes_an_existing_snapshot() {
+        let zfs = FakeZfsManager::new();
+        zfs.seed_dataset("zroot/keel/volumes/web-data");
+        zfs.snapshot("zroot/keel/volumes/web-data", "keel-repl-1").unwrap();
+        zfs.destroy_snapshot("zroot/keel/volumes/web-data", "keel-repl-1").unwrap();
+
+        let mut out = Vec::new();
+        assert!(matches!(
+            zfs.send_snapshot("zroot/keel/volumes/web-data", "keel-repl-1", None, &mut out),
+            Err(ZfsError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn destroy_snapshot_then_send_using_it_as_a_base_fails() {
+        let zfs = FakeZfsManager::new();
+        zfs.seed_dataset("zroot/keel/volumes/web-data");
+        zfs.snapshot("zroot/keel/volumes/web-data", "keel-repl-1").unwrap();
+        zfs.snapshot("zroot/keel/volumes/web-data", "keel-repl-2").unwrap();
+        zfs.destroy_snapshot("zroot/keel/volumes/web-data", "keel-repl-1").unwrap();
+
+        let mut out = Vec::new();
+        assert!(matches!(
+            zfs.send_snapshot("zroot/keel/volumes/web-data", "keel-repl-2", Some("keel-repl-1"), &mut out),
+            Err(ZfsError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn destroy_snapshot_on_an_unknown_snapshot_returns_not_found() {
+        let zfs = FakeZfsManager::new();
+        zfs.seed_dataset("zroot/keel/volumes/web-data");
+        assert!(matches!(
+            zfs.destroy_snapshot("zroot/keel/volumes/web-data", "keel-repl-1"),
+            Err(ZfsError::NotFound(_))
+        ));
     }
 
     #[test]

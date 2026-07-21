@@ -112,6 +112,10 @@ impl ZfsManager for CliZfsManager {
         Self::run_checked(&["snapshot", &format!("{dataset}@{snapshot}")])
     }
 
+    fn destroy_snapshot(&self, dataset: &str, snapshot: &str) -> Result<(), ZfsError> {
+        Self::run_checked(&["destroy", &format!("{dataset}@{snapshot}")])
+    }
+
     fn send_snapshot(&self, dataset: &str, snapshot: &str, base: Option<&str>, out: &mut dyn Write) -> Result<(), ZfsError> {
         let target = format!("{dataset}@{snapshot}");
         let base_arg = base.map(|b| format!("{dataset}@{b}"));

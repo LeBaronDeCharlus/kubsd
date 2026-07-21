@@ -126,9 +126,17 @@ impl ReplicaTargetRegistry {
 /// One accepted connection's worth of work: read the header, decide
 /// proceed-vs-reject against the locally-known `last_snapshot`, and (if
 /// proceeding) stream the rest of the connection into `zfs receive`.
+///
+/// `header.replica_name` is the plain replica/jail name (e.g. "db-0"), the
+/// same name used throughout `Standbys`, `PendingFences`, `Placements`, and
+/// force-repin's own probe -- `ReplicaTargetRegistry` is keyed by it
+/// directly. The volume/dataset name is reconstructed from it here using
+/// the "one volume named `data` per stateful replica" convention already
+/// hardcoded in `worker.rs`'s `Command::Apply` handler.
 fn handle_connection<Z: ZfsManager>(mut stream: TcpStream, zfs: &Z, pool: &str, targets: &ReplicaTargetRegistry) -> io::Result<()> {
     let header = read_header(&mut stream)?;
-    let dataset = crate::record::volume_dataset_path(pool, &header.replica_name);
+    let volume_name = format!("{}-data", header.replica_name);
+    let dataset = crate::record::volume_dataset_path(pool, &volume_name);
     let peer_addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
     let target = targets
         .ensure(&header.replica_name, &dataset, &peer_addr)
@@ -196,8 +204,8 @@ mod tests {
         let dir = test_state_dir("first_contact_creates_a_replica_target_and_accepts_a_full_send");
         let targets = ReplicaTargetRegistry::load(dir).unwrap();
         let sender_zfs = FakeZfsManager::new();
-        sender_zfs.seed_dataset("zroot/keel/volumes/db-0");
-        sender_zfs.snapshot("zroot/keel/volumes/db-0", "keel-repl-1").unwrap();
+        sender_zfs.seed_dataset("zroot/keel/volumes/db-0-data");
+        sender_zfs.snapshot("zroot/keel/volumes/db-0-data", "keel-repl-1").unwrap();
         let receiver_zfs = FakeZfsManager::new();
 
         let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
@@ -213,11 +221,11 @@ mod tests {
         stream.read_exact(&mut ack).unwrap();
         assert_eq!(ack[0], ACK_PROCEED);
 
-        sender_zfs.send_snapshot("zroot/keel/volumes/db-0", "keel-repl-1", None, &mut stream).unwrap();
+        sender_zfs.send_snapshot("zroot/keel/volumes/db-0-data", "keel-repl-1", None, &mut stream).unwrap();
         stream.shutdown(std::net::Shutdown::Write).unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(100));
-        assert!(receiver_zfs.dataset_exists("zroot/keel/volumes/db-0").unwrap());
+        assert!(receiver_zfs.dataset_exists("zroot/keel/volumes/db-0-data").unwrap());
         let target = targets.get("db-0").expect("expected a ReplicaTarget to have been created on first contact");
         assert_eq!(target.last_snapshot, Some("keel-repl-1".to_string()));
     }
@@ -244,6 +252,6 @@ mod tests {
         assert_eq!(ack[0], ACK_NEED_FULL);
 
         std::thread::sleep(std::time::Duration::from_millis(100));
-        assert!(!receiver_zfs.dataset_exists("zroot/keel/volumes/db-0").unwrap());
+        assert!(!receiver_zfs.dataset_exists("zroot/keel/volumes/db-0-data").unwrap());
     }
 }

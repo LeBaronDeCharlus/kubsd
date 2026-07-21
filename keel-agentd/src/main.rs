@@ -104,6 +104,11 @@ fn main() {
     );
 
     let (_worker_handle, commands) = worker::spawn(reconciler, zfs.clone(), config.pool.clone());
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    commands
+        .send(Command::ResumeReplicationLoops(resume_tx))
+        .expect("worker command channel closed before startup completed");
+    resume_rx.recv().expect("worker dropped without replying to ResumeReplicationLoops");
     let pod_cidr_slot = keel_agentd::PodCidrSlot::new();
     let replica_targets = keel_agentd::ReplicaTargetRegistry::load(config.state_dir.clone())
         .expect("failed to load replica-target state");
