@@ -314,6 +314,8 @@ mod tests {
             Placements::new(),
             keel_controlplane::Services::new("10.0.250.0/24".parse().unwrap()),
             keel_controlplane::addresses::UsedAddresses::new(),
+            keel_controlplane::Standbys::new(),
+            keel_controlplane::PendingFences::new(),
         );
         let reloading_tls = keel_controlplane::tls::ReloadingTls::spawn(
             fixture("fixture-node.crt"),

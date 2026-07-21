@@ -617,6 +617,8 @@ mod tests {
             Placements::new(),
             crate::services::Services::new("10.0.250.0/24".parse().unwrap()),
             crate::addresses::UsedAddresses::new(),
+            crate::standbys::Standbys::new(),
+            crate::pending_fences::PendingFences::new(),
         );
         let reloading_tls = tls::ReloadingTls::spawn(
             fixture("fixture-node.crt"),
@@ -1208,6 +1210,8 @@ mod tests {
             Placements::new(),
             crate::services::Services::new("10.0.250.0/24".parse().unwrap()),
             crate::addresses::UsedAddresses::new(),
+            crate::standbys::Standbys::new(),
+            crate::pending_fences::PendingFences::new(),
         );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -1446,6 +1450,8 @@ mod tests {
             Placements::new(),
             crate::services::Services::new("10.0.250.0/24".parse().unwrap()),
             crate::addresses::UsedAddresses::new(),
+            crate::standbys::Standbys::new(),
+            crate::pending_fences::PendingFences::new(),
         );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();

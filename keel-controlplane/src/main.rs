@@ -97,6 +97,8 @@ fn main() {
         Placements::new(),
         keel_controlplane::Services::new(service_cidr),
         keel_controlplane::addresses::UsedAddresses::new(),
+        keel_controlplane::Standbys::new(),
+        keel_controlplane::PendingFences::new(),
     );
 
     let listener = TcpListener::bind(&config.addr).expect("failed to bind TCP listener");
