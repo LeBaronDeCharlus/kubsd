@@ -43,6 +43,7 @@ pub(crate) fn diff_routes(
 pub fn spawn(
     node_id: String,
     advertise_addr: String,
+    replicate_addr: String,
     control_plane_addr: String,
     heartbeat_interval: Duration,
     capacity_cpu: f64,
@@ -58,7 +59,7 @@ pub fn spawn(
         loop {
             let client_config = reloading_tls.client_config();
             if !registered {
-                match register_once(&control_plane_addr, &node_id, &advertise_addr, capacity_cpu, capacity_memory, &client_config) {
+                match register_once(&control_plane_addr, &node_id, &advertise_addr, &replicate_addr, capacity_cpu, capacity_memory, &client_config) {
                     Ok(pod_cidr) => {
                         pod_cidr_slot.set(pod_cidr);
                         registered = true;
@@ -89,12 +90,13 @@ fn register_once(
     control_plane_addr: &str,
     node_id: &str,
     advertise_addr: &str,
+    replicate_addr: &str,
     capacity_cpu: f64,
     capacity_memory: u64,
     client_config: &Arc<rustls::ClientConfig>,
 ) -> Result<ipnet::Ipv4Net, String> {
     let body = format!(
-        "id: {node_id}\naddr: {advertise_addr}\ncapacity_cpu: {capacity_cpu}\ncapacity_memory: {capacity_memory}\n"
+        "id: {node_id}\naddr: {advertise_addr}\nreplicate_addr: {replicate_addr}\ncapacity_cpu: {capacity_cpu}\ncapacity_memory: {capacity_memory}\n"
     );
     let response_body = send_request(control_plane_addr, "POST", "/nodes/register", &body, client_config)?;
     let response: keel_controlplane::wire::RegisterResponse = serde_yaml::from_slice(&response_body)
@@ -457,6 +459,7 @@ mod tests {
         let _handle = spawn(
             "node-1".to_string(),
             "10.0.0.1".to_string(),
+            "10.0.0.9:7622".to_string(),
             control_plane_addr.clone(),
             Duration::from_millis(50),
             4.0,
@@ -519,6 +522,7 @@ mod tests {
         let _handle = spawn(
             "node-1".to_string(),
             "10.0.0.1".to_string(),
+            "10.0.0.9:7622".to_string(),
             control_plane_addr_clone,
             Duration::from_millis(50),
             4.0,
@@ -573,6 +577,7 @@ mod tests {
         let _handle = spawn(
             "node-1".to_string(),
             "127.0.0.1:1".to_string(),
+            "10.0.0.9:7622".to_string(),
             control_plane_addr.clone(),
             Duration::from_millis(50),
             4.0,
@@ -636,6 +641,7 @@ mod tests {
         let _handle = spawn(
             "node-1".to_string(),
             "10.0.0.1".to_string(),
+            "10.0.0.9:7622".to_string(),
             control_plane_addr.clone(),
             Duration::from_millis(50),
             4.0,
@@ -671,6 +677,7 @@ mod tests {
         let _handle = spawn(
             "node-1".to_string(),
             "10.0.0.1".to_string(),
+            "10.0.0.9:7622".to_string(),
             control_plane_addr,
             Duration::from_millis(50),
             4.0,
@@ -752,6 +759,7 @@ mod tests {
         let _handle = spawn(
             "node-1".to_string(),
             "10.0.0.1:7621".to_string(),
+            "10.0.0.9:7622".to_string(),
             control_plane_addr,
             Duration::from_millis(50),
             4.0,
@@ -816,6 +824,7 @@ mod tests {
         let _handle = spawn(
             "node-1".to_string(),
             "10.0.0.1:7621".to_string(),
+            "10.0.0.9:7622".to_string(),
             control_plane_addr,
             Duration::from_millis(500),
             4.0,

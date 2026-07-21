@@ -117,6 +117,7 @@ fn start_test_control_plane_with_node(node_id: &str, node_addr: &str) -> String 
         .send(keel_controlplane::worker::Command::Register(
             node_id.to_string(),
             node_addr.to_string(),
+            None,
             4.0,
             8 * 1024 * 1024 * 1024,
             reg_tx,

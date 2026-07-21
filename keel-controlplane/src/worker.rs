@@ -48,7 +48,7 @@ pub enum ReplicaAction {
 }
 
 pub enum Command {
-    Register(String, String, f64, u64, Sender<Result<ipnet::Ipv4Net, PodCidrCollision>>),
+    Register(String, String, Option<String>, f64, u64, Sender<Result<ipnet::Ipv4Net, PodCidrCollision>>),
     Heartbeat(String, f64, u64, Vec<crate::wire::JailHealth>, Sender<Result<(), UnknownNode>>),
     List(Sender<Vec<NodeStatus>>),
     Resolve(String, Sender<Result<String, ResolveError>>),
@@ -135,8 +135,8 @@ fn handle_command(
     command: Command,
 ) {
     match command {
-        Command::Register(id, addr, capacity_cpu, capacity_memory, reply) => {
-            let result = registry.register(id, addr, capacity_cpu, capacity_memory, Instant::now());
+        Command::Register(id, addr, replicate_addr, capacity_cpu, capacity_memory, reply) => {
+            let result = registry.register(id, addr, replicate_addr, capacity_cpu, capacity_memory, Instant::now());
             let _ = reply.send(result);
         }
         Command::Heartbeat(id, committed_cpu, committed_memory, jails, reply) => {
@@ -294,7 +294,7 @@ fn handle_command(
                         services::pick_node_for_service(alive_nodes.clone(), &busy)
                             .ok()
                             .filter(|standby_id| standby_id != &node_id)
-                            .and_then(|standby_id| registry.resolve(&standby_id, now).ok().map(|addr| (standby_id, addr)))
+                            .and_then(|standby_id| registry.replicate_addr(&standby_id).map(|addr| (standby_id, addr)))
                             .map(|(id, addr)| (Some(id), Some(addr)))
                             .unwrap_or((None, None))
                     };
@@ -463,6 +463,7 @@ mod tests {
             .send(Command::Register(
                 "node-1".to_string(),
                 "10.0.0.1".to_string(),
+                None,
                 4.0,
                 8 * 1024 * 1024 * 1024,
                 reg_tx,
@@ -495,6 +496,7 @@ mod tests {
             .send(Command::Register(
                 "node-1".to_string(),
                 "10.0.0.1".to_string(),
+                None,
                 4.0,
                 8 * 1024 * 1024 * 1024,
                 reg_tx,
@@ -570,6 +572,7 @@ mod tests {
             .send(Command::Register(
                 "node-1".to_string(),
                 "10.0.0.1".to_string(),
+                None,
                 4.0,
                 8 * 1024 * 1024 * 1024,
                 reg_tx,
@@ -594,7 +597,15 @@ mod tests {
     fn register_node(commands: &Sender<Command>, id: &str, addr: &str, capacity_cpu: f64, capacity_memory: u64) {
         let (reg_tx, reg_rx) = mpsc::channel();
         commands
-            .send(Command::Register(id.to_string(), addr.to_string(), capacity_cpu, capacity_memory, reg_tx))
+            .send(Command::Register(id.to_string(), addr.to_string(), None, capacity_cpu, capacity_memory, reg_tx))
+            .unwrap();
+        reg_rx.recv().unwrap().unwrap();
+    }
+
+    fn register_node_with_replicate_addr(commands: &Sender<Command>, id: &str, addr: &str, replicate_addr: &str, capacity_cpu: f64, capacity_memory: u64) {
+        let (reg_tx, reg_rx) = mpsc::channel();
+        commands
+            .send(Command::Register(id.to_string(), addr.to_string(), Some(replicate_addr.to_string()), capacity_cpu, capacity_memory, reg_tx))
             .unwrap();
         reg_rx.recv().unwrap().unwrap();
     }
@@ -1136,8 +1147,8 @@ mod tests {
             PendingFences::new(),
         )
         .1;
-        register_node(&commands, "node-1", "10.0.0.1", 4.0, 8 * 1024 * 1024 * 1024);
-        register_node(&commands, "node-2", "10.0.0.2", 4.0, 8 * 1024 * 1024 * 1024);
+        register_node_with_replicate_addr(&commands, "node-1", "10.0.0.1", "10.0.0.1:7622", 4.0, 8 * 1024 * 1024 * 1024);
+        register_node_with_replicate_addr(&commands, "node-2", "10.0.0.2", "10.0.0.2:7622", 4.0, 8 * 1024 * 1024 * 1024);
         apply_service_with_template(&commands, "db", 1, stateful_template());
 
         let actions = reconcile(&commands);
@@ -1146,7 +1157,7 @@ mod tests {
             ReplicaAction::Schedule { node_id, standby_node_id, standby_addr, .. } => {
                 let standby = standby_node_id.as_ref().expect("expected a standby to be picked for a stateful replica");
                 assert_ne!(standby, node_id, "standby must be a different node than the primary");
-                assert!(standby_addr.is_some());
+                assert_eq!(*standby_addr, Some("10.0.0.2:7622".to_string()), "expected the standby's advertised replicate_addr, not its HTTP addr");
             }
             other => panic!("expected a Schedule action, got: {other:?}"),
         }

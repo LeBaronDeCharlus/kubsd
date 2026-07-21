@@ -452,6 +452,7 @@ fn handle_register(body: &[u8], commands: &Sender<Command>) -> (u16, Vec<u8>) {
         .send(Command::Register(
             registration.id,
             registration.addr,
+            registration.replicate_addr,
             registration.capacity_cpu,
             registration.capacity_memory,
             reply_tx,

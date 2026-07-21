@@ -17,6 +17,7 @@ struct Config {
     node_id: Option<String>,
     control_plane_addr: Option<String>,
     advertise_addr: Option<String>,
+    replicate_addr: Option<String>,
     tls_ca_file: Option<PathBuf>,
     tls_cert_file: Option<PathBuf>,
     tls_key_file: Option<PathBuf>,
@@ -32,6 +33,7 @@ impl Default for Config {
             node_id: None,
             control_plane_addr: None,
             advertise_addr: None,
+            replicate_addr: None,
             tls_ca_file: None,
             tls_cert_file: None,
             tls_key_file: None,
@@ -56,6 +58,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Config {
             "--node-id" => config.node_id = Some(value),
             "--control-plane-addr" => config.control_plane_addr = Some(value),
             "--advertise-addr" => config.advertise_addr = Some(value),
+            "--replicate-addr" => config.replicate_addr = Some(value),
             "--tls-ca-file" => config.tls_ca_file = Some(PathBuf::from(value)),
             "--tls-cert-file" => config.tls_cert_file = Some(PathBuf::from(value)),
             "--tls-key-file" => config.tls_key_file = Some(PathBuf::from(value)),
@@ -66,13 +69,14 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Config {
     if config.control_plane_addr.is_some()
         && (config.node_id.is_none()
             || config.advertise_addr.is_none()
+            || config.replicate_addr.is_none()
             || config.tls_ca_file.is_none()
             || config.tls_cert_file.is_none()
             || config.tls_key_file.is_none()
             || config.tls_crl_file.is_none())
     {
         panic!(
-            "--node-id, --advertise-addr, --tls-ca-file, --tls-cert-file, --tls-key-file, and --tls-crl-file are all required when --control-plane-addr is set"
+            "--node-id, --advertise-addr, --replicate-addr, --tls-ca-file, --tls-cert-file, --tls-key-file, and --tls-crl-file are all required when --control-plane-addr is set"
         );
     }
     config
@@ -99,7 +103,7 @@ fn main() {
         config.socket.display()
     );
 
-    let (_worker_handle, commands) = worker::spawn(reconciler, zfs, config.pool.clone());
+    let (_worker_handle, commands) = worker::spawn(reconciler, zfs.clone(), config.pool.clone());
     let pod_cidr_slot = keel_agentd::PodCidrSlot::new();
     let replica_targets = keel_agentd::ReplicaTargetRegistry::load(config.state_dir.clone())
         .expect("failed to load replica-target state");
@@ -108,6 +112,7 @@ fn main() {
         Some(node_id),
         Some(control_plane_addr),
         Some(advertise_addr),
+        Some(replicate_addr),
         Some(ca_file),
         Some(cert_file),
         Some(key_file),
@@ -116,6 +121,7 @@ fn main() {
         config.node_id.clone(),
         config.control_plane_addr.clone(),
         config.advertise_addr.clone(),
+        config.replicate_addr.clone(),
         config.tls_ca_file.clone(),
         config.tls_cert_file.clone(),
         config.tls_key_file.clone(),
@@ -137,6 +143,7 @@ fn main() {
         keel_agentd::registration::spawn(
             node_id,
             advertise_addr.clone(),
+            replicate_addr.clone(),
             control_plane_addr,
             Duration::from_secs(5),
             capacity_cpu,
@@ -155,6 +162,14 @@ fn main() {
         thread::spawn(move || {
             keel_agentd::http::run_tls(tcp_listener, tcp_commands, reloading_tls, tcp_pod_cidr_slot, tcp_replica_targets)
         });
+
+        eprintln!("keel-agentd: serving replication listener on {replicate_addr}");
+        let replicate_listener = TcpListener::bind(&replicate_addr)
+            .unwrap_or_else(|e| panic!("failed to bind replication TCP listener on {replicate_addr}: {e}"));
+        let replicate_zfs = zfs.clone();
+        let replicate_pool = config.pool.clone();
+        let replicate_targets = replica_targets.clone();
+        thread::spawn(move || keel_agentd::replication::run(replicate_listener, replicate_zfs, replicate_pool, replicate_targets));
     }
 
     let timer_commands = commands.clone();
@@ -189,6 +204,7 @@ mod tests {
         assert_eq!(config.node_id, None);
         assert_eq!(config.control_plane_addr, None);
         assert_eq!(config.advertise_addr, None);
+        assert_eq!(config.replicate_addr, None);
         assert_eq!(config.tls_ca_file, None);
         assert_eq!(config.tls_cert_file, None);
         assert_eq!(config.tls_key_file, None);
@@ -196,11 +212,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_all_seven_control_plane_flags() {
+    fn parses_all_eight_control_plane_flags() {
         let config = parse_args_from(args(&[
             "--node-id", "node-2",
             "--control-plane-addr", "192.168.64.2:7620",
             "--advertise-addr", "192.168.64.2",
+            "--replicate-addr", "192.168.64.2:7622",
             "--tls-ca-file", "/etc/keel/ca.crt",
             "--tls-cert-file", "/etc/keel/node-2.crt",
             "--tls-key-file", "/etc/keel/node-2.key",
@@ -209,6 +226,7 @@ mod tests {
         assert_eq!(config.node_id, Some("node-2".to_string()));
         assert_eq!(config.control_plane_addr, Some("192.168.64.2:7620".to_string()));
         assert_eq!(config.advertise_addr, Some("192.168.64.2".to_string()));
+        assert_eq!(config.replicate_addr, Some("192.168.64.2:7622".to_string()));
         assert_eq!(config.tls_ca_file, Some(PathBuf::from("/etc/keel/ca.crt")));
         assert_eq!(config.tls_cert_file, Some(PathBuf::from("/etc/keel/node-2.crt")));
         assert_eq!(config.tls_key_file, Some(PathBuf::from("/etc/keel/node-2.key")));
@@ -216,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "--node-id, --advertise-addr, --tls-ca-file, --tls-cert-file, --tls-key-file, and --tls-crl-file are all required when --control-plane-addr is set")]
+    #[should_panic(expected = "--node-id, --advertise-addr, --replicate-addr, --tls-ca-file, --tls-cert-file, --tls-key-file, and --tls-crl-file are all required when --control-plane-addr is set")]
     fn control_plane_addr_without_node_id_panics() {
         parse_args_from(args(&[
             "--control-plane-addr", "192.168.64.2:7620",
@@ -229,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "--node-id, --advertise-addr, --tls-ca-file, --tls-cert-file, --tls-key-file, and --tls-crl-file are all required when --control-plane-addr is set")]
+    #[should_panic(expected = "--node-id, --advertise-addr, --replicate-addr, --tls-ca-file, --tls-cert-file, --tls-key-file, and --tls-crl-file are all required when --control-plane-addr is set")]
     fn control_plane_addr_without_advertise_addr_panics() {
         parse_args_from(args(&[
             "--control-plane-addr", "192.168.64.2:7620",
@@ -242,12 +260,27 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "--node-id, --advertise-addr, --tls-ca-file, --tls-cert-file, --tls-key-file, and --tls-crl-file are all required when --control-plane-addr is set")]
+    #[should_panic(expected = "--node-id, --advertise-addr, --replicate-addr, --tls-ca-file, --tls-cert-file, --tls-key-file, and --tls-crl-file are all required when --control-plane-addr is set")]
+    fn control_plane_addr_without_replicate_addr_panics() {
+        parse_args_from(args(&[
+            "--control-plane-addr", "192.168.64.2:7620",
+            "--node-id", "node-2",
+            "--advertise-addr", "192.168.64.2",
+            "--tls-ca-file", "/etc/keel/ca.crt",
+            "--tls-cert-file", "/etc/keel/node-2.crt",
+            "--tls-key-file", "/etc/keel/node-2.key",
+            "--tls-crl-file", "/etc/keel/crl.pem",
+        ]));
+    }
+
+    #[test]
+    #[should_panic(expected = "--node-id, --advertise-addr, --replicate-addr, --tls-ca-file, --tls-cert-file, --tls-key-file, and --tls-crl-file are all required when --control-plane-addr is set")]
     fn control_plane_addr_without_tls_crl_file_panics() {
         parse_args_from(args(&[
             "--control-plane-addr", "192.168.64.2:7620",
             "--node-id", "node-2",
             "--advertise-addr", "192.168.64.2",
+            "--replicate-addr", "192.168.64.2:7622",
             "--tls-ca-file", "/etc/keel/ca.crt",
             "--tls-cert-file", "/etc/keel/node-2.crt",
             "--tls-key-file", "/etc/keel/node-2.key",
