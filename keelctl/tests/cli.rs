@@ -422,3 +422,11 @@ fn get_lists_multiple_applied_jails() {
     assert!(stdout.contains("web-1"));
     assert!(stdout.contains("web-2"));
 }
+
+#[test]
+fn force_repin_on_an_unplaced_name_prints_the_control_planes_404_message() {
+    let control_plane_addr = start_test_control_plane_with_node("node-1", "10.0.0.1:7621");
+    let (ok, _stdout, stderr) = run_keelctl_scheduled(&control_plane_addr, &["force-repin", "db-0"]);
+    assert!(!ok, "expected force-repin on an unplaced name to fail");
+    assert!(stderr.contains("no known placement"), "got stderr: {stderr}");
+}

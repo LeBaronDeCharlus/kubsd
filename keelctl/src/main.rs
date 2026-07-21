@@ -54,9 +54,10 @@ fn main() -> ExitCode {
         Some((cmd, rest)) if cmd == "get" => run_get(&target, rest),
         Some((cmd, rest)) if cmd == "delete" => run_delete(&target, rest),
         Some((cmd, rest)) if cmd == "delete-volume" => run_delete_volume(&target, rest),
+        Some((cmd, rest)) if cmd == "force-repin" => run_force_repin(&target, rest),
         _ => {
             eprintln!(
-                "usage: keelctl <apply -f FILE|get [name]|delete NAME|delete-volume NAME> [--socket PATH|--control-plane-addr ADDR --node ID]"
+                "usage: keelctl <apply -f FILE|get [name]|delete NAME|delete-volume NAME|force-repin NAME> [--socket PATH|--control-plane-addr ADDR --node ID]"
             );
             return ExitCode::FAILURE;
         }
@@ -174,6 +175,12 @@ fn run_delete_volume(target: &Target, args: &[String]) -> Result<String, String>
     let name = args.first().ok_or("delete-volume requires a volume name")?;
     let path = jails_path(target, &format!("/volumes/{name}"));
     success_body(dispatch(target, "DELETE", &path, "")).map(|_| String::new())
+}
+
+fn run_force_repin(target: &Target, args: &[String]) -> Result<String, String> {
+    let name = args.first().ok_or("force-repin requires a replica name")?;
+    let path = jails_path(target, &format!("/replicas/{name}/force-repin"));
+    success_body(dispatch(target, "POST", &path, "")).map(|_| String::new())
 }
 
 /// Tries `/jails/<name>` first; on a `404`, retries against
