@@ -377,6 +377,50 @@ fn reconcile_and_execute(commands: &Sender<Command>, client_config: &Arc<rustls:
     }
 }
 
+/// Checked on every successful heartbeat, right alongside
+/// `reconcile_and_execute` -- if the heartbeating node id is owed a forced
+/// delete for any replica (per `PendingFences`), forwards it inline. On
+/// success or 404 (already gone -- e.g. an operator cleaned it up first)
+/// the fence is cleared; on any other outcome it's left in place so the
+/// next heartbeat from this node retries it. Unlike `reconcile_and_execute`
+/// (which has no node context and also runs from the service-apply path),
+/// this needs the specific heartbeating node's id, so it's called directly
+/// from `handle_heartbeat` rather than folded into that shared function.
+fn check_and_execute_fencing(node_id: &str, commands: &Sender<Command>, client_config: &Arc<rustls::ClientConfig>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::PendingFencesForNode(node_id.to_string(), reply_tx)).is_err() {
+        return;
+    }
+    let Ok(replica_names) = reply_rx.recv() else { return };
+    if replica_names.is_empty() {
+        return;
+    }
+    let (resolve_tx, resolve_rx) = mpsc::channel();
+    if commands.send(Command::Resolve(node_id.to_string(), resolve_tx)).is_err() {
+        return;
+    }
+    let Ok(Ok(addr)) = resolve_rx.recv() else { return };
+    for replica_name in replica_names {
+        match forward(&addr, "DELETE", &format!("/jails/{replica_name}"), &[], client_config) {
+            Ok((status, _)) if (200..300).contains(&status) || status == 404 => {
+                send_remove_pending_fence(&replica_name, commands);
+            }
+            Ok((status, body)) => eprintln!(
+                "keel-controlplane: forced delete of fenced jail '{replica_name}' on node '{node_id}' failed: status {status}, body {:?}",
+                String::from_utf8_lossy(&body)
+            ),
+            Err(e) => eprintln!("keel-controlplane: failed to reach node '{node_id}' at {addr} while fencing '{replica_name}': {e}"),
+        }
+    }
+}
+
+fn send_remove_pending_fence(replica_name: &str, commands: &Sender<Command>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::RemovePendingFence(replica_name.to_string(), reply_tx)).is_ok() {
+        let _ = reply_rx.recv();
+    }
+}
+
 fn execute_replica_actions(actions: Vec<ReplicaAction>, commands: &Sender<Command>, client_config: &Arc<rustls::ClientConfig>) {
     for action in actions {
         match action {
@@ -483,6 +527,7 @@ fn handle_heartbeat(id: &str, body: &[u8], commands: &Sender<Command>, client_co
     match reply_rx.recv() {
         Ok(Ok(())) => {
             reconcile_and_execute(commands, client_config);
+            check_and_execute_fencing(id, commands, client_config);
             let (entries_tx, entries_rx) = mpsc::channel();
             if commands.send(Command::ListServiceProxyEntries(entries_tx)).is_err() {
                 return error_response(500, "control plane worker is not running".to_string());
@@ -1508,5 +1553,89 @@ mod tests {
 
         let (status, _) = send_request(&addr, "GET", "/nodes", "");
         assert_eq!(status, 200, "expected the last-known-good certificate to keep being served after a malformed reload");
+    }
+
+    fn start_test_server_with_commands() -> (String, Sender<Command>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (_worker_handle, commands) = worker::spawn(
+            Registry::new("10.0.0.0/16".parse().unwrap()),
+            Placements::new(),
+            crate::services::Services::new("10.0.250.0/24".parse().unwrap()),
+            crate::addresses::UsedAddresses::new(),
+            crate::standbys::Standbys::new(),
+            crate::pending_fences::PendingFences::new(),
+        );
+        let reloading_tls = tls::ReloadingTls::spawn(
+            fixture("fixture-node.crt"),
+            fixture("fixture-node.key"),
+            fixture("ca.crt"),
+            fixture("crl.pem"),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let commands_for_server = commands.clone();
+        thread::spawn(move || run(listener, commands_for_server, reloading_tls));
+        (addr, commands)
+    }
+
+    fn record_pending_fence(commands: &Sender<Command>, replica_name: &str, node_id: &str) {
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::RecordPendingFence(replica_name.to_string(), node_id.to_string(), tx)).unwrap();
+        rx.recv().unwrap();
+    }
+
+    #[test]
+    fn a_heartbeat_from_a_node_owed_a_fence_triggers_a_forced_delete() {
+        let (cp_addr, commands) = start_test_server_with_commands();
+        let node_addr = start_fake_remote_tls_agentd(200, "");
+        register_node(&cp_addr, "node-a", &node_addr);
+        record_pending_fence(&commands, "db-0", "node-a");
+
+        let (status, _) = send_request(&cp_addr, "POST", "/nodes/node-a/heartbeat", "committed_cpu: 0\ncommitted_memory: 0\n");
+        assert_eq!(status, 200);
+
+        // The forced DELETE is fire-and-forget from the heartbeat response's
+        // point of view -- give it a moment, then confirm the fence was
+        // cleared (the fake remote agentd above answers every request with
+        // 200, so the forced delete "succeeds" and PendingFencesForNode
+        // should come back empty on the next check).
+        std::thread::sleep(Duration::from_millis(100));
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::PendingFencesForNode("node-a".to_string(), tx)).unwrap();
+        assert_eq!(rx.recv().unwrap(), Vec::<String>::new(), "expected the fence to have been cleared after a successful forced delete");
+    }
+
+    #[test]
+    fn a_heartbeat_from_an_unrelated_node_leaves_pending_fences_untouched() {
+        let (cp_addr, commands) = start_test_server_with_commands();
+        let node_a = start_fake_remote_tls_agentd(200, "");
+        let node_b = start_fake_remote_tls_agentd(200, "");
+        register_node(&cp_addr, "node-a", &node_a);
+        register_node(&cp_addr, "node-b", &node_b);
+        record_pending_fence(&commands, "db-0", "node-a");
+
+        send_request(&cp_addr, "POST", "/nodes/node-b/heartbeat", "committed_cpu: 0\ncommitted_memory: 0\n");
+
+        std::thread::sleep(Duration::from_millis(100));
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::PendingFencesForNode("node-a".to_string(), tx)).unwrap();
+        assert_eq!(rx.recv().unwrap(), vec!["db-0".to_string()], "expected node-a's fence to remain, untouched by node-b's heartbeat");
+    }
+
+    #[test]
+    fn a_failed_forced_delete_leaves_the_fence_in_place_for_the_next_heartbeat() {
+        let (cp_addr, commands) = start_test_server_with_commands();
+        // 500 from the fake remote agentd simulates the forced DELETE failing.
+        let node_addr = start_fake_remote_tls_agentd(500, "boom");
+        register_node(&cp_addr, "node-a", &node_addr);
+        record_pending_fence(&commands, "db-0", "node-a");
+
+        send_request(&cp_addr, "POST", "/nodes/node-a/heartbeat", "committed_cpu: 0\ncommitted_memory: 0\n");
+
+        std::thread::sleep(Duration::from_millis(100));
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::PendingFencesForNode("node-a".to_string(), tx)).unwrap();
+        assert_eq!(rx.recv().unwrap(), vec!["db-0".to_string()], "expected the fence to remain after a failed forced delete");
     }
 }
