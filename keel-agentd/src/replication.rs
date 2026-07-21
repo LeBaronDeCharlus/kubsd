@@ -78,23 +78,34 @@ impl ReplicaTargetRegistry {
     /// as given, `last_snapshot: None`) or refreshes `source_node_addr` on an
     /// existing one, without touching its `last_snapshot`. Persists to disk.
     fn ensure(&self, replica_name: &str, volume_dataset: &str, source_node_addr: &str) -> Result<ReplicaTarget, crate::store::StoreError> {
-        let mut guard = self.by_name.lock().unwrap();
-        let target = guard.entry(replica_name.to_string()).or_insert_with(|| ReplicaTarget {
-            replica_name: replica_name.to_string(),
-            volume_dataset: volume_dataset.to_string(),
-            source_node_addr: source_node_addr.to_string(),
-            last_snapshot: None,
-        });
-        target.source_node_addr = source_node_addr.to_string();
-        replica_target_store::save(&self.state_dir, target)?;
-        Ok(target.clone())
+        let target = {
+            let mut guard = self.by_name.lock().unwrap();
+            let target = guard.entry(replica_name.to_string()).or_insert_with(|| ReplicaTarget {
+                replica_name: replica_name.to_string(),
+                volume_dataset: volume_dataset.to_string(),
+                source_node_addr: source_node_addr.to_string(),
+                last_snapshot: None,
+            });
+            target.source_node_addr = source_node_addr.to_string();
+            target.clone()
+        };
+        replica_target_store::save(&self.state_dir, &target)?;
+        Ok(target)
     }
 
     fn record_snapshot(&self, replica_name: &str, snapshot_id: &str) -> Result<(), crate::store::StoreError> {
-        let mut guard = self.by_name.lock().unwrap();
-        if let Some(target) = guard.get_mut(replica_name) {
-            target.last_snapshot = Some(snapshot_id.to_string());
-            replica_target_store::save(&self.state_dir, target)?;
+        let target = {
+            let mut guard = self.by_name.lock().unwrap();
+            match guard.get_mut(replica_name) {
+                Some(target) => {
+                    target.last_snapshot = Some(snapshot_id.to_string());
+                    Some(target.clone())
+                }
+                None => None,
+            }
+        };
+        if let Some(target) = target {
+            replica_target_store::save(&self.state_dir, &target)?;
         }
         Ok(())
     }
