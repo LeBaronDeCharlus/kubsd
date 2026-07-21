@@ -37,6 +37,8 @@ pub enum ReplicaAction {
         template: keel_spec::JailTemplate,
         address: std::net::Ipv4Addr,
         prefix_len: u8,
+        standby_node_id: Option<String>,
+        standby_addr: Option<String>,
     },
     TearDown {
         replica_name: String,
@@ -285,6 +287,18 @@ fn handle_command(
                     let Ok(node_addr) = registry.resolve(&node_id, now) else { continue };
                     working_used.record(replica_name.clone(), node_id.clone(), address);
                     busy.insert(node_id.clone());
+
+                    let (standby_node_id, standby_addr) = if record.template.volumes.is_empty() {
+                        (None, None)
+                    } else {
+                        services::pick_node_for_service(alive_nodes.clone(), &busy)
+                            .ok()
+                            .filter(|standby_id| standby_id != &node_id)
+                            .and_then(|standby_id| registry.resolve(&standby_id, now).ok().map(|addr| (standby_id, addr)))
+                            .map(|(id, addr)| (Some(id), Some(addr)))
+                            .unwrap_or((None, None))
+                    };
+
                     actions.push(ReplicaAction::Schedule {
                         replica_name,
                         node_id,
@@ -292,6 +306,8 @@ fn handle_command(
                         template: record.template.clone(),
                         address,
                         prefix_len: pod_cidr.prefix_len(),
+                        standby_node_id,
+                        standby_addr,
                     });
                 }
 
@@ -1107,5 +1123,81 @@ mod tests {
         let (dtx2, drx2) = mpsc::channel();
         commands.send(Command::DiscoverService("web".to_string(), dtx2)).unwrap();
         assert_eq!(drx2.recv().unwrap().unwrap(), vec![], "a fully torn-down replica is no longer discoverable");
+    }
+
+    #[test]
+    fn reconcile_services_picks_a_distinct_standby_for_a_new_stateful_replica() {
+        let commands = spawn(
+            Registry::new(test_cluster_cidr()),
+            Placements::new(),
+            Services::new(test_service_cidr()),
+            UsedAddresses::new(),
+            Standbys::new(),
+            PendingFences::new(),
+        )
+        .1;
+        register_node(&commands, "node-1", "10.0.0.1", 4.0, 8 * 1024 * 1024 * 1024);
+        register_node(&commands, "node-2", "10.0.0.2", 4.0, 8 * 1024 * 1024 * 1024);
+        apply_service_with_template(&commands, "db", 1, stateful_template());
+
+        let actions = reconcile(&commands);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            ReplicaAction::Schedule { node_id, standby_node_id, standby_addr, .. } => {
+                let standby = standby_node_id.as_ref().expect("expected a standby to be picked for a stateful replica");
+                assert_ne!(standby, node_id, "standby must be a different node than the primary");
+                assert!(standby_addr.is_some());
+            }
+            other => panic!("expected a Schedule action, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_services_picks_no_standby_for_a_stateless_replica() {
+        let commands = spawn(
+            Registry::new(test_cluster_cidr()),
+            Placements::new(),
+            Services::new(test_service_cidr()),
+            UsedAddresses::new(),
+            Standbys::new(),
+            PendingFences::new(),
+        )
+        .1;
+        register_node(&commands, "node-1", "10.0.0.1", 4.0, 8 * 1024 * 1024 * 1024);
+        register_node(&commands, "node-2", "10.0.0.2", 4.0, 8 * 1024 * 1024 * 1024);
+        apply_service(&commands, "web", 1);
+
+        let actions = reconcile(&commands);
+        match &actions[0] {
+            ReplicaAction::Schedule { standby_node_id, standby_addr, .. } => {
+                assert_eq!(*standby_node_id, None);
+                assert_eq!(*standby_addr, None);
+            }
+            other => panic!("expected a Schedule action, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconcile_services_leaves_a_stateful_replica_without_a_standby_when_only_one_node_is_alive() {
+        let commands = spawn(
+            Registry::new(test_cluster_cidr()),
+            Placements::new(),
+            Services::new(test_service_cidr()),
+            UsedAddresses::new(),
+            Standbys::new(),
+            PendingFences::new(),
+        )
+        .1;
+        register_node(&commands, "node-1", "10.0.0.1", 4.0, 8 * 1024 * 1024 * 1024);
+        apply_service_with_template(&commands, "db", 1, stateful_template());
+
+        let actions = reconcile(&commands);
+        match &actions[0] {
+            ReplicaAction::Schedule { standby_node_id, standby_addr, .. } => {
+                assert_eq!(*standby_node_id, None, "no second node exists to serve as a standby");
+                assert_eq!(*standby_addr, None);
+            }
+            other => panic!("expected a Schedule action, got: {other:?}"),
+        }
     }
 }
