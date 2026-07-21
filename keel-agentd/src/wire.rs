@@ -24,6 +24,12 @@ pub struct VolumeStatus {
     pub name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplicaTargetStatus {
+    pub replica_name: String,
+    pub ready: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,6 +91,14 @@ mod tests {
         let status = VolumeStatus { name: "web-data".to_string() };
         let yaml = serde_yaml::to_string(&status).unwrap();
         let parsed: VolumeStatus = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed, status);
+    }
+
+    #[test]
+    fn replica_target_status_round_trips_through_yaml() {
+        let status = ReplicaTargetStatus { replica_name: "db-0".to_string(), ready: true };
+        let yaml = serde_yaml::to_string(&status).unwrap();
+        let parsed: ReplicaTargetStatus = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed, status);
     }
 }

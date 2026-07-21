@@ -17,6 +17,7 @@ fn start_test_server(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&state_dir);
     let zfs = FakeZfsManager::new();
     zfs.seed_dataset("zroot/keel/base/14.2-web");
+    let replica_targets = keel_agentd::ReplicaTargetRegistry::load(state_dir.clone()).unwrap();
     let reconciler = Reconciler::new(
         FakeJailRuntime::new(),
         zfs,
@@ -34,7 +35,7 @@ fn start_test_server(name: &str) -> PathBuf {
     let socket_path = short_unique_socket_path();
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path).unwrap();
-    thread::spawn(move || keel_agentd::http::run(listener, commands, keel_agentd::PodCidrSlot::new()));
+    thread::spawn(move || keel_agentd::http::run(listener, commands, keel_agentd::PodCidrSlot::new(), replica_targets));
     socket_path
 }
 
@@ -73,6 +74,7 @@ fn start_test_agentd_tcp(name: &str) -> String {
     let _ = std::fs::remove_dir_all(&state_dir);
     let zfs = FakeZfsManager::new();
     zfs.seed_dataset("zroot/keel/base/14.2-web");
+    let replica_targets = keel_agentd::ReplicaTargetRegistry::load(state_dir.clone()).unwrap();
     let reconciler = Reconciler::new(
         FakeJailRuntime::new(),
         zfs,
@@ -94,7 +96,7 @@ fn start_test_agentd_tcp(name: &str) -> String {
         std::time::Duration::from_secs(3600),
     )
     .unwrap();
-    thread::spawn(move || keel_agentd::http::run_tls(listener, commands, reloading_tls, keel_agentd::PodCidrSlot::new()));
+    thread::spawn(move || keel_agentd::http::run_tls(listener, commands, reloading_tls, keel_agentd::PodCidrSlot::new(), replica_targets));
     addr
 }
 

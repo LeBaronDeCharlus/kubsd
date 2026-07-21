@@ -100,6 +100,8 @@ fn main() {
 
     let (_worker_handle, commands) = worker::spawn(reconciler);
     let pod_cidr_slot = keel_agentd::PodCidrSlot::new();
+    let replica_targets = keel_agentd::ReplicaTargetRegistry::load(config.state_dir.clone())
+        .expect("failed to load replica-target state");
 
     if let (
         Some(node_id),
@@ -148,7 +150,10 @@ fn main() {
             .unwrap_or_else(|e| panic!("failed to bind jails-API TCP listener on {advertise_addr}: {e}"));
         let tcp_commands = commands.clone();
         let tcp_pod_cidr_slot = pod_cidr_slot.clone();
-        thread::spawn(move || keel_agentd::http::run_tls(tcp_listener, tcp_commands, reloading_tls, tcp_pod_cidr_slot));
+        let tcp_replica_targets = replica_targets.clone();
+        thread::spawn(move || {
+            keel_agentd::http::run_tls(tcp_listener, tcp_commands, reloading_tls, tcp_pod_cidr_slot, tcp_replica_targets)
+        });
     }
 
     let timer_commands = commands.clone();
@@ -166,7 +171,7 @@ fn main() {
     std::fs::set_permissions(&config.socket, std::fs::Permissions::from_mode(0o600))
         .expect("failed to set socket permissions");
 
-    keel_agentd::http::run(listener, commands, pod_cidr_slot);
+    keel_agentd::http::run(listener, commands, pod_cidr_slot, replica_targets);
 }
 
 #[cfg(test)]

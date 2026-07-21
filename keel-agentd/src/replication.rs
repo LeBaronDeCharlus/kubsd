@@ -109,6 +109,18 @@ impl ReplicaTargetRegistry {
         }
         Ok(())
     }
+
+    /// Test helper: seed a `ReplicaTarget` directly, bypassing the network
+    /// handshake in `handle_connection`.
+    pub fn ensure_for_test(&self, replica_name: &str, volume_dataset: &str, source_node_addr: &str) {
+        self.ensure(replica_name, volume_dataset, source_node_addr).unwrap();
+    }
+
+    /// Test helper: mark a `ReplicaTarget` as having completed a snapshot,
+    /// bypassing a real `zfs receive`.
+    pub fn record_snapshot_for_test(&self, replica_name: &str, snapshot_id: &str) {
+        self.record_snapshot(replica_name, snapshot_id).unwrap();
+    }
 }
 
 /// One accepted connection's worth of work: read the header, decide

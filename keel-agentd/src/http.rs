@@ -16,13 +16,14 @@ const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
 type TlsStream = StreamOwned<ServerConnection, TcpStream>;
 
-pub fn run(listener: UnixListener, commands: Sender<Command>, pod_cidr_slot: PodCidrSlot) {
+pub fn run(listener: UnixListener, commands: Sender<Command>, pod_cidr_slot: PodCidrSlot, replica_targets: crate::ReplicaTargetRegistry) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let commands = commands.clone();
         let pod_cidr_slot = pod_cidr_slot.clone();
+        let replica_targets = replica_targets.clone();
         thread::spawn(move || {
-            let _ = handle_connection(stream, &commands, &pod_cidr_slot);
+            let _ = handle_connection(stream, &commands, &pod_cidr_slot, &replica_targets);
         });
     }
 }
@@ -32,16 +33,18 @@ pub fn run_tls(
     commands: Sender<Command>,
     reloading_tls: Arc<crate::tls::ReloadingTls>,
     pod_cidr_slot: PodCidrSlot,
+    replica_targets: crate::ReplicaTargetRegistry,
 ) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let commands = commands.clone();
         let tls_config = reloading_tls.server_config();
         let pod_cidr_slot = pod_cidr_slot.clone();
+        let replica_targets = replica_targets.clone();
         thread::spawn(move || {
             let Ok(conn) = ServerConnection::new(tls_config) else { return };
             let mut tls_stream = TlsStream::new(conn, stream);
-            if handle_connection_tls(&mut tls_stream, &commands, &pod_cidr_slot).is_err() {
+            if handle_connection_tls(&mut tls_stream, &commands, &pod_cidr_slot, &replica_targets).is_err() {
                 eprintln!("keel-agentd: TLS handshake or request handling failed for a connection");
             }
         });
@@ -58,12 +61,13 @@ fn handle_connection(
     mut stream: UnixStream,
     commands: &Sender<Command>,
     pod_cidr_slot: &PodCidrSlot,
+    replica_targets: &crate::ReplicaTargetRegistry,
 ) -> io::Result<()> {
     let request = match read_request(&mut stream)? {
         Some(r) => r,
         None => return Ok(()),
     };
-    let (status, body) = route(&request, commands, pod_cidr_slot);
+    let (status, body) = route(&request, commands, pod_cidr_slot, replica_targets);
     write_response(&mut stream, status, &body)
 }
 
@@ -71,12 +75,13 @@ fn handle_connection_tls(
     stream: &mut TlsStream,
     commands: &Sender<Command>,
     pod_cidr_slot: &PodCidrSlot,
+    replica_targets: &crate::ReplicaTargetRegistry,
 ) -> io::Result<()> {
     let request = match read_request_tls(stream)? {
         Some(r) => r,
         None => return Ok(()),
     };
-    let (status, body) = route(&request, commands, pod_cidr_slot);
+    let (status, body) = route(&request, commands, pod_cidr_slot, replica_targets);
     write_response_tls(stream, status, &body)
 }
 
@@ -212,7 +217,12 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-fn route(request: &ParsedRequest, commands: &Sender<Command>, pod_cidr_slot: &PodCidrSlot) -> (u16, Vec<u8>) {
+fn route(
+    request: &ParsedRequest,
+    commands: &Sender<Command>,
+    pod_cidr_slot: &PodCidrSlot,
+    replica_targets: &crate::ReplicaTargetRegistry,
+) -> (u16, Vec<u8>) {
     let segments: Vec<&str> =
         request.path.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
     match (request.method.as_str(), segments.as_slice()) {
@@ -222,7 +232,18 @@ fn route(request: &ParsedRequest, commands: &Sender<Command>, pod_cidr_slot: &Po
         ("DELETE", ["jails", name]) => handle_delete(name, commands),
         ("GET", ["volumes", name]) => handle_get_volume(name, commands),
         ("DELETE", ["volumes", name]) => handle_delete_volume(name, commands),
+        ("GET", ["replica-targets", name]) => handle_get_replica_target(name, replica_targets),
         _ => error_response(404, format!("no route for {} {}", request.method, request.path)),
+    }
+}
+
+fn handle_get_replica_target(name: &str, replica_targets: &crate::ReplicaTargetRegistry) -> (u16, Vec<u8>) {
+    match replica_targets.get(name) {
+        None => error_response(404, format!("no replica target '{name}'")),
+        Some(target) if target.last_snapshot.is_none() => {
+            error_response(409, format!("replica target '{name}' has not completed a first full replication yet"))
+        }
+        Some(_) => yaml_response(200, &crate::wire::ReplicaTargetStatus { replica_name: name.to_string(), ready: true }),
     }
 }
 
@@ -374,6 +395,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state_dir);
         let zfs = FakeZfsManager::new();
         zfs.seed_dataset("zroot/keel/base/14.2-web");
+        let replica_targets = crate::ReplicaTargetRegistry::load(state_dir.clone()).unwrap();
         let reconciler = Reconciler::new(
             FakeJailRuntime::new(),
             zfs,
@@ -388,7 +410,7 @@ mod tests {
         let socket_path = short_unique_socket_path();
         let _ = std::fs::remove_file(&socket_path);
         let listener = UnixListener::bind(&socket_path).unwrap();
-        thread::spawn(move || run(listener, commands, PodCidrSlot::new()));
+        thread::spawn(move || run(listener, commands, PodCidrSlot::new(), replica_targets));
         socket_path
     }
 
@@ -397,6 +419,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state_dir);
         let zfs = FakeZfsManager::new();
         zfs.seed_dataset("zroot/keel/base/14.2-web");
+        let replica_targets = crate::ReplicaTargetRegistry::load(state_dir.clone()).unwrap();
         let reconciler = Reconciler::new(FakeJailRuntime::new(), zfs, FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), state_dir).unwrap();
         let (_worker_handle, commands) = worker::spawn(reconciler);
 
@@ -409,8 +432,23 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
         let listener = UnixListener::bind(&socket_path).unwrap();
         let slot_clone = pod_cidr_slot.clone();
-        thread::spawn(move || run(listener, commands, slot_clone));
+        thread::spawn(move || run(listener, commands, slot_clone, replica_targets));
         (socket_path, pod_cidr_slot)
+    }
+
+    fn start_test_server_with_replica_targets(name: &str, targets: crate::ReplicaTargetRegistry) -> PathBuf {
+        let state_dir = std::env::temp_dir().join(format!("keel-agentd-http-test-state-{name}"));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        let zfs = FakeZfsManager::new();
+        zfs.seed_dataset("zroot/keel/base/14.2-web");
+        let reconciler = Reconciler::new(FakeJailRuntime::new(), zfs, FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), state_dir).unwrap();
+        let (_worker_handle, commands) = worker::spawn(reconciler);
+
+        let socket_path = short_unique_socket_path();
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        thread::spawn(move || run(listener, commands, PodCidrSlot::new(), targets));
+        socket_path
     }
 
     fn send_request(socket_path: &PathBuf, method: &str, path: &str, body: &str) -> (u16, String) {
@@ -602,6 +640,40 @@ mod tests {
         assert_eq!(status, 200, "single-node/never-registered mode must skip the subnet check entirely");
     }
 
+    #[test]
+    fn get_replica_target_on_an_unknown_name_returns_404() {
+        let dir = std::env::temp_dir().join("keel-agentd-http-test-replica-targets-unknown");
+        let _ = std::fs::remove_dir_all(&dir);
+        let targets = crate::ReplicaTargetRegistry::load(dir).unwrap();
+        let socket_path = start_test_server_with_replica_targets("get_replica_target_on_an_unknown_name_returns_404", targets);
+        let (status, _) = send_request(&socket_path, "GET", "/replica-targets/missing", "");
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn get_replica_target_before_a_first_snapshot_returns_409() {
+        let dir = std::env::temp_dir().join("keel-agentd-http-test-replica-targets-not-ready");
+        let _ = std::fs::remove_dir_all(&dir);
+        let targets = crate::ReplicaTargetRegistry::load(dir).unwrap();
+        targets.ensure_for_test("db-0", "zroot/keel/volumes/db-0-data", "10.0.0.4:7621");
+        let socket_path = start_test_server_with_replica_targets("get_replica_target_before_a_first_snapshot_returns_409", targets);
+        let (status, _) = send_request(&socket_path, "GET", "/replica-targets/db-0", "");
+        assert_eq!(status, 409);
+    }
+
+    #[test]
+    fn get_replica_target_after_a_first_snapshot_returns_200_and_ready_true() {
+        let dir = std::env::temp_dir().join("keel-agentd-http-test-replica-targets-ready");
+        let _ = std::fs::remove_dir_all(&dir);
+        let targets = crate::ReplicaTargetRegistry::load(dir).unwrap();
+        targets.ensure_for_test("db-0", "zroot/keel/volumes/db-0-data", "10.0.0.4:7621");
+        targets.record_snapshot_for_test("db-0", "keel-repl-1");
+        let socket_path = start_test_server_with_replica_targets("get_replica_target_after_a_first_snapshot_returns_200_and_ready_true", targets);
+        let (status, body) = send_request(&socket_path, "GET", "/replica-targets/db-0", "");
+        assert_eq!(status, 200);
+        assert!(body.contains("ready: true"), "got: {body}");
+    }
+
     use crate::tls;
 
     fn fixture(name: &str) -> PathBuf {
@@ -613,6 +685,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state_dir);
         let zfs = FakeZfsManager::new();
         zfs.seed_dataset("zroot/keel/base/14.2-web");
+        let replica_targets = crate::ReplicaTargetRegistry::load(state_dir.clone()).unwrap();
         let reconciler = Reconciler::new(
             FakeJailRuntime::new(),
             zfs,
@@ -634,7 +707,7 @@ mod tests {
             Duration::from_secs(3600),
         )
         .unwrap();
-        thread::spawn(move || run_tls(listener, commands, reloading_tls, PodCidrSlot::new()));
+        thread::spawn(move || run_tls(listener, commands, reloading_tls, PodCidrSlot::new(), replica_targets));
         addr
     }
 
@@ -810,13 +883,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state_dir);
         let zfs = FakeZfsManager::new();
         zfs.seed_dataset("zroot/keel/base/14.2-web");
+        let replica_targets = crate::ReplicaTargetRegistry::load(state_dir.clone()).unwrap();
         let reconciler =
             Reconciler::new(FakeJailRuntime::new(), zfs, FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), state_dir).unwrap();
         let (_worker_handle, commands) = worker::spawn(reconciler);
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        thread::spawn(move || run_tls(listener, commands, reloading, PodCidrSlot::new()));
+        thread::spawn(move || run_tls(listener, commands, reloading, PodCidrSlot::new(), replica_targets));
 
         let (status, _) = send_request_tcp(&addr, "GET", "/jails", "");
         assert_eq!(status, 200, "expected the initial fixture-node certificate to be served");
@@ -855,13 +929,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state_dir);
         let zfs = FakeZfsManager::new();
         zfs.seed_dataset("zroot/keel/base/14.2-web");
+        let replica_targets = crate::ReplicaTargetRegistry::load(state_dir.clone()).unwrap();
         let reconciler =
             Reconciler::new(FakeJailRuntime::new(), zfs, FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), state_dir).unwrap();
         let (_worker_handle, commands) = worker::spawn(reconciler);
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        thread::spawn(move || run_tls(listener, commands, reloading, PodCidrSlot::new()));
+        thread::spawn(move || run_tls(listener, commands, reloading, PodCidrSlot::new(), replica_targets));
 
         std::fs::write(&cert_path, "not a certificate").unwrap();
         thread::sleep(Duration::from_millis(200));
