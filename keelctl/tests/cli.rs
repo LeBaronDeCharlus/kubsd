@@ -20,14 +20,14 @@ fn start_test_server(name: &str) -> PathBuf {
     let replica_targets = keel_agentd::ReplicaTargetRegistry::load(state_dir.clone()).unwrap();
     let reconciler = Reconciler::new(
         FakeJailRuntime::new(),
-        zfs,
+        zfs.clone(),
         FakeNetManager::new(),
         FakeMountManager::new(),
         "zroot".to_string(),
         state_dir,
     )
     .unwrap();
-    let (_worker_handle, commands) = worker::spawn(reconciler);
+    let (_worker_handle, commands) = worker::spawn(reconciler, zfs, "zroot".to_string());
 
     // A short, non-descriptive filename (not the full test name) — macOS/BSD
     // cap Unix socket paths at ~104 bytes (SUN_LEN), and the default macOS
@@ -77,14 +77,14 @@ fn start_test_agentd_tcp(name: &str) -> String {
     let replica_targets = keel_agentd::ReplicaTargetRegistry::load(state_dir.clone()).unwrap();
     let reconciler = Reconciler::new(
         FakeJailRuntime::new(),
-        zfs,
+        zfs.clone(),
         FakeNetManager::new(),
         FakeMountManager::new(),
         "zroot".to_string(),
         state_dir,
     )
     .unwrap();
-    let (_worker_handle, commands) = worker::spawn(reconciler);
+    let (_worker_handle, commands) = worker::spawn(reconciler, zfs, "zroot".to_string());
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();

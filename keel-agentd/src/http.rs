@@ -230,6 +230,7 @@ fn route(
         ("GET", ["jails"]) => handle_get(None, commands),
         ("GET", ["jails", name]) => handle_get(Some(name.to_string()), commands),
         ("DELETE", ["jails", name]) => handle_delete(name, commands),
+        ("PUT", ["jails", name, "replicate-to"]) => handle_set_replicate_to(name, &request.body, commands),
         ("GET", ["volumes", name]) => handle_get_volume(name, commands),
         ("DELETE", ["volumes", name]) => handle_delete_volume(name, commands),
         ("GET", ["replica-targets", name]) => handle_get_replica_target(name, replica_targets),
@@ -281,6 +282,26 @@ fn handle_apply(
 
     let (reply_tx, reply_rx) = mpsc::channel();
     if commands.send(Command::Apply(spec, reply_tx)).is_err() {
+        return error_response(500, "reconciler worker is not running".to_string());
+    }
+    match reply_rx.recv() {
+        Ok(Ok(())) => (200, Vec::new()),
+        Ok(Err(e)) => error_response(status_for_error(&e), e.to_string()),
+        Err(_) => error_response(500, "reconciler worker did not respond".to_string()),
+    }
+}
+
+fn handle_set_replicate_to(name: &str, body: &[u8], commands: &Sender<Command>) -> (u16, Vec<u8>) {
+    let replicate_to: Option<String> = if body.is_empty() {
+        None
+    } else {
+        match serde_yaml::from_slice::<crate::wire::ReplicateToBody>(body) {
+            Ok(b) => Some(b.replicate_to),
+            Err(e) => return error_response(400, format!("invalid YAML: {e}")),
+        }
+    };
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::SetReplicateTo(name.to_string(), replicate_to, reply_tx)).is_err() {
         return error_response(500, "reconciler worker is not running".to_string());
     }
     match reply_rx.recv() {
@@ -398,14 +419,14 @@ mod tests {
         let replica_targets = crate::ReplicaTargetRegistry::load(state_dir.clone()).unwrap();
         let reconciler = Reconciler::new(
             FakeJailRuntime::new(),
-            zfs,
+            zfs.clone(),
             FakeNetManager::new(),
             FakeMountManager::new(),
             "zroot".to_string(),
             state_dir,
         )
         .unwrap();
-        let (_worker_handle, commands) = worker::spawn(reconciler);
+        let (_worker_handle, commands) = worker::spawn(reconciler, zfs, "zroot".to_string());
 
         let socket_path = short_unique_socket_path();
         let _ = std::fs::remove_file(&socket_path);
@@ -420,8 +441,8 @@ mod tests {
         let zfs = FakeZfsManager::new();
         zfs.seed_dataset("zroot/keel/base/14.2-web");
         let replica_targets = crate::ReplicaTargetRegistry::load(state_dir.clone()).unwrap();
-        let reconciler = Reconciler::new(FakeJailRuntime::new(), zfs, FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), state_dir).unwrap();
-        let (_worker_handle, commands) = worker::spawn(reconciler);
+        let reconciler = Reconciler::new(FakeJailRuntime::new(), zfs.clone(), FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), state_dir).unwrap();
+        let (_worker_handle, commands) = worker::spawn(reconciler, zfs, "zroot".to_string());
 
         let pod_cidr_slot = PodCidrSlot::new();
         if let Some(cidr) = pod_cidr {
@@ -441,8 +462,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state_dir);
         let zfs = FakeZfsManager::new();
         zfs.seed_dataset("zroot/keel/base/14.2-web");
-        let reconciler = Reconciler::new(FakeJailRuntime::new(), zfs, FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), state_dir).unwrap();
-        let (_worker_handle, commands) = worker::spawn(reconciler);
+        let reconciler = Reconciler::new(FakeJailRuntime::new(), zfs.clone(), FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), state_dir).unwrap();
+        let (_worker_handle, commands) = worker::spawn(reconciler, zfs, "zroot".to_string());
 
         let socket_path = short_unique_socket_path();
         let _ = std::fs::remove_file(&socket_path);
@@ -582,6 +603,26 @@ mod tests {
     }
 
     #[test]
+    fn put_replicate_to_retargets_an_existing_jails_replication_address() {
+        let socket_path = start_test_server("put_replicate_to_retargets_an_existing_jails_replication_address");
+        send_request(&socket_path, "PUT", "/jails/web-1", &sample_spec_yaml("web-1"));
+
+        let (status, _) = send_request(&socket_path, "PUT", "/jails/web-1/replicate-to", "replicate_to: 10.0.0.9:7622\n");
+        assert_eq!(status, 200);
+
+        let (status, body) = send_request(&socket_path, "GET", "/jails/web-1", "");
+        assert_eq!(status, 200);
+        assert!(body.contains("10.0.0.9:7622"), "got: {body}");
+    }
+
+    #[test]
+    fn put_replicate_to_on_an_unknown_name_returns_404() {
+        let socket_path = start_test_server("put_replicate_to_on_an_unknown_name_returns_404");
+        let (status, _) = send_request(&socket_path, "PUT", "/jails/missing/replicate-to", "replicate_to: 10.0.0.9:7622\n");
+        assert_eq!(status, 404);
+    }
+
+    #[test]
     fn get_jails_lists_all_applied_jails() {
         let socket_path = start_test_server("get_jails_lists_all_applied_jails");
         send_request(&socket_path, "PUT", "/jails/web-1", &sample_spec_yaml("web-1"));
@@ -688,14 +729,14 @@ mod tests {
         let replica_targets = crate::ReplicaTargetRegistry::load(state_dir.clone()).unwrap();
         let reconciler = Reconciler::new(
             FakeJailRuntime::new(),
-            zfs,
+            zfs.clone(),
             FakeNetManager::new(),
             FakeMountManager::new(),
             "zroot".to_string(),
             state_dir,
         )
         .unwrap();
-        let (_worker_handle, commands) = worker::spawn(reconciler);
+        let (_worker_handle, commands) = worker::spawn(reconciler, zfs, "zroot".to_string());
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -885,8 +926,8 @@ mod tests {
         zfs.seed_dataset("zroot/keel/base/14.2-web");
         let replica_targets = crate::ReplicaTargetRegistry::load(state_dir.clone()).unwrap();
         let reconciler =
-            Reconciler::new(FakeJailRuntime::new(), zfs, FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), state_dir).unwrap();
-        let (_worker_handle, commands) = worker::spawn(reconciler);
+            Reconciler::new(FakeJailRuntime::new(), zfs.clone(), FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), state_dir).unwrap();
+        let (_worker_handle, commands) = worker::spawn(reconciler, zfs, "zroot".to_string());
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -931,8 +972,8 @@ mod tests {
         zfs.seed_dataset("zroot/keel/base/14.2-web");
         let replica_targets = crate::ReplicaTargetRegistry::load(state_dir.clone()).unwrap();
         let reconciler =
-            Reconciler::new(FakeJailRuntime::new(), zfs, FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), state_dir).unwrap();
-        let (_worker_handle, commands) = worker::spawn(reconciler);
+            Reconciler::new(FakeJailRuntime::new(), zfs.clone(), FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), state_dir).unwrap();
+        let (_worker_handle, commands) = worker::spawn(reconciler, zfs, "zroot".to_string());
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();

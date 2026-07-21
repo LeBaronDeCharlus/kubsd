@@ -30,6 +30,11 @@ pub struct ReplicaTargetStatus {
     pub ready: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplicateToBody {
+    pub replicate_to: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

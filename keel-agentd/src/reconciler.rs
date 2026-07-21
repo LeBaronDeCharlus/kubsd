@@ -162,6 +162,19 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J
         Ok(())
     }
 
+    /// Retargets an *already-running* primary's replication without a full
+    /// re-provision -- just updates `replicate_to` on the existing
+    /// `JailRecord` and persists it. Bypasses `apply()`/`validate_transition`
+    /// entirely: `replicate_to` isn't an immutability-checked field, and this
+    /// path has no spec to validate against, only a bare address to store.
+    pub fn set_replicate_to(&mut self, name: &str, replicate_to: Option<String>) -> Result<(), ReconcileError> {
+        let mut record = self.records.get(name).ok_or_else(|| ReconcileError::NotFound(name.to_string()))?.clone();
+        record.spec.spec.replicate_to = replicate_to;
+        store::save(&self.state_dir, &record)?;
+        self.records.insert(name.to_string(), record);
+        Ok(())
+    }
+
     fn configure_networking_and_limits(&mut self, name: &str, record: &JailRecord) -> Result<(), ReconcileError> {
         let jail_name = record::jail_name(name);
         let epair_base = record::epair_base_name(record.epair_ordinal);
@@ -890,5 +903,26 @@ mod tests {
         let dir = test_state_dir("list_is_empty_when_no_specs_have_been_applied");
         let reconciler = new_reconciler(dir);
         assert!(reconciler.list(Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn set_replicate_to_updates_the_record_without_going_through_validate_transition() {
+        let dir = test_state_dir("set_replicate_to_updates_the_record_without_going_through_validate_transition");
+        let mut reconciler = new_reconciler(dir.clone());
+        reconciler.zfs.seed_dataset("zroot/keel/base/14.2-web");
+        reconciler.apply(sample_spec_with_volume("db-0", "db-0-data", "/var/db", "5G")).unwrap();
+
+        reconciler.set_replicate_to("db-0", Some("10.0.0.9:7622".to_string())).unwrap();
+
+        assert_eq!(reconciler.records["db-0"].spec.spec.replicate_to, Some("10.0.0.9:7622".to_string()));
+        let loaded = store::load_all(&dir).unwrap();
+        assert_eq!(loaded[0].spec.spec.replicate_to, Some("10.0.0.9:7622".to_string()));
+    }
+
+    #[test]
+    fn set_replicate_to_on_an_unknown_name_returns_not_found() {
+        let dir = test_state_dir("set_replicate_to_on_an_unknown_name_returns_not_found");
+        let mut reconciler = new_reconciler(dir);
+        assert!(matches!(reconciler.set_replicate_to("missing", Some("10.0.0.9:7622".to_string())), Err(ReconcileError::NotFound(_))));
     }
 }

@@ -6,7 +6,7 @@ use keel_spec::JailSpec;
 use keel_zfs::ZfsManager;
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub enum Command {
     Apply(JailSpec, Sender<Result<(), ReconcileError>>),
@@ -20,30 +20,40 @@ pub enum Command {
     RemoveServiceAlias(String, String, Sender<Result<(), keel_net::NetError>>),
     GetVolume(String, Sender<Result<(), ReconcileError>>),
     DeleteVolume(String, Sender<Result<(), ReconcileError>>),
+    SetReplicateTo(String, Option<String>, Sender<Result<(), ReconcileError>>),
 }
 
-pub fn spawn<J, Z, N, M>(mut reconciler: Reconciler<J, Z, N, M>) -> (JoinHandle<()>, Sender<Command>)
+pub fn spawn<J, Z, N, M>(mut reconciler: Reconciler<J, Z, N, M>, zfs: Z, pool: String) -> (JoinHandle<()>, Sender<Command>)
 where
     J: JailRuntime + Send + 'static,
-    Z: ZfsManager + Send + 'static,
+    Z: ZfsManager + Clone + Send + 'static,
     N: NetManager + Send + 'static,
     M: MountManager + Send + 'static,
 {
     let (tx, rx) = mpsc::channel::<Command>();
+    let commands_for_thread = tx.clone();
     let handle = thread::spawn(move || {
+        let mut replicating: std::collections::HashSet<String> = std::collections::HashSet::new();
         for command in rx {
-            handle_command(&mut reconciler, command);
+            handle_command(&mut reconciler, command, &zfs, &pool, &commands_for_thread, &mut replicating);
         }
     });
     (handle, tx)
 }
 
-fn handle_command<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager>(
+#[allow(clippy::too_many_arguments)]
+fn handle_command<J: JailRuntime, Z: ZfsManager + Clone + Send + 'static, N: NetManager, M: MountManager>(
     reconciler: &mut Reconciler<J, Z, N, M>,
     command: Command,
+    zfs: &Z,
+    pool: &str,
+    commands: &Sender<Command>,
+    replicating: &mut std::collections::HashSet<String>,
 ) {
     match command {
         Command::Apply(spec, reply) => {
+            let is_stateful_and_replicated = !spec.spec.volumes.is_empty() && spec.spec.replicate_to.is_some();
+            let name = spec.metadata.name.clone();
             let result = reconciler.apply(spec);
             // Reconcile immediately so a client's apply/delete call
             // observes its effects by the time it gets a response,
@@ -52,6 +62,10 @@ fn handle_command<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager>
             // jail's backoff status on a later `get`, so they're
             // discarded here (same treatment as a plain `Tick`).
             let _ = reconciler.reconcile(Instant::now());
+            if result.is_ok() && is_stateful_and_replicated && replicating.insert(name.clone()) {
+                let volume_name = format!("{name}-data");
+                crate::replication_loop::spawn(name, volume_name, pool.to_string(), zfs.clone(), commands.clone(), Duration::from_secs(30));
+            }
             let _ = reply.send(result);
         }
         Command::Delete(name, reply) => {
@@ -92,6 +106,9 @@ fn handle_command<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager>
         }
         Command::DeleteVolume(name, reply) => {
             let _ = reply.send(reconciler.delete_volume(&name));
+        }
+        Command::SetReplicateTo(name, replicate_to, reply) => {
+            let _ = reply.send(reconciler.set_replicate_to(&name, replicate_to));
         }
     }
 }
@@ -137,14 +154,14 @@ mod tests {
         zfs.seed_dataset("zroot/keel/base/14.2-web");
         let reconciler = Reconciler::new(
             FakeJailRuntime::new(),
-            zfs,
+            zfs.clone(),
             FakeNetManager::new(),
             FakeMountManager::new(),
             "zroot".to_string(),
             test_state_dir(name),
         )
         .unwrap();
-        let (_handle, commands) = spawn(reconciler);
+        let (_handle, commands) = spawn(reconciler, zfs, "zroot".to_string());
         commands
     }
 
@@ -253,9 +270,10 @@ mod tests {
 
     #[test]
     fn add_service_alias_command_round_trips() {
+        let zfs = FakeZfsManager::new();
         let reconciler = crate::Reconciler::new(
             FakeJailRuntime::new(),
-            FakeZfsManager::new(),
+            zfs.clone(),
             FakeNetManager::new(),
             FakeMountManager::new(),
             "zroot".to_string(),
@@ -266,7 +284,7 @@ mod tests {
         // Reconciler owns its own NetManager instance internally; assert
         // through the command channel's observable success instead of a
         // second handle to the same fake.
-        let (_worker_handle, commands) = spawn(reconciler);
+        let (_worker_handle, commands) = spawn(reconciler, zfs, "zroot".to_string());
 
         let (tx, rx) = mpsc::channel();
         commands.send(Command::AddServiceAlias("keel0".to_string(), "10.0.250.7".to_string(), tx)).unwrap();

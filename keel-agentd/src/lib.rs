@@ -9,6 +9,7 @@ pub mod registration;
 pub mod replica_target;
 pub mod replica_target_store;
 pub mod replication;
+pub mod replication_loop;
 pub mod store;
 pub mod tls;
 pub mod wire;

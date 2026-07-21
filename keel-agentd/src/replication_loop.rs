@@ -1,0 +1,201 @@
+use crate::replication::{self, ACK_NEED_FULL};
+use crate::worker::Command;
+use keel_zfs::ZfsManager;
+use std::io::Read;
+use std::net::TcpStream;
+use std::sync::mpsc::Sender;
+use std::thread;
+use std::time::Duration;
+
+/// Spawned once per stateful+replicated jail name from `Command::Apply`
+/// (see `worker.rs`) when its spec has both `volumes` and `replicate_to`
+/// set. Ticks every `interval`: re-reads `replicate_to` from the live
+/// `JailRecord` (so a `PUT /jails/<name>/replicate-to` takes effect on the
+/// very next tick with no signal/restart), snapshots the volume, and sends
+/// a full or incremental stream to the standby. Exits once the record
+/// itself is gone (the replica was deleted) -- checked every tick via
+/// `Command::Get`, since nothing should keep replicating a deleted
+/// replica's already-orphaned dataset forever.
+pub fn spawn<Z: ZfsManager + Clone + Send + 'static>(
+    replica_name: String,
+    volume_name: String,
+    pool: String,
+    zfs: Z,
+    commands: Sender<Command>,
+    interval: Duration,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let dataset = crate::record::volume_dataset_path(&pool, &volume_name);
+        let mut last_confirmed_sent: Option<String> = None;
+        let mut tick: u64 = 0;
+        loop {
+            thread::sleep(interval);
+            tick += 1;
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            if commands.send(Command::Get(Some(replica_name.clone()), tx)).is_err() {
+                return;
+            }
+            let Ok(statuses) = rx.recv() else { return };
+            let Some(status) = statuses.into_iter().next() else {
+                eprintln!("keel-agentd: replica '{replica_name}' no longer exists, stopping its replication loop");
+                return;
+            };
+            let Some(replicate_to) = status.record.spec.spec.replicate_to.clone() else {
+                continue; // retargeted away to nothing (shouldn't normally happen); just wait
+            };
+
+            let snapshot_id = format!("keel-repl-{tick}");
+            if let Err(e) = zfs.snapshot(&dataset, &snapshot_id) {
+                eprintln!("keel-agentd: failed to snapshot '{dataset}' for replica '{replica_name}': {e}");
+                continue;
+            }
+
+            match send_once(&zfs, &dataset, &snapshot_id, last_confirmed_sent.as_deref(), &replicate_to) {
+                Ok(()) => {
+                    last_confirmed_sent = Some(snapshot_id);
+                }
+                Err(SendOnceError::NeedFull) => {
+                    eprintln!("keel-agentd: standby for replica '{replica_name}' rejected the incremental base; will send full next tick");
+                    last_confirmed_sent = None;
+                }
+                Err(SendOnceError::Io(e)) => {
+                    eprintln!("keel-agentd: failed to replicate '{replica_name}' to {replicate_to}: {e}");
+                }
+            }
+        }
+    })
+}
+
+enum SendOnceError {
+    NeedFull,
+    Io(String),
+}
+
+fn send_once<Z: ZfsManager>(zfs: &Z, dataset: &str, snapshot_id: &str, base: Option<&str>, replicate_to: &str) -> Result<(), SendOnceError> {
+    let mut stream = TcpStream::connect(replicate_to).map_err(|e| SendOnceError::Io(e.to_string()))?;
+    replication::write_header(&mut stream, dataset_replica_name(dataset), snapshot_id, base).map_err(|e| SendOnceError::Io(e.to_string()))?;
+    let mut ack = [0u8; 1];
+    stream.read_exact(&mut ack).map_err(|e| SendOnceError::Io(e.to_string()))?;
+    if ack[0] == ACK_NEED_FULL {
+        return Err(SendOnceError::NeedFull);
+    }
+    zfs.send_snapshot(dataset, snapshot_id, base, &mut stream).map_err(|e| SendOnceError::Io(e.to_string()))?;
+    stream.shutdown(std::net::Shutdown::Write).ok();
+    Ok(())
+}
+
+/// `dataset` is `<pool>/keel/volumes/<replica_name>`; the receiver keys its
+/// `ReplicaTarget` by the final path component (the volume name), not the
+/// replica name -- see `replication::handle_connection`'s own use of
+/// `header.replica_name` to build `record::volume_dataset_path`.
+fn dataset_replica_name(dataset: &str) -> &str {
+    dataset.rsplit('/').next().unwrap_or(dataset)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reconciler::Reconciler;
+    use crate::worker;
+    use keel_jail::{FakeJailRuntime, FakeMountManager};
+    use keel_net::FakeNetManager;
+    use keel_spec::{Metadata, NetworkSpec, RestartPolicy, ResourcesSpec, Spec, VolumeMount};
+    use keel_zfs::FakeZfsManager;
+    use std::path::PathBuf;
+
+    fn test_state_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("keel-agentd-replication-loop-test-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn stateful_spec(name: &str) -> keel_spec::JailSpec {
+        keel_spec::JailSpec {
+            api_version: "keel/v1".to_string(),
+            kind: "Jail".to_string(),
+            metadata: Metadata { name: name.to_string() },
+            spec: Spec {
+                image: "base/14.2-web".to_string(),
+                command: vec!["/usr/local/bin/myapp".to_string()],
+                network: NetworkSpec { vnet: true, bridge: "keel0".to_string(), address: "10.0.0.5/24".to_string() },
+                resources: ResourcesSpec { cpu: "1".to_string(), memory: "256M".to_string() },
+                restart_policy: RestartPolicy::Always,
+                volumes: vec![VolumeMount { name: format!("{name}-data"), mount_path: "/var/db".to_string(), size: "1G".to_string() }],
+                replicate_to: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_tick_snapshots_and_sends_a_full_replication_on_first_contact() {
+        let dir = test_state_dir("a_tick_snapshots_and_sends_a_full_replication_on_first_contact");
+        let zfs = FakeZfsManager::new();
+        zfs.seed_dataset("zroot/keel/base/14.2-web");
+        let reconciler = Reconciler::new(FakeJailRuntime::new(), zfs.clone(), FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), dir).unwrap();
+        let (_worker_handle, commands) = worker::spawn(reconciler, zfs.clone(), "zroot".to_string());
+
+        let (apply_tx, apply_rx) = std::sync::mpsc::channel();
+        commands.send(Command::Apply(stateful_spec("db-0"), apply_tx)).unwrap();
+        apply_rx.recv().unwrap().unwrap();
+
+        let receiver_zfs = FakeZfsManager::new();
+        let receiver_dir = std::env::temp_dir().join("keel-agentd-replication-loop-test-receiver-a_tick_snapshots_and_sends_a_full_replication_on_first_contact");
+        let _ = std::fs::remove_dir_all(&receiver_dir);
+        let targets = crate::ReplicaTargetRegistry::load(receiver_dir).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let receiver_zfs_clone = receiver_zfs.clone();
+        let targets_clone = targets.clone();
+        std::thread::spawn(move || crate::replication::run(listener, receiver_zfs_clone, "zroot".to_string(), targets_clone));
+
+        let (rt_tx, rt_rx) = std::sync::mpsc::channel();
+        commands.send(Command::SetReplicateTo("db-0".to_string(), Some(addr), rt_tx)).unwrap();
+        rt_rx.recv().unwrap().unwrap();
+
+        let _handle = spawn("db-0".to_string(), "db-0-data".to_string(), "zroot".to_string(), zfs.clone(), commands.clone(), Duration::from_millis(50));
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(receiver_zfs.dataset_exists("zroot/keel/volumes/db-0-data").unwrap());
+        // The wire protocol's `replica_name` header field is keyed by the
+        // dataset's final path segment (see `dataset_replica_name` above and
+        // `replication::handle_connection`'s own `volume_dataset_path(pool,
+        // &header.replica_name)`), i.e. the *volume* name ("db-0-data"), not
+        // the jail/replica name ("db-0").
+        assert!(targets.get("db-0-data").is_some_and(|t| t.last_snapshot.is_some()));
+    }
+
+    #[test]
+    fn the_loop_exits_once_its_replica_record_is_deleted() {
+        // Exercises the "record deleted" exit path directly rather than only
+        // assuming it: deletes the replica right after applying it (before
+        // spawning the loop), then asserts the spawned thread's JoinHandle
+        // finishes on its own within a bounded wait -- if the loop kept
+        // looping forever (bug: exit condition never firing), `join()` would
+        // hang and this test would time out instead of completing.
+        let dir = test_state_dir("the_loop_exits_once_its_replica_record_is_deleted");
+        let zfs = FakeZfsManager::new();
+        zfs.seed_dataset("zroot/keel/base/14.2-web");
+        let reconciler = Reconciler::new(FakeJailRuntime::new(), zfs.clone(), FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), dir).unwrap();
+        let (_worker_handle, commands) = worker::spawn(reconciler, zfs.clone(), "zroot".to_string());
+
+        let (apply_tx, apply_rx) = std::sync::mpsc::channel();
+        commands.send(Command::Apply(stateful_spec("db-1"), apply_tx)).unwrap();
+        apply_rx.recv().unwrap().unwrap();
+
+        let (del_tx, del_rx) = std::sync::mpsc::channel();
+        commands.send(Command::Delete("db-1".to_string(), del_tx)).unwrap();
+        del_rx.recv().unwrap().unwrap();
+
+        let handle = spawn("db-1".to_string(), "db-1-data".to_string(), "zroot".to_string(), zfs.clone(), commands.clone(), Duration::from_millis(20));
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = handle.join();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("expected the replication loop thread to exit once its replica record was deleted");
+    }
+}

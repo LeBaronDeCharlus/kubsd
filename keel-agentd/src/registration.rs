@@ -438,16 +438,19 @@ mod tests {
     #[test]
     fn registers_and_then_keeps_heartbeating() {
         let control_plane_addr = start_test_control_plane();
+        let zfs = keel_zfs::FakeZfsManager::new();
         let (_worker_handle, commands) = crate::worker::spawn(
             crate::Reconciler::new(
                 keel_jail::FakeJailRuntime::new(),
-                keel_zfs::FakeZfsManager::new(),
+                zfs.clone(),
                 keel_net::FakeNetManager::new(),
                 keel_jail::FakeMountManager::new(),
                 "zroot".to_string(),
                 std::env::temp_dir().join("keel-agentd-registration-test-registers_and_then_keeps_heartbeating"),
             )
             .unwrap(),
+            zfs,
+            "zroot".to_string(),
         );
         let _handle = spawn(
             "node-1".to_string(),
@@ -475,14 +478,14 @@ mod tests {
         zfs.seed_dataset("zroot/keel/base/14.2-web");
         let reconciler = crate::Reconciler::new(
             keel_jail::FakeJailRuntime::new(),
-            zfs,
+            zfs.clone(),
             keel_net::FakeNetManager::new(),
             keel_jail::FakeMountManager::new(),
             "zroot".to_string(),
             std::env::temp_dir().join("keel-agentd-registration-test-heartbeats_report_the_reconcilers_committed_resources"),
         )
         .unwrap();
-        let (_worker_handle, commands) = crate::worker::spawn(reconciler);
+        let (_worker_handle, commands) = crate::worker::spawn(reconciler, zfs, "zroot".to_string());
 
         let (apply_tx, apply_rx) = mpsc::channel();
         commands
@@ -539,16 +542,19 @@ mod tests {
 
         let net = keel_net::FakeNetManager::new();
         net.ensure_bridge_exists("keel0").unwrap();
+        let zfs = keel_zfs::FakeZfsManager::new();
         let (_worker_handle, commands) = crate::worker::spawn(
             crate::Reconciler::new(
                 keel_jail::FakeJailRuntime::new(),
-                keel_zfs::FakeZfsManager::new(),
+                zfs.clone(),
                 net.clone(),
                 keel_jail::FakeMountManager::new(),
                 "zroot".to_string(),
                 std::env::temp_dir().join("keel-agentd-registration-test-a_heartbeat_aliases_and_proxies_an_applied_service"),
             )
             .unwrap(),
+            zfs,
+            "zroot".to_string(),
         );
         let pod_cidr_slot = crate::PodCidrSlot::new();
         // Port 1 on loopback: guaranteed nothing is listening there, so the
@@ -611,16 +617,19 @@ mod tests {
     #[test]
     fn registration_with_a_wrong_ca_certificate_never_registers() {
         let control_plane_addr = start_test_control_plane();
+        let zfs = keel_zfs::FakeZfsManager::new();
         let (_worker_handle, commands) = crate::worker::spawn(
             crate::Reconciler::new(
                 keel_jail::FakeJailRuntime::new(),
-                keel_zfs::FakeZfsManager::new(),
+                zfs.clone(),
                 keel_net::FakeNetManager::new(),
                 keel_jail::FakeMountManager::new(),
                 "zroot".to_string(),
                 std::env::temp_dir().join("keel-agentd-registration-test-registration_with_a_wrong_ca_certificate_never_registers"),
             )
             .unwrap(),
+            zfs,
+            "zroot".to_string(),
         );
         let _handle = spawn(
             "node-1".to_string(),
@@ -642,16 +651,19 @@ mod tests {
     #[test]
     fn a_successful_registration_stores_the_returned_pod_cidr_in_the_slot() {
         let control_plane_addr = start_test_control_plane();
+        let zfs = keel_zfs::FakeZfsManager::new();
         let (_worker_handle, commands) = crate::worker::spawn(
             crate::Reconciler::new(
                 keel_jail::FakeJailRuntime::new(),
-                keel_zfs::FakeZfsManager::new(),
+                zfs.clone(),
                 keel_net::FakeNetManager::new(),
                 keel_jail::FakeMountManager::new(),
                 "zroot".to_string(),
                 std::env::temp_dir().join("keel-agentd-registration-test-a_successful_registration_stores_the_returned_pod_cidr_in_the_slot"),
             )
             .unwrap(),
+            zfs,
+            "zroot".to_string(),
         );
         let pod_cidr_slot = crate::PodCidrSlot::new();
         let _handle = spawn(
@@ -720,16 +732,19 @@ mod tests {
         .unwrap();
 
         let net = keel_net::FakeNetManager::new();
+        let zfs = keel_zfs::FakeZfsManager::new();
         let (_worker_handle, commands) = crate::worker::spawn(
             crate::Reconciler::new(
                 keel_jail::FakeJailRuntime::new(),
-                keel_zfs::FakeZfsManager::new(),
+                zfs.clone(),
                 net.clone(),
                 keel_jail::FakeMountManager::new(),
                 "zroot".to_string(),
                 std::env::temp_dir().join("keel-agentd-registration-test-route_reconciliation_adds_a_route_for_a_peer"),
             )
             .unwrap(),
+            zfs,
+            "zroot".to_string(),
         );
         let pod_cidr_slot = crate::PodCidrSlot::new();
         let _handle = spawn(
@@ -781,16 +796,19 @@ mod tests {
         .unwrap();
 
         let net = keel_net::FakeNetManager::new();
+        let zfs = keel_zfs::FakeZfsManager::new();
         let (_worker_handle, commands) = crate::worker::spawn(
             crate::Reconciler::new(
                 keel_jail::FakeJailRuntime::new(),
-                keel_zfs::FakeZfsManager::new(),
+                zfs.clone(),
                 net.clone(),
                 keel_jail::FakeMountManager::new(),
                 "zroot".to_string(),
                 std::env::temp_dir().join("keel-agentd-registration-test-route_reconciliation_withdraws_a_route_once_the_peer_is_reported_dead"),
             )
             .unwrap(),
+            zfs,
+            "zroot".to_string(),
         );
         let pod_cidr_slot = crate::PodCidrSlot::new();
         let _handle = spawn(

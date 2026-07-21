@@ -174,7 +174,7 @@ mod tests {
     }
 
     fn spawn_test_worker(name: &str) -> mpsc::Sender<worker::Command> {
-        worker::spawn(test_reconciler(name)).1
+        worker::spawn(test_reconciler(name), FakeZfsManager::new(), "zroot".to_string()).1
     }
 
     // Binds a plain TCP listener standing in for a replica, echoing

@@ -81,9 +81,10 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Config {
 fn main() {
     let config = parse_args();
 
+    let zfs = CliZfsManager::new();
     let reconciler = Reconciler::new(
         ProcessJailRuntime::new(),
-        CliZfsManager::new(),
+        zfs.clone(),
         ProcessNetManager::new(),
         keel_jail::CliMountManager::new(),
         config.pool.clone(),
@@ -98,7 +99,7 @@ fn main() {
         config.socket.display()
     );
 
-    let (_worker_handle, commands) = worker::spawn(reconciler);
+    let (_worker_handle, commands) = worker::spawn(reconciler, zfs, config.pool.clone());
     let pod_cidr_slot = keel_agentd::PodCidrSlot::new();
     let replica_targets = keel_agentd::ReplicaTargetRegistry::load(config.state_dir.clone())
         .expect("failed to load replica-target state");
