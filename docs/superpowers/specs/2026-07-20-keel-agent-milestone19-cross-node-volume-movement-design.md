@@ -44,13 +44,21 @@ struct PendingFences { by_replica: HashMap<String, String> }  // replica_name ->
 
 `Standbys` is populated whenever the scheduler places a stateful replica's first index (alongside the existing `Placements` entry) and updated on every successful `force-repin`. `PendingFences` gains an entry only as part of a successful `force-repin` and loses one only once that node's heartbeat handling confirms the forced delete succeeded (see "Fencing" below).
 
-### `JailSpec` gains `replicate_to`
+Like `Placements` and `UsedAddresses`, both maps are owned by the single-writer `worker::spawn` thread alongside the `Registry` and `Services`, not read or written directly by HTTP handlers. Getting or updating them means adding new `Command` enum variants (e.g. `ResolveStandby`, `RecordStandby`, `CheckPendingFence`) that round-trip through the existing `mpsc::Sender<Command>` / oneshot-reply pattern `resolve_placement` already uses, matching how every other piece of control-plane state is touched today.
+
+### Scheduling: picking a standby
+
+Today's `services::pick_node_for_service` (and the `scheduler::pick_node` it wraps) returns exactly one node per call; nothing in the scheduler currently picks two nodes for one replica. Placing a stateful replica's standby means calling `pick_node_for_service` a second time, with the just-chosen primary node added to the busy-node exclusion set the first call already builds from `nodes_hosting_service`, so the two calls can never return the same node. `force-repin` step 5 reuses this same two-call shape when it needs to hand the freshly-promoted primary a fresh standby.
+
+### `Spec` gains `replicate_to`
+
+Alongside `volumes` (`keel-spec/src/types.rs`) — on the inner `Spec` struct, not the outer `JailSpec` envelope (`apiVersion`/`kind`/`metadata`/`spec`):
 
 ```rust
 replicate_to: Option<String>  // standby node's advertised "host:port" for its replication listener
 ```
 
-Set by the control plane whenever it forwards a stateful replica's spec to a node: at first scheduling, and again (pointing at a newly-chosen standby) as part of a `force-repin` promotion. `keel-agentd` persists this in its own on-disk `JailRecord`, the same crash-safe record Milestone 4 already keeps every other field in.
+Set by the control plane whenever it forwards a stateful replica's spec to a node: at first scheduling, and again (pointing at a newly-chosen standby) as part of a `force-repin` promotion. `keel-agentd` persists this in its own on-disk `JailRecord`, the same record Milestone 4 already keeps every other field in (write-then-rename to a `.yaml.tmp` path, so a crash can't leave a corrupt record — not a durability/fsync guarantee, just the existing "never partially written" property).
 
 A new endpoint, `PUT /jails/<name>/replicate-to`, lets the control plane retarget an *already-running* primary's replication without a full re-provision: it just updates the field on the existing `JailRecord`. This is the only mechanism `force-repin` needs to give a freshly-promoted primary a new standby — no separate "start replicating" command required, since the replication loop (below) polls this field on its own schedule.
 
@@ -79,7 +87,7 @@ fn send_snapshot(&self, dataset: &str, snapshot: &str, base: Option<&str>, out: 
 fn receive_snapshot(&self, dataset: &str, input: &mut dyn Read) -> Result<(), ZfsError>;
 ```
 
-`send_snapshot`/`receive_snapshot` shell out to `zfs send [-i <base>] <dataset>@<snapshot>` / `zfs receive <dataset>`, piping the spawned child process's stdout/stdin through the caller's `Write`/`Read`, following the same subprocess-wrapping style `CliZfsManager` already uses for every other operation. `base: None` means a full send: the first replication ever, or any time the standby reports it doesn't have the claimed base snapshot. `FakeZfsManager` models this with an in-memory dataset/snapshot map and synthetic byte markers, so replication logic is fully unit-testable without real ZFS.
+`send_snapshot`/`receive_snapshot` shell out to `zfs send [-i <base>] <dataset>@<snapshot>` / `zfs receive <dataset>`, piping the spawned child process's stdout/stdin through the caller's `Write`/`Read`. This is new subprocess-handling plumbing for `keel-zfs`, not just new methods in the existing style: every current `CliZfsManager` method (`create_volume`, `clone_from_base`, `destroy_dataset`) uses `Command::output()`, which buffers everything and returns only once the child has already exited, whereas streaming a live `zfs send`/`receive` needs `Command::spawn()` with `Stdio::piped()` so the caller can read/write the child while it's still running, then check its exit status once the stream is fully drained. `base: None` means a full send: the first replication ever, or any time the standby reports it doesn't have the claimed base snapshot. `FakeZfsManager` has no snapshot concept today at all (even `clone_from_base`'s fake just inserts a dataset name, with no notion of the `@keel` snapshot the real CLI implementation takes internally), so modeling snapshots there — an in-memory dataset/snapshot map and synthetic byte markers — is wholly new test scaffolding, not an extension of existing fake state.
 
 ### Replication wire protocol
 
