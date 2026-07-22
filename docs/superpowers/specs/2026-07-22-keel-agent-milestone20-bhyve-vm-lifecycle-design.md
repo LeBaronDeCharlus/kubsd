@@ -1,7 +1,34 @@
 # Milestone 20: Single-Node bhyve VM Lifecycle (Sub-Project 8, First Milestone)
 
-Status: Approved
+Status: Approved, shelved (blocked on real-hardware infra — see note below)
 Date: 2026-07-22
+
+**2026-07-22 update:** Implementation was paused before it started. The
+project's FreeBSD test VM (`root@192.168.64.2`) is arm64, not amd64, which
+already invalidates this doc's `-l bootrom,<UEFI firmware path>` framing —
+arm64 bhyve boots via the generic `-o bootrom=<path>` option with a
+U-Boot image (`u-boot-bhyve-arm64` package), not amd64's edk2/UEFI
+firmware, and has no `lpc` PCI device model. Worse, a live smoke test
+(`bhyve -c 1 -m 256M -s 0,hostbridge -s 3,virtio-blk,<zvol> -o
+bootrom=/usr/local/share/u-boot/u-boot-bhyve-arm64/u-boot.bin <name>`)
+fails at the kernel level with `vmm: Processor doesn't have support for
+virtualization`: this FreeBSD guest itself runs nested under UTM/QEMU
+with HVF acceleration on the Apple Silicon host, and that hypervisor
+doesn't expose EL2/nested-virt to the guest, so `vmm.ko` cannot create
+any VM context regardless of bhyve flags. This is a test-infrastructure
+gap, not a flaw in the design below. Apple Silicon (M3+, macOS 15+) does
+support nested virtualization, but only via UTM's Apple Virtualization
+backend (not QEMU), and Apple's own docs only confirm it for Linux
+guests — whether FreeBSD's `vmm.ko` works under it at all is unconfirmed.
+Given this project's methodology of verifying every FreeBSD-specific
+behavior on real hardware before locking in a plan (see README), and
+that bhyve support blocks nothing else on the roadmap, this milestone is
+shelved rather than implemented against unverifiable mechanics. Revisit
+once real bhyve-capable FreeBSD hardware (bare metal, a cloud instance
+with nested virt, or a confirmed-working Apple Virtualization setup) is
+available — at which point the `-o bootrom=`/U-Boot correction above
+must be folded into the Architecture section before writing an
+implementation plan.
 
 ## Context
 
@@ -63,7 +90,7 @@ down.
 
 ## Architecture
 
-### `keel-vm`: a new crate alongside `keel-jail`
+### `keel-vm`: a new workspace member alongside `keel-jail`
 
 ```rust
 pub trait VmRuntime {
@@ -171,6 +198,23 @@ first attempt at the real implementation will be correct.
 
 ## Open Questions / Deferred Decisions
 
+- How `destroy` locates the running bhyve process to stop when it's still
+  alive. `JailRuntime::destroy`'s real implementation doesn't need an
+  in-memory `Child` handle for this — `jail -r <name>` kills every process
+  in the jail directly via the OS jail subsystem, authoritative regardless
+  of what `ProcessJailRuntime` remembers, and its own `children: Mutex<Vec<
+  (String, Child)>>` bookkeeping exists only to reap already-dead zombies
+  afterward. bhyve has no equivalent "stop everything for this VM name"
+  primitive: the process is just a plain PID with no OS-level indexing by
+  VM name, so if `BhyveVmRuntime` tracks it only as an in-memory `Child`,
+  that link is lost across a `keel-agentd` restart — in tension with this
+  project's stated crash-safety bar ("killing the daemon...never leaves it
+  confused about what it manages"). Whether this milestone's `destroy`
+  needs to locate the process independent of any in-memory handle (e.g.
+  `pgrep -f` matching `name` in the bhyve command line) or whether
+  `bhyvectl --destroy` alone reliably force-exits the attached bhyve
+  process without one is left to real-hardware discovery, same as the
+  other mechanics below.
 - Whether `create`'s non-blocking contract needs a way to detect a launch
   failure that happens *inside* bhyve after the process spawns successfully
   (a bad disk path, a firmware file that doesn't exist) is left to

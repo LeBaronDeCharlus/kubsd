@@ -1295,9 +1295,13 @@ cluster-wide across all three nodes.
 18. Stateful services via node-pinning: `volumes` on `kind: Service`'s `template`, per-replica volume naming, `ReconcileServices` health-blind `present_indices` for stateful services (no automatic failover, no cross-node replication) (412 tests passing, clippy clean), 3-node VM verification passed (pinned-replica survival on a dead node, no rescheduling, self-healing recovery with data intact, scale-down/up volume durability, explicit `keelctl delete-volume` cleanup); also fixed a real pre-existing Milestone 17 bug, `rollback_provision` not unmounting volumes before destroying a failed provision's rootfs dataset
 19. Cross-node volume movement via replication and force re-pin: one standby node per stateful replica chosen at schedule time, `zfs send`/`receive` replication over a new plain-TCP wire protocol, `keelctl force-repin`, heartbeat-piggybacked fencing of a resurrected stale jail (479 tests passing, clippy clean); a final whole-branch review (after every individual task was already reviewed and approved) caught a Critical sender/receiver/prober key mismatch that would have made `force-repin` fail against every real standby, plus missing snapshot pruning and missing restart-resume, all fixed and re-verified; 3-node VM verification passed in full, directly exercising the Critical-bug fix (checksummed data replication, live pruning, a real `force-repin` promotion with a fresh standby, and fencing of the original node's resurrected jail)
 
+**Sub-project 8: bhyve VM workloads (shelved)**
+
+20. Single-node bhyve VM lifecycle: designed (`keel-vm` crate mirroring `keel-jail`'s `FakeVmRuntime`/`BhyveVmRuntime` split), but implementation was not started. The project's FreeBSD test VM is arm64 and runs nested under UTM/QEMU without EL2/nested-virt exposed to the guest, so `vmm.ko` cannot create any bhyve VM context there regardless of code correctness — confirmed with a live smoke test, not assumed. Shelved rather than built against unverifiable mechanics, consistent with this project's real-hardware verification discipline; see `docs/superpowers/specs/2026-07-22-keel-agent-milestone20-bhyve-vm-lifecycle-design.md` for the full finding and what would need to be true (bhyve-capable FreeBSD hardware) to resume.
+
 **Not yet designed** (future sub-projects, each will get its own spec):
 
-- bhyve VM workloads alongside jails
+- (bhyve is designed but shelved, see Sub-project 8 above; no other undesigned sub-projects remain)
 
 ## Platform support
 
