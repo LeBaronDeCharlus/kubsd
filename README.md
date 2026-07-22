@@ -1166,6 +1166,93 @@ session, rejected by their own TLS listener with a `certificate revoked`
 alert on first use (fixed by redistributing the current certificate from
 the control-plane host).
 
+### Milestone 19: cross-node volume movement via replication and force re-pin
+
+Milestone 18 traded automatic failover for the guarantee that a stateful
+replica's data is never silently abandoned or replaced with an empty
+volume: a replica pinned to a permanently-`Dead` node just stays down
+forever, with no operator verb to move it. This milestone, the third
+milestone in Sub-Project 7, closes that gap with the second mechanism
+Milestone 17 named but deferred: `zfs send`/`receive` replication to a
+second, standby node chosen at schedule time, plus the "force re-pin"
+verb Milestone 18 explicitly left undesigned. Failover stays fully
+manual by design, for the same reason Milestone 18 went health-blind
+rather than auto-rescheduling: automatic promotion on a heartbeat-timeout
+`Dead` status reopens the split-brain risk both milestones deliberately
+avoid.
+
+A review pass against the actual codebase, before any code was written,
+corrected four gaps between the design spec's prose and reality: control-plane
+state (the new `Standbys`/`PendingFences` maps) lives behind the existing
+single-writer worker actor, not touched directly by HTTP handlers, so the
+spec's plain-`HashMap` description needed a note about the `Command` enum
+integration that actually reaches it; picking a standby means calling the
+existing `pick_node_for_service` twice (nothing today selects two nodes for
+one replica); `replicate_to` belongs on the inner `Spec` struct, not the
+outer `JailSpec` envelope; and streaming `zfs send`/`receive` needs new
+`Command::spawn`-with-piped-stdio subprocess plumbing, not just new methods
+in `CliZfsManager`'s existing buffered-`Command::output()` style.
+
+Implementation surfaced two further real gaps, both fixed before this
+milestone's own tests could be trusted:
+
+- **A missing node-level `replicate_addr`.** `keel-agentd`'s replication
+  listener binds its own port, distinct from the main HTTP API, but nothing
+  taught the control plane that address — the standby-scheduling code
+  initially used `Registry::resolve()` (a node's HTTP address) for the value
+  embedded into `replicateTo`, which would have pointed every replication
+  connection at the wrong port. Fixed by having each node advertise a second,
+  optional `replicate_addr` at registration (`#[serde(default)]`, so every
+  existing registration body keeps parsing), with `Registry` gaining a
+  `replicate_addr()` accessor mirroring `pod_cidr()`. The same investigation
+  found `keel-agentd`'s `main()` had never actually been wired to bind and
+  start the replication listener at all — built, but never run.
+- **A Critical bug caught only by a final whole-branch review, after every
+  individual task had already been reviewed and approved in isolation.** The
+  replication sender wrote the wire protocol's `replica_name` header field as
+  the volume dataset's name (e.g. `db-0-data`), and the receiver keyed its
+  `ReplicaTarget` registry by that same value — internally consistent between
+  those two pieces, verified by their own tests. But `force-repin`'s readiness
+  probe (`GET /replica-targets/<name>`) queries by the plain replica name
+  (`db-0`), which could never match, so `force-repin` would 409 "standby not
+  ready" against every real, fully-replicated standby, forever. Every
+  per-task review missed it because each side's tests stubbed the other.
+  Fixed by keying the wire protocol and the registry by the plain replica
+  name throughout, reconstructing the `-data`-suffixed dataset name only
+  where the actual ZFS path is needed. The same review pass added two more
+  fixes matching explicit design-spec requirements that no per-task test had
+  covered: `keel-zfs` gained a `destroy_snapshot` primitive so the
+  replication loop actually prunes the previous snapshot on a successful
+  send (previously nothing pruned anything, ever), and a new
+  `Command::ResumeReplicationLoops`, replayed once at `keel-agentd` startup,
+  so replication actually resumes after a process restart instead of
+  silently stopping forever.
+
+479 tests pass across the workspace (clippy clean, no new warning
+categories). Real 3-node VM verification passed in full — and directly
+exercised the fix for the Critical bug above, not just the happy path a
+unit test can stub: a 2-replica stateful service ("db") scheduled its
+standbys using each node's real advertised `replicate_addr`, confirmed live
+in `db-0`'s own forwarded spec; both `keel-agentd` processes logged
+"serving replication listener," confirming the previously-missing listener
+startup now runs for real. A payload written into `db-0`'s live jail was
+replicated to its standby node within one tick, and cloning the exact
+replicated snapshot there and hashing it produced a byte-for-byte match
+against the primary's own file. The primary held exactly one snapshot at a
+time throughout (pruning confirmed live), while the standby correctly
+accumulated every one (the documented, unfixed asymmetry — only the sender
+prunes). Killing `db-0`'s primary node's `keel-agentd` and waiting past the
+`Dead` threshold left its pinned placement untouched, matching Milestone
+18's unchanged behavior; `keelctl force-repin db-0` against the real
+cluster then succeeded — promoting the standby with the data checksum
+still matching, assigning a fresh standby using its own `replicate_addr`,
+and starting a real new baseline replication to it, confirmed by a new
+dataset and snapshot appearing there. Restarting the original node found
+its own resurrected, orphaned FreeBSD jail (still running after the daemon
+process died, independent of it) torn down by the fencing push within one
+heartbeat of re-registering, leaving exactly one running copy of `db-0`
+cluster-wide across all three nodes.
+
 ## Roadmap
 
 **Sub-project 1: single-node jail reconciliation daemon (complete)**
@@ -1206,10 +1293,10 @@ the control-plane host).
 
 17. Persistent volumes on a single node: `spec.volumes` on `kind: Jail`, `create_volume`/decoupled dataset lifecycle, `MountManager` (`mount -t nullfs`), `GET`/`DELETE /volumes/<name>`, `keelctl delete-volume` (403 tests passing), 3-node VM verification passed (create/write/delete/re-apply/read-back, 409-while-in-use, 404-after-delete, no-volumes jail unaffected)
 18. Stateful services via node-pinning: `volumes` on `kind: Service`'s `template`, per-replica volume naming, `ReconcileServices` health-blind `present_indices` for stateful services (no automatic failover, no cross-node replication) (412 tests passing, clippy clean), 3-node VM verification passed (pinned-replica survival on a dead node, no rescheduling, self-healing recovery with data intact, scale-down/up volume durability, explicit `keelctl delete-volume` cleanup); also fixed a real pre-existing Milestone 17 bug, `rollback_provision` not unmounting volumes before destroying a failed provision's rootfs dataset
+19. Cross-node volume movement via replication and force re-pin: one standby node per stateful replica chosen at schedule time, `zfs send`/`receive` replication over a new plain-TCP wire protocol, `keelctl force-repin`, heartbeat-piggybacked fencing of a resurrected stale jail (479 tests passing, clippy clean); a final whole-branch review (after every individual task was already reviewed and approved) caught a Critical sender/receiver/prober key mismatch that would have made `force-repin` fail against every real standby, plus missing snapshot pruning and missing restart-resume, all fixed and re-verified; 3-node VM verification passed in full, directly exercising the Critical-bug fix (checksummed data replication, live pruning, a real `force-repin` promotion with a fresh standby, and fencing of the original node's resurrected jail)
 
 **Not yet designed** (future sub-projects, each will get its own spec):
 
-- Cross-node volume movement: `zfs send`/`receive` replication (or another mechanism) so a stateful replica's data can follow it off a permanently-gone node, plus an operator "force re-pin" verb
 - bhyve VM workloads alongside jails
 
 ## Platform support
