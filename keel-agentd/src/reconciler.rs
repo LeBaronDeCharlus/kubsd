@@ -1031,4 +1031,25 @@ mod tests {
         assert_eq!(reconciler.list_ingress().len(), 1);
         assert_eq!(reconciler.get_ingress("blog").unwrap().spec.spec.host, "blog.example.com");
     }
+
+    #[test]
+    fn re_applying_an_existing_ingress_preserves_cert_expires_at_unix() {
+        let dir = test_state_dir("re_applying_an_existing_ingress_preserves_cert_expires_at_unix");
+        let mut reconciler = new_reconciler(dir);
+
+        // Apply ingress with initial host
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+
+        // Manually set cert_expires_at_unix to simulate a certificate that was issued
+        let cert_timestamp = 1_800_000_000i64;
+        reconciler.ingress_records.get_mut("blog").unwrap().cert_expires_at_unix = Some(cert_timestamp);
+
+        // Re-apply the same ingress with a different host
+        reconciler.apply_ingress(sample_ingress_spec("blog", "blog.example.com")).unwrap();
+
+        // Verify the certificate expiry is preserved despite the re-apply
+        let record = reconciler.get_ingress("blog").unwrap();
+        assert_eq!(record.cert_expires_at_unix, Some(cert_timestamp), "cert_expires_at_unix must be preserved across re-apply");
+        assert_eq!(record.spec.spec.host, "blog.example.com", "host should be updated to the new value");
+    }
 }
