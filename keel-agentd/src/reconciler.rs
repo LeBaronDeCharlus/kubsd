@@ -331,7 +331,13 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J
             metadata: keel_spec::Metadata { name: "ingress".to_string() },
             spec: keel_spec::Spec {
                 image: "base/keel-ingress".to_string(),
-                command: vec!["/usr/local/sbin/nginx".to_string(), "-g".to_string(), "daemon off;".to_string()],
+                command: vec![
+                    "/usr/local/sbin/nginx".to_string(),
+                    "-c".to_string(),
+                    crate::nginx::NGINX_CONF_PATH.to_string(),
+                    "-g".to_string(),
+                    "daemon off;".to_string(),
+                ],
                 network: keel_spec::NetworkSpec {
                     vnet: true,
                     bridge: "keel0".to_string(),
@@ -398,9 +404,20 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J
                 continue;
             }
             let record = self.ingress_records[&name].clone();
+            let cert_file_missing = !self.cert_exists_in_ingress_jail(&record.spec.spec.host);
             let needs_issuance = match record.cert_expires_at_unix {
                 None => true,
-                Some(expires_at) => expires_at - now_unix < RENEWAL_THRESHOLD_SECS,
+                // A timestamp alone isn't proof the cert is actually usable:
+                // if the ingress jail's rootfs was ever recreated (e.g. lost
+                // and re-cloned from the base image after a crash, or torn
+                // down and reprovisioned), `cert_expires_at_unix` still
+                // claims a valid cert while the file itself is gone from the
+                // new rootfs. Reproduced directly during Milestone 21 VM
+                // verification: recreating the ingress jail to fix an
+                // unrelated base-image issue silently wiped the previously
+                // issued cert while the `Ingress` record's own expiry
+                // timestamp (persisted separately) still looked fine.
+                Some(expires_at) => cert_file_missing || expires_at - now_unix < RENEWAL_THRESHOLD_SECS,
             };
             if !needs_issuance {
                 continue;
@@ -469,6 +486,11 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J
         if let Err(e) = self.nginx.reload("keel-ingress") {
             eprintln!("keel-agentd: failed to reload ingress nginx: {e}");
         }
+    }
+
+    fn cert_exists_in_ingress_jail(&self, host: &str) -> bool {
+        let crt_path = record::jail_rootfs_path(&self.pool, "ingress").join("usr/local/etc/nginx/certs").join(format!("{host}.crt"));
+        crt_path.is_file()
     }
 
     fn write_cert_to_ingress_jail(&self, host: &str, cert: &keel_ingress::Cert) -> Result<(), ReconcileError> {
@@ -1367,6 +1389,34 @@ mod tests {
         // expiry must be untouched by this second pass.
         reconciler.reconcile_certs(now + 60);
         assert_eq!(reconciler.get_ingress("blog").unwrap().cert_expires_at_unix, first_expiry);
+    }
+
+    #[test]
+    fn reconcile_certs_reissues_when_the_cert_file_is_missing_even_with_a_fresh_expiry_timestamp() {
+        // Reproduces a real bug found during Milestone 21 VM verification:
+        // the ingress jail's rootfs was recreated (destroyed and
+        // reprovisioned) after a cert had already been issued into it, and
+        // `cert_expires_at_unix` (persisted separately from the jail's own
+        // filesystem) still claimed the cert was valid and unexpired, so
+        // `reconcile_certs` never re-issued a replacement even though the
+        // actual `.crt`/`.key` files were gone from the new rootfs.
+        let dir = test_state_dir("reconcile_certs_reissues_when_the_cert_file_is_missing");
+        let mut reconciler = test_reconciler_with_acme(&dir, keel_ingress::FakeAcmeClient::new(), keel_ingress::FakeDnsProvider::new());
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        let now = 1_800_000_000;
+        reconciler.reconcile_certs(now);
+        assert!(reconciler.get_ingress("blog").unwrap().cert_expires_at_unix.is_some());
+
+        // Simulate the jail's rootfs being lost/recreated: delete the cert
+        // files on disk without touching the persisted `cert_expires_at_unix`.
+        let certs_dir = certs_dir_for(&reconciler);
+        fs::remove_file(certs_dir.join("example.com.crt")).unwrap();
+        fs::remove_file(certs_dir.join("example.com.key")).unwrap();
+
+        // Only 60 seconds later, well inside the 30-day threshold - but the
+        // missing cert file must still force reissuance.
+        reconciler.reconcile_certs(now + 60);
+        assert!(fs::read_to_string(certs_dir.join("example.com.crt")).unwrap().contains("example.com"), "cert file should have been reissued");
     }
 
     #[test]

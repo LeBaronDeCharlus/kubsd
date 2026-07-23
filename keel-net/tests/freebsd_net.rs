@@ -232,6 +232,64 @@ fn attach_jail_supports_two_jails_on_the_same_bridge() {
 }
 
 #[test]
+fn attach_jail_supports_two_distinct_subnets_gateways_coexisting_on_one_bridge() {
+    // Reproduces a real bug found during Milestone 21 VM verification:
+    // `attach_jail`'s gateway address used to be set with a plain
+    // `ifconfig <bridge> inet <addr>` (no `alias`), which *replaces* the
+    // bridge's primary address rather than adding a second one alongside
+    // it. Every milestone before 21 only ever put jails from the SAME
+    // subnet (one node's own pod-CIDR) on a given bridge, so this was
+    // never exercised - Milestone 21 was the first to put a second,
+    // unrelated subnet (the singleton ingress jail's fixed `10.0.0.0/24`)
+    // on the same bridge as the node's ordinary jails, and attaching the
+    // second subnet's jail silently evicted the first subnet's gateway,
+    // breaking every already-running jail in that first subnet.
+    let net = ProcessNetManager::new();
+    let bridge = "keel-test-br8";
+    let jail_a = "keel-net-test-subnet-a";
+    let jail_b = "keel-net-test-subnet-b";
+    let epair_a = "epair58";
+    let epair_b = "epair59";
+
+    destroy_interface_if_exists(&format!("{epair_a}a"));
+    destroy_interface_if_exists(&format!("{epair_b}a"));
+    destroy_interface_if_exists(bridge);
+    let jails_a = make_test_jail(jail_a);
+    let jails_b = make_test_jail(jail_b);
+
+    net.ensure_bridge_exists(bridge).expect("bridge should be created");
+
+    // Two completely distinct /24 subnets on the same bridge - not two
+    // jails sharing one subnet, which `attach_jail_supports_two_jails_
+    // on_the_same_bridge` above already covers.
+    net.attach_jail(jail_a, bridge, epair_a, "10.99.30.5/24").expect("first subnet's attach_jail should succeed");
+    net.attach_jail(jail_b, bridge, epair_b, "10.99.31.5/24").expect("second subnet's attach_jail should succeed");
+
+    let bridge_check = Command::new("ifconfig").arg(bridge).output().expect("ifconfig should run");
+    let bridge_output = String::from_utf8_lossy(&bridge_check.stdout);
+    assert!(
+        bridge_output.contains("10.99.30.1"),
+        "expected the first subnet's gateway to still be present after attaching the second subnet's jail: {bridge_output}"
+    );
+    assert!(bridge_output.contains("10.99.31.1"), "expected the second subnet's gateway to be present: {bridge_output}");
+
+    let route_a = Command::new("jexec")
+        .args([jail_a, "/sbin/route", "-n", "get", "default"])
+        .output()
+        .expect("jexec route should run");
+    assert!(
+        String::from_utf8_lossy(&route_a.stdout).contains("10.99.30.1"),
+        "first jail's default route should still point at its own gateway"
+    );
+
+    jails_a.destroy(jail_a).expect("cleanup destroy should succeed");
+    jails_b.destroy(jail_b).expect("cleanup destroy should succeed");
+    destroy_interface_if_exists(&format!("{epair_a}a"));
+    destroy_interface_if_exists(&format!("{epair_b}a"));
+    destroy_interface_if_exists(bridge);
+}
+
+#[test]
 fn attach_jail_tolerates_restart_with_same_address() {
     let net = ProcessNetManager::new();
     let bridge = "keel-test-br7";

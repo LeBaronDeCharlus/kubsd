@@ -65,17 +65,51 @@ impl Default for ProcessJailRuntime {
 
 impl JailRuntime for ProcessJailRuntime {
     fn create(&self, name: &str, rootfs: &Path, vnet: bool) -> Result<(), JailError> {
+        // `mount.devfs` below requires `<rootfs>/dev` to already exist as a
+        // directory; a real jail's rootfs (cloned from a base image via
+        // ZFS) already has one, but this makes `create` robust regardless
+        // of what the rootfs happened to contain beforehand, rather than
+        // relying on every caller to have created it.
+        std::fs::create_dir_all(rootfs.join("dev")).map_err(|e| JailError::Spawn("mkdir devfs mountpoint".to_string(), e))?;
+
         let path_arg = format!("path={}", rootfs.display());
         let name_arg = format!("name={name}");
         let mut args: Vec<&str> = vec!["-c", &name_arg, &path_arg];
         if vnet {
             args.push("vnet");
         }
+        // Without this, the jail's own `/dev` is an empty directory: no
+        // `/dev/null`, `/dev/random`, etc. Every previous real-VM test
+        // happened to only ever run statically-linked `/rescue/*` binaries
+        // or shell builtins, none of which touch `/dev` from inside the
+        // jail, so this went undetected until a real dynamically-linked
+        // workload (Milestone 21's Python test backend) needed
+        // `/dev/null` for its own dynamic linker and failed outright.
+        // `devfs_ruleset=4` is FreeBSD's standard `devfsrules_jail` set
+        // (`/etc/defaults/devfs.rules`): null/zero/random/urandom/crypto,
+        // pty/tty, fd/stdin/stdout/stderr, fuse, zfs — deliberately not
+        // ruleset 0 (unrestricted), which would expose the host's raw
+        // disk devices to the jail.
+        args.push("mount.devfs");
+        args.push("devfs_ruleset=4");
         args.push("persist");
         Self::run_checked("jail", &args)
     }
 
     fn destroy(&self, name: &str) -> Result<(), JailError> {
+        // Must be captured before `jail -r` below: once the jail is gone,
+        // `jls` can no longer report its `path`. `jail -r` does not itself
+        // unmount `devfs` from `<path>/dev` (confirmed directly against a
+        // real jail during Milestone 21 VM verification: the mount was
+        // still present in `mount(8)`'s output after removal), so this is
+        // undone explicitly below rather than assumed automatic.
+        let devfs_path = Self::run("jls", &["-j", name, "path"])
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|p| !p.is_empty())
+            .map(|p| Path::new(&p).join("dev"));
+
         let output = Self::run("jail", &["-r", name])?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -99,6 +133,15 @@ impl JailRuntime for ProcessJailRuntime {
                 stderr.into_owned(),
             ));
         }
+
+        // Best-effort: an already-unmounted `/dev` (e.g. a jail created
+        // before this fix, or destroy called twice) is not an error here,
+        // matching every other idempotent-on-absence cleanup step in this
+        // project (`remove_resource_limits`, `detach_jail`, ...).
+        if let Some(devfs_path) = devfs_path {
+            let _ = Self::run("umount", &[devfs_path.to_string_lossy().as_ref()]);
+        }
+
         // `jail -r` kills every process in the jail and blocks until
         // removal completes, but the kernel doesn't fully release a killed
         // child until its parent (us, since `start_command` spawned it via

@@ -1,6 +1,18 @@
 use std::sync::Mutex;
 use thiserror::Error;
 
+/// Passed explicitly to every real nginx invocation (jail start command,
+/// `-t`, `-s reload`) rather than relying on nginx's own compiled-in
+/// default: FreeBSD 15's `freenginx` package defaults to
+/// `/usr/local/etc/freenginx/nginx.conf`, not `/usr/local/etc/nginx/
+/// nginx.conf` — discovered directly on the real FreeBSD VPS during
+/// Milestone 21 verification (`nginx -V`'s advertised default is a
+/// build-time/package choice this project has no control over and
+/// shouldn't depend on). Always passing `-c` here means the config path
+/// `write_config` writes to is the one path that matters, regardless of
+/// what any given nginx package build defaults to.
+pub const NGINX_CONF_PATH: &str = "/usr/local/etc/nginx/nginx.conf";
+
 #[derive(Debug, Error)]
 pub enum NginxError {
     #[error("failed to write nginx config: {0}")]
@@ -101,7 +113,9 @@ impl NginxController for JexecNginxController {
     }
 
     fn test_config(&self, jail_name: &str) -> Result<(), NginxError> {
-        let output = self.run_jexec(jail_name, &["/usr/local/sbin/nginx", "-t"]).map_err(|e| NginxError::ValidationFailed(e.to_string()))?;
+        let output = self
+            .run_jexec(jail_name, &["/usr/local/sbin/nginx", "-c", NGINX_CONF_PATH, "-t"])
+            .map_err(|e| NginxError::ValidationFailed(e.to_string()))?;
         if output.status.success() {
             Ok(())
         } else {
@@ -110,7 +124,9 @@ impl NginxController for JexecNginxController {
     }
 
     fn reload(&self, jail_name: &str) -> Result<(), NginxError> {
-        let output = self.run_jexec(jail_name, &["/usr/local/sbin/nginx", "-s", "reload"]).map_err(|e| NginxError::ReloadFailed(e.to_string()))?;
+        let output = self
+            .run_jexec(jail_name, &["/usr/local/sbin/nginx", "-c", NGINX_CONF_PATH, "-s", "reload"])
+            .map_err(|e| NginxError::ReloadFailed(e.to_string()))?;
         if output.status.success() {
             Ok(())
         } else {

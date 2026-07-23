@@ -122,6 +122,35 @@ fn destroy_on_a_never_created_jail_returns_not_found() {
 }
 
 #[test]
+fn create_mounts_devfs_so_dev_null_exists_inside_the_jail_and_destroy_unmounts_it() {
+    // Reproduces a real bug found during Milestone 21 VM verification:
+    // `create` never mounted `devfs`, so a jail's own `/dev` was an empty
+    // directory. Every prior real-VM test happened to only run
+    // statically-linked `/rescue/*` binaries or shell builtins, none of
+    // which touch `/dev` from inside the jail, so this went undetected
+    // until a real dynamically-linked workload (a Python interpreter)
+    // needed `/dev/null` for its own dynamic linker and failed outright.
+    let runtime = ProcessJailRuntime::new();
+    let name = "keel-test-devfs";
+    let rootfs = Path::new("/tmp/keel-test-devfs-rootfs");
+    std::fs::create_dir_all(rootfs.join("dev")).unwrap();
+
+    let _ = runtime.destroy(name);
+    runtime.create(name, rootfs, false).expect("create should succeed");
+
+    assert!(rootfs.join("dev/null").exists(), "expected /dev/null to exist inside the jail's rootfs after create");
+
+    runtime.destroy(name).expect("destroy should succeed");
+
+    let mount_output = std::process::Command::new("mount").output().expect("mount should run");
+    let mount_table = String::from_utf8_lossy(&mount_output.stdout);
+    assert!(
+        !mount_table.contains(&*rootfs.join("dev").to_string_lossy()),
+        "devfs should be unmounted from the jail's rootfs after destroy, but mount(8) still shows it:\n{mount_table}"
+    );
+}
+
+#[test]
 fn jail_exists_distinguishes_created_from_never_existed() {
     let runtime = ProcessJailRuntime::new();
     let name = "keel-test-jail-exists";

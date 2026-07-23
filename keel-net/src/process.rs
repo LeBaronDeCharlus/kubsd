@@ -65,11 +65,25 @@ impl NetManager for ProcessNetManager {
             return Err(NetError::NotFound(bridge.to_string()));
         }
 
+        // `alias`, not a plain `inet` set: a bridge on a single node can now
+        // carry more than one distinct subnet's gateway at once (the node's
+        // own pod-CIDR, plus the Milestone 21 singleton ingress jail's own
+        // fixed `10.0.0.0/24`). A non-aliased `ifconfig <bridge> inet <addr>`
+        // *replaces* the bridge's primary address rather than adding a
+        // second one alongside it, so attaching a jail from a different
+        // subnet than whatever was already primary silently evicted the
+        // other subnet's gateway — reproduced directly during Milestone 21
+        // VM verification: applying an `Ingress` (address `10.0.0.2/24`)
+        // after a `Service` replica (address `10.0.131.2/24`) knocked the
+        // Service's own gateway off the bridge, breaking every existing
+        // Service on the node. `bridge_gateway`'s returned string already
+        // carries an explicit prefix length, so `alias` here needs no
+        // separate netmask handling the way `add_alias`'s VIP case does.
         let gateway = crate::bridge_gateway(address);
-        let gateway_set = Self::run("ifconfig", &[bridge, "inet", &gateway])?;
+        let gateway_set = Self::run("ifconfig", &[bridge, "inet", &gateway, "alias"])?;
         if !gateway_set.status.success() && !Self::stderr_contains(&gateway_set, "File exists") {
             return Err(NetError::CommandFailed(
-                format!("ifconfig {bridge} inet {gateway}"),
+                format!("ifconfig {bridge} inet {gateway} alias"),
                 gateway_set.status,
                 String::from_utf8_lossy(&gateway_set.stderr).into_owned(),
             ));
@@ -157,7 +171,12 @@ impl NetManager for ProcessNetManager {
 
     fn remove_route(&self, subnet: &str) -> Result<(), NetError> {
         let output = Self::run("route", &["delete", "-net", subnet])?;
-        if output.status.success() || Self::stderr_contains(&output, "not in table") {
+        // FreeBSD 15.0's `route(8)` reports a missing route as "route has
+        // not been found", not "not in table" - discovered directly on the
+        // real FreeBSD VPS during Milestone 21 verification. Checking for
+        // both keeps this tolerant of whichever wording an older FreeBSD
+        // release this project might still run against uses.
+        if output.status.success() || Self::stderr_contains(&output, "not in table") || Self::stderr_contains(&output, "has not been found") {
             Ok(())
         } else {
             Err(NetError::CommandFailed(
