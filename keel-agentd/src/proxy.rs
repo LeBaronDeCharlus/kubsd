@@ -171,6 +171,8 @@ mod tests {
             std::env::temp_dir().join(format!("keel-agentd-proxy-test-{name}")),
             Box::new(keel_ingress::FakeAcmeClient::new()),
             Box::new(keel_ingress::FakeDnsProvider::new()),
+            Box::new(crate::nginx::FakeNginxController::new()),
+            crate::ServiceVipSlot::new(),
         )
         .unwrap()
     }

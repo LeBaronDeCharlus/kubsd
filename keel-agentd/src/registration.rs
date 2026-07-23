@@ -354,6 +354,8 @@ mod tests {
                 std::env::temp_dir().join(format!("keel-agentd-registration-test-{name}")),
                 Box::new(keel_ingress::FakeAcmeClient::new()),
                 Box::new(keel_ingress::FakeDnsProvider::new()),
+                Box::new(crate::nginx::FakeNginxController::new()),
+                crate::ServiceVipSlot::new(),
             )
             .unwrap(),
             zfs,
@@ -521,6 +523,8 @@ mod tests {
                 std::env::temp_dir().join("keel-agentd-registration-test-registers_and_then_keeps_heartbeating"),
                 Box::new(keel_ingress::FakeAcmeClient::new()),
                 Box::new(keel_ingress::FakeDnsProvider::new()),
+                Box::new(crate::nginx::FakeNginxController::new()),
+                crate::ServiceVipSlot::new(),
             )
             .unwrap(),
             zfs,
@@ -561,6 +565,8 @@ mod tests {
             std::env::temp_dir().join("keel-agentd-registration-test-heartbeats_report_the_reconcilers_committed_resources"),
             Box::new(keel_ingress::FakeAcmeClient::new()),
             Box::new(keel_ingress::FakeDnsProvider::new()),
+            Box::new(crate::nginx::FakeNginxController::new()),
+            crate::ServiceVipSlot::new(),
         )
         .unwrap();
         let (_worker_handle, commands) = crate::worker::spawn(reconciler, zfs, "zroot".to_string());
@@ -633,6 +639,8 @@ mod tests {
                 std::env::temp_dir().join("keel-agentd-registration-test-a_heartbeat_aliases_and_proxies_an_applied_service"),
                 Box::new(keel_ingress::FakeAcmeClient::new()),
                 Box::new(keel_ingress::FakeDnsProvider::new()),
+                Box::new(crate::nginx::FakeNginxController::new()),
+                crate::ServiceVipSlot::new(),
             )
             .unwrap(),
             zfs,
@@ -712,6 +720,8 @@ mod tests {
                 std::env::temp_dir().join("keel-agentd-registration-test-registration_with_a_wrong_ca_certificate_never_registers"),
                 Box::new(keel_ingress::FakeAcmeClient::new()),
                 Box::new(keel_ingress::FakeDnsProvider::new()),
+                Box::new(crate::nginx::FakeNginxController::new()),
+                crate::ServiceVipSlot::new(),
             )
             .unwrap(),
             zfs,
@@ -750,6 +760,8 @@ mod tests {
                 std::env::temp_dir().join("keel-agentd-registration-test-a_successful_registration_stores_the_returned_pod_cidr_in_the_slot"),
                 Box::new(keel_ingress::FakeAcmeClient::new()),
                 Box::new(keel_ingress::FakeDnsProvider::new()),
+                Box::new(crate::nginx::FakeNginxController::new()),
+                crate::ServiceVipSlot::new(),
             )
             .unwrap(),
             zfs,
@@ -835,6 +847,8 @@ mod tests {
                 std::env::temp_dir().join("keel-agentd-registration-test-route_reconciliation_adds_a_route_for_a_peer"),
                 Box::new(keel_ingress::FakeAcmeClient::new()),
                 Box::new(keel_ingress::FakeDnsProvider::new()),
+                Box::new(crate::nginx::FakeNginxController::new()),
+                crate::ServiceVipSlot::new(),
             )
             .unwrap(),
             zfs,
@@ -903,6 +917,8 @@ mod tests {
                 std::env::temp_dir().join("keel-agentd-registration-test-route_reconciliation_withdraws_a_route_once_the_peer_is_reported_dead"),
                 Box::new(keel_ingress::FakeAcmeClient::new()),
                 Box::new(keel_ingress::FakeDnsProvider::new()),
+                Box::new(crate::nginx::FakeNginxController::new()),
+                crate::ServiceVipSlot::new(),
             )
             .unwrap(),
             zfs,

@@ -132,7 +132,7 @@ mod tests {
         let dir = test_state_dir("a_tick_snapshots_and_sends_a_full_replication_on_first_contact");
         let zfs = FakeZfsManager::new();
         zfs.seed_dataset("zroot/keel/base/14.2-web");
-        let reconciler = Reconciler::new(FakeJailRuntime::new(), zfs.clone(), FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), dir, Box::new(keel_ingress::FakeAcmeClient::new()), Box::new(keel_ingress::FakeDnsProvider::new())).unwrap();
+        let reconciler = Reconciler::new(FakeJailRuntime::new(), zfs.clone(), FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), dir, Box::new(keel_ingress::FakeAcmeClient::new()), Box::new(keel_ingress::FakeDnsProvider::new()), Box::new(crate::nginx::FakeNginxController::new()), crate::ServiceVipSlot::new()).unwrap();
         let (_worker_handle, commands) = worker::spawn(reconciler, zfs.clone(), "zroot".to_string());
 
         let (apply_tx, apply_rx) = std::sync::mpsc::channel();
@@ -175,7 +175,7 @@ mod tests {
         let dir = test_state_dir("a_successful_send_prunes_the_previous_confirmed_snapshot");
         let zfs = FakeZfsManager::new();
         zfs.seed_dataset("zroot/keel/base/14.2-web");
-        let reconciler = Reconciler::new(FakeJailRuntime::new(), zfs.clone(), FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), dir, Box::new(keel_ingress::FakeAcmeClient::new()), Box::new(keel_ingress::FakeDnsProvider::new())).unwrap();
+        let reconciler = Reconciler::new(FakeJailRuntime::new(), zfs.clone(), FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), dir, Box::new(keel_ingress::FakeAcmeClient::new()), Box::new(keel_ingress::FakeDnsProvider::new()), Box::new(crate::nginx::FakeNginxController::new()), crate::ServiceVipSlot::new()).unwrap();
         let (_worker_handle, commands) = worker::spawn(reconciler, zfs.clone(), "zroot".to_string());
 
         let (apply_tx, apply_rx) = std::sync::mpsc::channel();
@@ -226,7 +226,7 @@ mod tests {
         let dir = test_state_dir("the_loop_exits_once_its_replica_record_is_deleted");
         let zfs = FakeZfsManager::new();
         zfs.seed_dataset("zroot/keel/base/14.2-web");
-        let reconciler = Reconciler::new(FakeJailRuntime::new(), zfs.clone(), FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), dir, Box::new(keel_ingress::FakeAcmeClient::new()), Box::new(keel_ingress::FakeDnsProvider::new())).unwrap();
+        let reconciler = Reconciler::new(FakeJailRuntime::new(), zfs.clone(), FakeNetManager::new(), FakeMountManager::new(), "zroot".to_string(), dir, Box::new(keel_ingress::FakeAcmeClient::new()), Box::new(keel_ingress::FakeDnsProvider::new()), Box::new(crate::nginx::FakeNginxController::new()), crate::ServiceVipSlot::new()).unwrap();
         let (_worker_handle, commands) = worker::spawn(reconciler, zfs.clone(), "zroot".to_string());
 
         let (apply_tx, apply_rx) = std::sync::mpsc::channel();

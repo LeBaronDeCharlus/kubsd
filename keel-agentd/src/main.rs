@@ -86,6 +86,12 @@ fn main() {
     let config = parse_args();
 
     let zfs = CliZfsManager::new();
+    // Created here (rather than after the reconciler, as before) so the same
+    // shared slot can be handed to the reconciler below -- it must be the
+    // identical instance that `registration::spawn`'s heartbeat loop and
+    // `http::run`/`run_tls` populate/read, not an independent one, or the
+    // reconciler's ingress-config regeneration would never see a real VIP.
+    let service_vips = keel_agentd::ServiceVipSlot::new();
     let reconciler = Reconciler::new(
         ProcessJailRuntime::new(),
         zfs.clone(),
@@ -97,6 +103,10 @@ fn main() {
         // exist until Tasks 15/16 -- Task 17 replaces these.
         Box::new(keel_ingress::FakeAcmeClient::new()),
         Box::new(keel_ingress::FakeDnsProvider::new()),
+        // Temporary placeholder: the real jexec(8)-based nginx controller
+        // doesn't exist yet -- a later task replaces this.
+        Box::new(keel_agentd::nginx::FakeNginxController::new()),
+        service_vips.clone(),
     )
     .expect("failed to initialize reconciler from on-disk state");
 
@@ -114,7 +124,6 @@ fn main() {
         .expect("worker command channel closed before startup completed");
     resume_rx.recv().expect("worker dropped without replying to ResumeReplicationLoops");
     let pod_cidr_slot = keel_agentd::PodCidrSlot::new();
-    let service_vips = keel_agentd::ServiceVipSlot::new();
     let replica_targets = keel_agentd::ReplicaTargetRegistry::load(config.state_dir.clone())
         .expect("failed to load replica-target state");
 

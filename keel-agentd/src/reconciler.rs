@@ -47,6 +47,8 @@ pub struct Reconciler<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountMana
     ingress_backoff: HashMap<String, BackoffState>,
     acme: Box<dyn keel_ingress::AcmeClient + Send>,
     dns: Box<dyn keel_ingress::DnsProvider + Send>,
+    nginx: Box<dyn crate::nginx::NginxController + Send>,
+    service_vips: crate::ServiceVipSlot,
 }
 
 impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J, Z, N, M> {
@@ -60,6 +62,8 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J
         state_dir: PathBuf,
         acme: Box<dyn keel_ingress::AcmeClient + Send>,
         dns: Box<dyn keel_ingress::DnsProvider + Send>,
+        nginx: Box<dyn crate::nginx::NginxController + Send>,
+        service_vips: crate::ServiceVipSlot,
     ) -> Result<Self, ReconcileError> {
         let loaded = store::load_all(&state_dir)?;
         let next_epair_ordinal = loaded.iter().map(|r| r.epair_ordinal).max().map(|m| m + 1).unwrap_or(1);
@@ -80,6 +84,8 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J
             ingress_backoff: HashMap::new(),
             acme,
             dns,
+            nginx,
+            service_vips,
         })
     }
 
@@ -349,6 +355,7 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         self.reconcile_certs(now_unix);
+        self.reconcile_ingress_config();
         let names: Vec<String> = self.records.keys().cloned().collect();
         let mut failures = Vec::new();
         for name in names {
@@ -423,6 +430,44 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J
                     self.ingress_backoff.get_mut(&name).unwrap().record_attempt(Instant::now());
                 }
             }
+        }
+    }
+
+    /// Regenerates nginx's config from every applied `Ingress` joined
+    /// against `service_vips`'s current `Service` VIP table, then
+    /// `write_config` -> `test_config` -> `reload` in sequence. Aborts the
+    /// sequence (no reload, and on a `test_config` failure no disruption of
+    /// whatever config is currently live) as soon as any step fails. An
+    /// `Ingress` whose backend service has no known VIP yet (the control
+    /// plane hasn't reported it, or it's simply down) is silently omitted
+    /// from this pass's rendered config rather than failing the whole
+    /// reconcile; the next tick picks it up once the VIP becomes known.
+    fn reconcile_ingress_config(&mut self) {
+        let backends: Vec<keel_ingress::IngressBackendConfig> = self
+            .ingress_records
+            .values()
+            .filter_map(|record| {
+                let (vip, port) = self.service_vips.get(&record.spec.spec.backend.service)?;
+                Some(keel_ingress::IngressBackendConfig {
+                    host: record.spec.spec.host.clone(),
+                    vip,
+                    port,
+                    cert_path: format!("/usr/local/etc/nginx/certs/{}.crt", record.spec.spec.host),
+                    key_path: format!("/usr/local/etc/nginx/certs/{}.key", record.spec.spec.host),
+                })
+            })
+            .collect();
+        let config = keel_ingress::render_nginx_config(&backends);
+        if let Err(e) = self.nginx.write_config("keel-ingress", &config) {
+            eprintln!("keel-agentd: failed to write ingress nginx config: {e}");
+            return;
+        }
+        if let Err(e) = self.nginx.test_config("keel-ingress") {
+            eprintln!("keel-agentd: ingress nginx config failed validation, leaving the previous config live: {e}");
+            return;
+        }
+        if let Err(e) = self.nginx.reload("keel-ingress") {
+            eprintln!("keel-agentd: failed to reload ingress nginx: {e}");
         }
     }
 
@@ -547,6 +592,8 @@ mod tests {
             state_dir,
             Box::new(keel_ingress::FakeAcmeClient::new()),
             Box::new(keel_ingress::FakeDnsProvider::new()),
+            Box::new(crate::nginx::FakeNginxController::new()),
+            crate::ServiceVipSlot::new(),
         )
         .unwrap()
     }
@@ -1283,6 +1330,8 @@ mod tests {
             dir.to_path_buf(),
             Box::new(acme),
             Box::new(dns),
+            Box::new(crate::nginx::FakeNginxController::new()),
+            crate::ServiceVipSlot::new(),
         )
         .unwrap()
     }
@@ -1362,6 +1411,62 @@ mod tests {
         }
     }
 
+    fn test_reconciler_with_acme_and_nginx(
+        dir: &std::path::Path,
+        acme: keel_ingress::FakeAcmeClient,
+        dns: keel_ingress::FakeDnsProvider,
+    ) -> (Reconciler<FakeJailRuntime, FakeZfsManager, FakeNetManager, FakeMountManager>, std::sync::Arc<crate::nginx::FakeNginxController>) {
+        let mut reconciler = test_reconciler_with_acme(dir, acme, dns);
+        let nginx = std::sync::Arc::new(crate::nginx::FakeNginxController::new());
+        reconciler.nginx = Box::new(std::sync::Arc::clone(&nginx));
+        reconciler.service_vips = crate::ServiceVipSlot::new();
+        (reconciler, nginx)
+    }
+
+    #[test]
+    fn reconcile_ingress_config_writes_and_reloads_nginx_once_a_backend_vip_is_known() {
+        let dir = test_state_dir("reconcile_ingress_config_writes_and_reloads_nginx_once_a_backend_vip_is_known");
+        let (mut reconciler, nginx) = test_reconciler_with_acme_and_nginx(&dir, keel_ingress::FakeAcmeClient::new(), keel_ingress::FakeDnsProvider::new());
+        reconciler.service_vips.set_all(&[keel_controlplane::wire::ServiceProxyEntry {
+            name: "hugo-site".to_string(),
+            vip: "10.0.0.9".to_string(),
+            port: 8080,
+            replicas: vec![],
+        }]);
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        reconciler.reconcile_ingress_config();
+        let config = nginx.last_written_config("keel-ingress").unwrap();
+        assert!(config.contains("server_name example.com;"));
+        assert!(config.contains("proxy_pass http://10.0.0.9:8080;"));
+        assert_eq!(nginx.reload_count("keel-ingress"), 1);
+    }
+
+    #[test]
+    fn reconcile_ingress_config_skips_a_backend_whose_vip_is_not_yet_known() {
+        let dir = test_state_dir("reconcile_ingress_config_skips_a_backend_whose_vip_is_not_yet_known");
+        let (mut reconciler, nginx) = test_reconciler_with_acme_and_nginx(&dir, keel_ingress::FakeAcmeClient::new(), keel_ingress::FakeDnsProvider::new());
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        reconciler.reconcile_ingress_config();
+        let config = nginx.last_written_config("keel-ingress").unwrap();
+        assert!(!config.contains("example.com"));
+    }
+
+    #[test]
+    fn reconcile_ingress_config_does_not_reload_when_validation_fails() {
+        let dir = test_state_dir("reconcile_ingress_config_does_not_reload_when_validation_fails");
+        let (mut reconciler, nginx) = test_reconciler_with_acme_and_nginx(&dir, keel_ingress::FakeAcmeClient::new(), keel_ingress::FakeDnsProvider::new());
+        reconciler.service_vips.set_all(&[keel_controlplane::wire::ServiceProxyEntry {
+            name: "hugo-site".to_string(),
+            vip: "10.0.0.9".to_string(),
+            port: 8080,
+            replicas: vec![],
+        }]);
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        nginx.set_fail_test(true);
+        reconciler.reconcile_ingress_config();
+        assert_eq!(nginx.reload_count("keel-ingress"), 0);
+    }
+
     #[test]
     fn reconcile_certs_backs_off_on_failure_without_blocking_other_ingresses() {
         let dir = test_state_dir("reconcile_certs_backs_off_on_failure_without_blocking_others");
@@ -1376,6 +1481,8 @@ mod tests {
             dir,
             Box::new(acme),
             Box::new(keel_ingress::FakeDnsProvider::new()),
+            Box::new(crate::nginx::FakeNginxController::new()),
+            crate::ServiceVipSlot::new(),
         )
         .unwrap();
         reconciler.apply_ingress(sample_ingress_spec("broken", "broken.example.com")).unwrap();

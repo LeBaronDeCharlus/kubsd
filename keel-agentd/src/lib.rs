@@ -3,6 +3,7 @@ pub mod capacity;
 pub mod http;
 pub mod ingress_record;
 pub mod ingress_store;
+pub mod nginx;
 pub mod podcidr;
 pub mod proxy;
 pub mod record;

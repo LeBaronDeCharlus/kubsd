@@ -201,6 +201,8 @@ mod tests {
             test_state_dir(name),
             Box::new(keel_ingress::FakeAcmeClient::new()),
             Box::new(keel_ingress::FakeDnsProvider::new()),
+            Box::new(crate::nginx::FakeNginxController::new()),
+            crate::ServiceVipSlot::new(),
         )
         .unwrap();
         let (_handle, commands) = spawn(reconciler, zfs, "zroot".to_string());
@@ -322,6 +324,8 @@ mod tests {
             std::env::temp_dir().join("keel-agentd-worker-test-add_service_alias_command_round_trips"),
             Box::new(keel_ingress::FakeAcmeClient::new()),
             Box::new(keel_ingress::FakeDnsProvider::new()),
+            Box::new(crate::nginx::FakeNginxController::new()),
+            crate::ServiceVipSlot::new(),
         )
         .unwrap();
         let _net = FakeNetManager::new();
@@ -481,6 +485,8 @@ mod tests {
                 dir.clone(),
                 Box::new(keel_ingress::FakeAcmeClient::new()),
                 Box::new(keel_ingress::FakeDnsProvider::new()),
+                Box::new(crate::nginx::FakeNginxController::new()),
+                crate::ServiceVipSlot::new(),
             )
             .unwrap();
             reconciler.apply(stateful_replicated_spec("db-resume", &addr)).unwrap();
@@ -500,6 +506,8 @@ mod tests {
             dir,
             Box::new(keel_ingress::FakeAcmeClient::new()),
             Box::new(keel_ingress::FakeDnsProvider::new()),
+            Box::new(crate::nginx::FakeNginxController::new()),
+            crate::ServiceVipSlot::new(),
         )
         .unwrap();
         let (_worker_handle, commands) = spawn(restarted_reconciler, zfs.clone(), "zroot".to_string());
