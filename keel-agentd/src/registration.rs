@@ -51,6 +51,7 @@ pub fn spawn(
     reloading_tls: Arc<tls::ReloadingTls>,
     commands: Sender<crate::worker::Command>,
     pod_cidr_slot: crate::PodCidrSlot,
+    service_vips: crate::ServiceVipSlot,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut registered = false;
@@ -68,7 +69,10 @@ pub fn spawn(
                 }
             } else {
                 match heartbeat_once(&control_plane_addr, &node_id, &commands, &client_config) {
-                    Ok(entries) => crate::proxy::reconcile_services(&entries, &mut proxied_services, &commands),
+                    Ok(entries) => {
+                        service_vips.set_all(&entries);
+                        crate::proxy::reconcile_services(&entries, &mut proxied_services, &commands);
+                    }
                     Err(e) => {
                         eprintln!("keel-agentd: heartbeat failed: {e}");
                         registered = false;
@@ -242,6 +246,7 @@ fn send_request(addr: &str, method: &str, path: &str, body: &str, client_config:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registration;
     use keel_controlplane::placements::Placements;
     use keel_controlplane::registry::Registry;
     use keel_controlplane::worker;
@@ -329,6 +334,30 @@ mod tests {
         .unwrap();
         thread::spawn(move || keel_controlplane::http::run(listener, commands, reloading_tls));
         addr
+    }
+
+    // Mirrors the `spawn_test_worker` helper already used by proxy.rs's and
+    // worker.rs's own test modules (each private to its module, hence a
+    // separate copy here): a real worker/reconciler pair backed entirely by
+    // fakes, suitable for tests that only need the heartbeat loop to be able
+    // to answer `CommittedResources`/`Get` without touching real ZFS/jail/net
+    // state.
+    fn spawn_test_worker(name: &str) -> mpsc::Sender<crate::worker::Command> {
+        let zfs = keel_zfs::FakeZfsManager::new();
+        crate::worker::spawn(
+            crate::Reconciler::new(
+                keel_jail::FakeJailRuntime::new(),
+                zfs.clone(),
+                keel_net::FakeNetManager::new(),
+                keel_jail::FakeMountManager::new(),
+                "zroot".to_string(),
+                std::env::temp_dir().join(format!("keel-agentd-registration-test-{name}")),
+            )
+            .unwrap(),
+            zfs,
+            "zroot".to_string(),
+        )
+        .1
     }
 
     fn node_client_config() -> std::sync::Arc<rustls::ClientConfig> {
@@ -440,6 +469,43 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_populates_the_service_vip_slot_from_the_proxy_table() {
+        let control_plane_addr = start_test_control_plane();
+        let commands = spawn_test_worker("heartbeat_populates_the_service_vip_slot");
+        let client_config = node_client_config();
+        let service_vips = crate::ServiceVipSlot::new();
+
+        registration::spawn(
+            "node-1".to_string(),
+            "127.0.0.1:0".to_string(),
+            "127.0.0.1:0".to_string(),
+            control_plane_addr.clone(),
+            Duration::from_millis(50),
+            1.0,
+            1_073_741_824,
+            node_reloading_tls(),
+            commands.clone(),
+            crate::PodCidrSlot::new(),
+            service_vips.clone(),
+        );
+
+        // Apply a Service on the real control plane so the next heartbeat's
+        // proxy table is non-empty, then wait a few ticks for it to land.
+        let apply_body = "apiVersion: keel/v1\nkind: Service\nmetadata:\n  name: hugo-site\nspec:\n  replicas: 1\n  port: 8080\n  template:\n    image: base/test\n    command: [\"/bin/true\"]\n    network:\n      vnet: true\n      bridge: keel0\n    resources:\n      cpu: \"1\"\n      memory: \"128M\"\n    restartPolicy: Always\n";
+        let _ = send_request(&control_plane_addr, "PUT", "/services/hugo-site", apply_body, &client_config);
+
+        let mut found = None;
+        for _ in 0..40 {
+            if let Some(vip) = service_vips.get("hugo-site") {
+                found = Some(vip);
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(found.is_some(), "expected 'hugo-site' to appear in the ServiceVipSlot within the timeout");
+    }
+
+    #[test]
     fn registers_and_then_keeps_heartbeating() {
         let control_plane_addr = start_test_control_plane();
         let zfs = keel_zfs::FakeZfsManager::new();
@@ -467,6 +533,7 @@ mod tests {
             node_reloading_tls(),
             commands,
             crate::PodCidrSlot::new(),
+            crate::ServiceVipSlot::new(),
         );
 
         thread::sleep(Duration::from_millis(200));
@@ -530,6 +597,7 @@ mod tests {
             node_reloading_tls(),
             commands,
             crate::PodCidrSlot::new(),
+            crate::ServiceVipSlot::new(),
         );
 
         thread::sleep(Duration::from_millis(200));
@@ -585,6 +653,7 @@ mod tests {
             node_reloading_tls(),
             commands,
             pod_cidr_slot,
+            crate::ServiceVipSlot::new(),
         );
 
         thread::sleep(Duration::from_millis(300));
@@ -649,6 +718,7 @@ mod tests {
             wrong_ca_reloading_tls(),
             commands,
             crate::PodCidrSlot::new(),
+            crate::ServiceVipSlot::new(),
         );
 
         thread::sleep(Duration::from_millis(200));
@@ -685,6 +755,7 @@ mod tests {
             node_reloading_tls(),
             commands,
             pod_cidr_slot.clone(),
+            crate::ServiceVipSlot::new(),
         );
 
         thread::sleep(Duration::from_millis(200));
@@ -767,6 +838,7 @@ mod tests {
             node_reloading_tls(),
             commands,
             pod_cidr_slot,
+            crate::ServiceVipSlot::new(),
         );
 
         thread::sleep(Duration::from_millis(300));
@@ -832,6 +904,7 @@ mod tests {
             node_reloading_tls(),
             commands,
             pod_cidr_slot,
+            crate::ServiceVipSlot::new(),
         );
 
         thread::sleep(Duration::from_millis(700));

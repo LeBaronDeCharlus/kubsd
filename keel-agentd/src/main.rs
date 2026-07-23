@@ -145,6 +145,7 @@ fn main() {
         eprintln!(
             "keel-agentd: registering with control plane at {control_plane_addr} as node '{node_id}' ({advertise_addr}), capacity {capacity_cpu} cores / {capacity_memory} bytes"
         );
+        let service_vips = keel_agentd::ServiceVipSlot::new();
         keel_agentd::registration::spawn(
             node_id,
             advertise_addr.clone(),
@@ -156,6 +157,7 @@ fn main() {
             std::sync::Arc::clone(&reloading_tls),
             commands.clone(),
             pod_cidr_slot.clone(),
+            service_vips.clone(),
         );
 
         eprintln!("keel-agentd: serving jails API over TLS on {advertise_addr}");
