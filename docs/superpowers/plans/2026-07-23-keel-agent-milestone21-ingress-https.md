@@ -1592,10 +1592,11 @@ git commit -m "feat(keel-agentd): add PUT/GET/DELETE /ingress HTTP routes"
 
 **Files:**
 - Modify: `keel-agentd/src/reconciler.rs`
+- Modify: `keel-agentd/src/record.rs`
 
 **Interfaces:**
 - Consumes: `Reconciler::apply` (existing, Milestone 4); `self.ingress_records` (Task 8).
-- Produces: `Reconciler::ensure_ingress_jail(&mut self) -> Result<(), ReconcileError>`, called from `reconcile()`.
+- Produces: `Reconciler::ensure_ingress_jail(&mut self) -> Result<(), ReconcileError>`, called from `reconcile()`; `keel_agentd::record::INGRESS_JAIL_BRIDGE_ADDR: &str` (the ingress jail's internal bridge address, reused by Task 14's `pf` rule so both read one constant instead of repeating the literal).
 
 The synthesized `JailSpec`'s `metadata.name` must be `"ingress"`, **not** `"keel-ingress"` - `record::jail_name` already prepends `"keel-"` to whatever name it's given (`jail_name("ingress") == "keel-ingress"`), so naming the spec itself `"keel-ingress"` would double-prefix to `keel-keel-ingress`. This was checked directly against `record::jail_name`'s current implementation before writing this task.
 
@@ -1622,13 +1623,22 @@ fn reconcile_does_not_provision_the_ingress_jail_when_no_ingress_spec_exists() {
 }
 
 #[test]
-fn reconcile_provisions_the_ingress_jail_only_once_even_across_multiple_ticks() {
-    let dir = test_state_dir("reconcile_provisions_the_ingress_jail_only_once");
+fn reconcile_provisions_only_one_ingress_jail_even_as_more_ingress_specs_are_applied() {
+    let dir = test_state_dir("reconcile_provisions_only_one_ingress_jail");
     let mut reconciler = test_reconciler(&dir);
     reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
     reconciler.reconcile(Instant::now());
+    let ordinal_after_first = reconciler.records.get("ingress").unwrap().epair_ordinal;
+    assert_eq!(reconciler.records.keys().filter(|name| name.as_str() == "ingress").count(), 1);
+
+    reconciler.apply_ingress(sample_ingress_spec("docs", "docs.example.com")).unwrap();
     reconciler.reconcile(Instant::now());
-    assert_eq!(reconciler.records.get("ingress").unwrap().epair_ordinal, reconciler.records.get("ingress").unwrap().epair_ordinal);
+    assert_eq!(reconciler.records.keys().filter(|name| name.as_str() == "ingress").count(), 1);
+    assert_eq!(
+        reconciler.records.get("ingress").unwrap().epair_ordinal,
+        ordinal_after_first,
+        "the ingress jail must not be re-provisioned (and so not re-assigned a new epair ordinal) once it already exists"
+    );
 }
 
 #[test]
@@ -1647,10 +1657,18 @@ fn deleting_the_last_ingress_spec_does_not_retroactively_destroy_the_ingress_jai
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p keel-agentd reconcile_provisions_the_singleton_ingress_jail reconcile_does_not_provision deleting_the_last_ingress_spec`
+Run: `cargo test -p keel-agentd reconcile_provisions_the_singleton_ingress_jail reconcile_does_not_provision deleting_the_last_ingress_spec reconcile_provisions_only_one_ingress_jail`
 Expected: FAIL - `keel-ingress` jail is never provisioned yet (`ensure_ingress_jail` doesn't exist).
 
 - [ ] **Step 3: Implement `ensure_ingress_jail` and call it from `reconcile`**
+
+Add the constant to `keel-agentd/src/record.rs`, near its other `pub fn`s (this same constant is reused by Task 14's `pf` rule, so both read one shared value rather than repeating the literal in two files):
+
+```rust
+pub const INGRESS_JAIL_BRIDGE_ADDR: &str = "10.0.0.2";
+```
+
+Add `use crate::record;` to `reconciler.rs`'s imports if not already present, then:
 
 ```rust
     fn ensure_ingress_jail(&mut self) -> Result<(), ReconcileError> {
@@ -1667,7 +1685,7 @@ Expected: FAIL - `keel-ingress` jail is never provisioned yet (`ensure_ingress_j
                 network: keel_spec::NetworkSpec {
                     vnet: true,
                     bridge: "keel0".to_string(),
-                    address: "10.0.0.2/24".to_string(),
+                    address: format!("{}/24", record::INGRESS_JAIL_BRIDGE_ADDR),
                 },
                 resources: keel_spec::ResourcesSpec { cpu: "1".to_string(), memory: "256M".to_string() },
                 restart_policy: keel_spec::RestartPolicy::Always,
@@ -1697,7 +1715,7 @@ Note: `10.0.0.2/24` is a placeholder internal address, deliberately picked outsi
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p keel-agentd reconcile_provisions_the_singleton_ingress_jail reconcile_does_not_provision deleting_the_last_ingress_spec`
+Run: `cargo test -p keel-agentd reconcile_provisions_the_singleton_ingress_jail reconcile_does_not_provision deleting_the_last_ingress_spec reconcile_provisions_only_one_ingress_jail`
 Expected: PASS.
 
 - [ ] **Step 5: Run the full existing test suite to confirm no regression**
@@ -2345,7 +2363,7 @@ git commit -m "feat(keel-agentd): add real JexecNginxController"
 
 **Interfaces:**
 - Produces: `keel_agentd::pf::PfController` trait (`ensure_redirect_rules(&self, public_iface: &str, ingress_bridge_addr: &str) -> Result<(), PfError>`), `FakePfController`, `PfctlController` (real, shells to `pfctl`).
-- Consumes: nothing from other tasks - applied once at startup from `main.rs`, independent of per-`Ingress` reconciliation, exactly as the design specifies ("applied once, not per-`Ingress`").
+- Consumes: `keel_agentd::record::INGRESS_JAIL_BRIDGE_ADDR` (Task 10). Otherwise nothing from other tasks - applied once at startup from `main.rs`, independent of per-`Ingress` reconciliation, exactly as the design specifies ("applied once, not per-`Ingress`").
 
 This is a single, once-at-startup call (with its own retry loop, not folded into `Reconciler::reconcile`), matching the design's explicit statement that a `pf` failure "doesn't block per-`Ingress` cert/config reconciliation, since it's a separate concern."
 
@@ -2487,11 +2505,7 @@ impl PfController for PfctlController {
 
 Add `public_iface: Option<String>` to `Config` in `main.rs` (default `None`) and a `--public-iface` flag parsed the same way every other optional flag already is.
 
-`keel_agentd::record::INGRESS_JAIL_BRIDGE_ADDR` is a new `pub const &str = "10.0.0.2"` added to `keel-agentd/src/record.rs` in Task 10 instead of a literal repeated in two files: Task 10's synthesized `JailSpec.spec.network.address` and this task's `pf` rule both read from the one constant, so a later real-VM correction to the address (flagged as likely in Task 10) only needs to change in one place. Go back and update Task 10's Step 3 to use `format!("{}/24", keel_agentd::record::INGRESS_JAIL_BRIDGE_ADDR)` for `network.address` rather than the literal `"10.0.0.2/24"` shown there, and add the constant itself near `record.rs`'s other `pub fn`s:
-
-```rust
-pub const INGRESS_JAIL_BRIDGE_ADDR: &str = "10.0.0.2";
-```
+`keel_agentd::record::INGRESS_JAIL_BRIDGE_ADDR` is the constant Task 10 adds to `keel-agentd/src/record.rs` for its synthesized `JailSpec.spec.network.address`; this task reuses the same constant for the `pf` rule rather than repeating the literal in two files, so a later real-VM correction to the address (flagged as likely in Task 10) only needs to change in one place.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
