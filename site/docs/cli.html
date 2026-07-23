@@ -22,7 +22,13 @@
           <a href="api.html">HTTP API Reference</a>
         </div>
       </div>
-      <a href="../quickstart.html">Quickstart</a>
+      <div class="nav-dropdown">
+        <a href="../quickstart.html">Quickstart</a>
+        <div class="nav-dropdown-menu">
+          <a href="../quickstart.html">Static Website</a>
+          <a href="../https-quickstart.html">Automatic HTTPS</a>
+        </div>
+      </div>
       <a href="../journey.html">Journey</a>
       <a class="nav-github" href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub &#8599;</a>
     </nav>
@@ -71,35 +77,38 @@
   <section id="apply">
     <div class="container">
       <h2>keelctl apply -f FILE</h2>
-      <p>Reads a spec YAML file, validates it locally, and sniffs <code>kind</code> to decide where it goes: a <code>kind: Jail</code> sends <code>PUT /jails/&lt;name&gt;</code>; a <code>kind: Service</code> sends <code>PUT /services/&lt;name&gt;</code> instead (the name comes from the spec's own <code>metadata.name</code> either way). Routed through a control plane with no <code>--node</code>, a <code>kind: Jail</code>'s <code>PUT /jails/&lt;name&gt;</code> is scheduled automatically onto the least-loaded alive node; with <code>--node</code>, it's <code>PUT /nodes/&lt;node&gt;/jails/&lt;name&gt;</code> instead, landing on exactly that node. A <code>kind: Service</code> always goes through the control plane's own scheduler and same-service spreading; <code>--node</code> does not apply to it.</p>
+      <p>Reads a spec YAML file, validates it locally, and sniffs <code>kind</code> to decide where it goes: a <code>kind: Jail</code> sends <code>PUT /jails/&lt;name&gt;</code>; a <code>kind: Service</code> sends <code>PUT /services/&lt;name&gt;</code>; a <code>kind: Ingress</code> sends <code>PUT /ingress/&lt;name&gt;</code> (the name comes from the spec's own <code>metadata.name</code> in every case). Routed through a control plane with no <code>--node</code>, a <code>kind: Jail</code>'s <code>PUT /jails/&lt;name&gt;</code> is scheduled automatically onto the least-loaded alive node; with <code>--node</code>, it's <code>PUT /nodes/&lt;node&gt;/jails/&lt;name&gt;</code> instead, landing on exactly that node. A <code>kind: Service</code> always goes through the control plane's own scheduler and same-service spreading; <code>--node</code> does not apply to it. A <code>kind: Ingress</code> is never routed through a control plane at all: it always applies directly to <code>--socket</code>'s node, regardless of <code>--control-plane-addr</code>/<code>--node</code>, since an <code>Ingress</code> and its backend <code>Service</code> must already be co-located on one node (see the <a href="api.html#ingress">HTTP API reference</a>).</p>
       <pre>keelctl apply -f jail.yaml
 keelctl --control-plane-addr 10.0.0.2:7620 apply -f jail.yaml
 keelctl --control-plane-addr 10.0.0.2:7620 --node node-4 apply -f jail.yaml
-keelctl --control-plane-addr 10.0.0.2:7620 apply -f service.yaml</pre>
+keelctl --control-plane-addr 10.0.0.2:7620 apply -f service.yaml
+keelctl apply -f ingress.yaml</pre>
     </div>
   </section>
 
   <section id="get">
     <div class="container">
       <h2>keelctl get [name]</h2>
-      <p>With no argument, lists every jail keel-agentd (or the routed-to node) is tracking (<code>GET /jails</code>, or <code>GET /nodes/&lt;node&gt;/jails</code> when routed by name) &mdash; this never lists services, see the note below. With a name, fetches just that one: tries <code>GET /jails/&lt;name&gt;</code> first, and on a <code>404</code> falls back to <code>GET /services/&lt;name&gt;</code> (a service's currently-healthy replicas), since jail and service names share one flat namespace and a <code>404</code> on one path is a cheap, unambiguous signal to try the other. Through a control plane with no <code>--node</code>, the jail-path lookup resolves against whichever node the jail was placed on; with <code>--node</code>, <code>GET /nodes/&lt;node&gt;/jails/&lt;name&gt;</code>.</p>
+      <p>With no argument, lists every jail keel-agentd (or the routed-to node) is tracking (<code>GET /jails</code>, or <code>GET /nodes/&lt;node&gt;/jails</code> when routed by name); this never lists services or ingresses, see the notes below. With a name, tries <code>GET /jails/&lt;name&gt;</code> first, then falls back to <code>GET /services/&lt;name&gt;</code> on a <code>404</code> (a service's currently-healthy replicas), then to <code>GET /ingress/&lt;name&gt;</code> on a further <code>404</code>, since all three share one flat namespace and a <code>404</code> on one path is a cheap, unambiguous signal to try the next. Through a control plane with no <code>--node</code>, the jail-path lookup resolves against whichever node the jail was placed on; with <code>--node</code>, <code>GET /nodes/&lt;node&gt;/jails/&lt;name&gt;</code>. The <code>Ingress</code> fallback leg always targets the local <code>--socket</code>, the same reasoning <code>apply</code> above uses.</p>
       <pre>keelctl get
 keelctl get web-1
 keelctl --control-plane-addr 10.0.0.2:7620 get web-1
 keelctl --control-plane-addr 10.0.0.2:7620 --node node-4 get web-1
-keelctl --control-plane-addr 10.0.0.2:7620 get web       # falls back to the service, if web-1 above doesn't exist</pre>
-      <p><strong>No bare-collection verb for services.</strong> <code>keel-controlplane</code>'s <code>GET /services</code> (every known service, including each one's virtual IP and port, see the <a href="api.html#services">HTTP API reference</a>) has no corresponding <code>keelctl</code> command: <code>get</code> either lists jails (no argument) or resolves a single name (jail, falling back to service). Reaching a service's VIP today means a direct HTTP call against the control plane.</p>
+keelctl --control-plane-addr 10.0.0.2:7620 get web       # falls back to the service, if web-1 above doesn't exist
+keelctl get blog                                         # falls back further to the Ingress, if neither above exists</pre>
+      <p><strong>No bare-collection verb for services.</strong> <code>keel-controlplane</code>'s <code>GET /services</code> (every known service, including each one's virtual IP and port, see the <a href="api.html#services">HTTP API reference</a>) has no corresponding <code>keelctl</code> command: <code>get</code> either lists jails (no argument) or resolves a single name (jail, falling back to service, falling back to ingress). Reaching a service's VIP today means a direct HTTP call against the control plane.</p>
     </div>
   </section>
 
   <section id="delete">
     <div class="container">
       <h2>keelctl delete NAME</h2>
-      <p>Tears down the named jail, its ZFS dataset, its network attachment, and its resource limits (<code>DELETE /jails/&lt;name&gt;</code>, or <code>DELETE /nodes/&lt;node&gt;/jails/&lt;name&gt;</code> when routed by name), falling back to <code>DELETE /services/&lt;name&gt;</code> on a <code>404</code> the same way <code>get</code> does, tearing down every one of that service's replicas (and, once its next heartbeat lands on every node, its virtual IP alias). Through a control plane with no <code>--node</code>, deleting a jail also clears its recorded placement.</p>
+      <p>Tears down the named jail, its ZFS dataset, its network attachment, and its resource limits (<code>DELETE /jails/&lt;name&gt;</code>, or <code>DELETE /nodes/&lt;node&gt;/jails/&lt;name&gt;</code> when routed by name), falling back to <code>DELETE /services/&lt;name&gt;</code> then <code>DELETE /ingress/&lt;name&gt;</code> on successive <code>404</code>s the same way <code>get</code> does, tearing down every one of a service's replicas (and, once its next heartbeat lands on every node, its virtual IP alias), or removing an <code>Ingress</code>'s <code>server</code> block from nginx on the node's next reconcile pass. Through a control plane with no <code>--node</code>, deleting a jail also clears its recorded placement.</p>
       <pre>keelctl delete web-1
 keelctl --control-plane-addr 10.0.0.2:7620 delete web-1
 keelctl --control-plane-addr 10.0.0.2:7620 --node node-4 delete web-1
-keelctl --control-plane-addr 10.0.0.2:7620 delete web    # falls back to the service, if web-1 above doesn't exist</pre>
+keelctl --control-plane-addr 10.0.0.2:7620 delete web    # falls back to the service, if web-1 above doesn't exist
+keelctl delete blog                                      # falls back further to the Ingress, if neither above exists</pre>
     </div>
   </section>
 

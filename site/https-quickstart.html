@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quickstart: automatic HTTPS · Keel</title>
+<link rel="icon" href="assets/keel-logo.png">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="container nav">
+    <a class="brand" href="index.html"><img src="assets/keel-logo.png" alt="Keel logo" class="brand-logo">Keel</a>
+    <nav class="nav-links">
+      <a href="why.html">Why</a>
+      <div class="nav-dropdown">
+        <a href="docs/index.html">Docs</a>
+        <div class="nav-dropdown-menu">
+          <a href="docs/architecture.html">Architecture</a>
+          <a href="docs/jailspec.html">JailSpec Reference</a>
+          <a href="docs/cli.html">CLI Reference</a>
+          <a href="docs/api.html">HTTP API Reference</a>
+        </div>
+      </div>
+      <div class="nav-dropdown">
+        <a href="quickstart.html">Quickstart</a>
+        <div class="nav-dropdown-menu">
+          <a href="quickstart.html">Static Website</a>
+          <a href="https-quickstart.html">Automatic HTTPS</a>
+        </div>
+      </div>
+      <a href="journey.html">Journey</a>
+      <a class="nav-github" href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub &#8599;</a>
+    </nav>
+  </div>
+</header>
+<main>
+  <section class="page-header">
+    <div class="container">
+      <h1>Quickstart: automatic HTTPS with an Ingress</h1>
+      <p class="lead">Take a <code>kind: Service</code> already running on one node, put a real domain in front of it, and get a browser-trusted certificate that issues and renews itself, with no manual intervention, ever.</p>
+    </div>
+  </section>
+
+  <section id="prerequisites">
+    <div class="container">
+      <h2>Prerequisites</h2>
+      <ul>
+        <li>Everything the <a href="quickstart.html">static website quickstart</a> needs: a FreeBSD 15 host with jails, ZFS, and VNET usable, root access, and Keel built from source.</li>
+        <li>A real domain name, with its DNS hosted at OVH (the only DNS provider this milestone automates). If your domain lives elsewhere, this feature isn't usable yet without writing a new <code>DnsProvider</code> implementation; see <a href="docs/architecture.html#ingress">Architecture</a>.</li>
+        <li>An OVH API application key, application secret, and consumer key, scoped to <code>GET</code>/<code>POST</code>/<code>PUT</code>/<code>DELETE</code> on <code>/domain/zone/&lt;your-zone&gt;/*</code>. Create these at OVH's API token page; the consumer key needs a follow-up browser approval before it's active.</li>
+        <li>A single node running both <code>keel-controlplane</code> and <code>keel-agentd</code> registered to it: an <code>Ingress</code>'s backend must be a <code>kind: Service</code>, and only <code>keel-controlplane</code> understands services, even in a cluster of one.</li>
+        <li>The node's public IP pointed at your domain (an A record), and <code>pf</code> available to redirect inbound traffic to the ingress jail.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="base-images">
+    <div class="container">
+      <h2>1. Prepare two base images</h2>
+      <p>The ingress jail runs nginx; your backend runs whatever you're actually serving. This walkthrough reuses the static site from the <a href="quickstart.html">first quickstart</a> as the backend, so you need one additional base image with nginx installed, cloned exactly the way every base image is:</p>
+      <pre># as root
+zfs create -p zroot/keel/base/keel-ingress
+tar -xf base.txz -C /zroot/keel/base/keel-ingress
+cp /etc/resolv.conf /zroot/keel/base/keel-ingress/etc/resolv.conf
+pkg -c /zroot/keel/base/keel-ingress install -y nginx
+
+# nginx's package may default its config path differently depending on
+# your FreeBSD release and package set; confirm which one before moving
+# on, since keel-agentd always writes to /usr/local/etc/nginx/nginx.conf
+# and passes -c explicitly, regardless of nginx's own compiled-in default.
+chroot /zroot/keel/base/keel-ingress /usr/local/sbin/nginx -c /usr/local/etc/nginx/nginx.conf -t</pre>
+      <p>Also make sure the base image's dynamic linker actually knows where nginx's shared libraries live: a freshly extracted base system plus a <code>pkg -c</code> install doesn't always populate this on its own:</p>
+      <pre>chroot /zroot/keel/base/keel-ingress /sbin/ldconfig -m /usr/local/lib</pre>
+    </div>
+  </section>
+
+  <section id="daemons">
+    <div class="container">
+      <h2>2. Configure OVH credentials and start the daemons</h2>
+      <p>Write the OVH credentials to a daemon config file: never into a spec, since these are secrets, not per-<code>Ingress</code> data:</p>
+      <pre># /usr/local/etc/keel/dns-ovh.toml
+app_key = "your-application-key"
+app_secret = "your-application-secret"
+consumer_key = "your-consumer-key"
+zone = "example.com"</pre>
+      <p>Start <code>keel-controlplane</code>, then <code>keel-agentd</code> registered to it, pointing the ACME client at Let's Encrypt's <strong>staging</strong> directory first: staging has none of production's rate limits, so this is where you iterate:</p>
+      <pre># as root, one terminal
+keel-controlplane --addr 127.0.0.1:7620 \
+  --cluster-cidr 10.0.0.0/16 --service-cidr 10.0.250.0/24 \
+  --tls-ca-file /etc/keel/ca.crt --tls-cert-file /etc/keel/controlplane.crt \
+  --tls-key-file /etc/keel/controlplane.key --tls-crl-file /etc/keel/crl.pem
+
+# as root, another terminal
+keel-agentd --pool zroot --node-id node-1 \
+  --control-plane-addr 127.0.0.1:7620 \
+  --advertise-addr 127.0.0.1:7621 --replicate-addr 127.0.0.1:7622 \
+  --tls-ca-file /etc/keel/ca.crt --tls-cert-file /etc/keel/node-1.crt \
+  --tls-key-file /etc/keel/node-1.key --tls-crl-file /etc/keel/crl.pem \
+  --dns-ovh-config /usr/local/etc/keel/dns-ovh.toml \
+  --acme-directory-url https://acme-staging-v02.api.letsencrypt.org/directory \
+  --acme-account-key-file /var/db/keel/acme-account.json \
+  --public-iface vtnet0</pre>
+      <p>See the <a href="docs/cli.html#certificates">CLI reference</a> for generating the mutual-TLS certificates these flags reference with <code>scripts/gen-certs.sh</code>. <code>--public-iface</code> is the node's real public network interface; <code>keel-agentd</code> uses it to write the <code>pf</code> redirect rules in step 5.</p>
+    </div>
+  </section>
+
+  <section id="backend">
+    <div class="container">
+      <h2>3. Turn your jail into a Service</h2>
+      <p>An <code>Ingress</code>'s backend must be a <code>kind: Service</code>, never a bare <code>kind: Jail</code>, so it always has a stable virtual IP to proxy to, even a single-replica one. Reusing the static site from the <a href="quickstart.html">first quickstart</a>:</p>
+      <pre>apiVersion: keel/v1
+kind: Service
+metadata:
+  name: hugo-site
+spec:
+  replicas: 1
+  port: 8080
+  template:
+    image: base/14.2-web
+    command: ["/usr/local/bin/python3", "-m", "http.server", "8080", "--directory", "/srv/www"]
+    network:
+      vnet: true
+      bridge: keel0
+    resources:
+      cpu: "1"
+      memory: "256M"
+    restartPolicy: Always</pre>
+      <pre>keelctl --control-plane-addr 127.0.0.1:7620 \
+  --tls-ca-file /etc/keel/ca.crt --tls-cert-file /etc/keel/admin.crt \
+  --tls-key-file /etc/keel/admin.key --tls-crl-file /etc/keel/crl.pem \
+  apply -f service.yaml</pre>
+    </div>
+  </section>
+
+  <section id="ingress">
+    <div class="container">
+      <h2>4. Apply the Ingress</h2>
+      <p>Save the following as <code>ingress.yaml</code>, using your own real domain and a real contact email: Let's Encrypt requires both to be genuine, and <code>spec.host</code> becomes the certificate's subject:</p>
+      <pre>apiVersion: keel/v1
+kind: Ingress
+metadata:
+  name: blog
+spec:
+  host: example.com
+  backend:
+    service: hugo-site
+    port: 8080
+  tls:
+    email: admin@example.com</pre>
+      <p>Apply it directly to the node's own socket, not through the control plane: an <code>Ingress</code> is never scheduled, it always applies to whichever node it's given to.</p>
+      <pre>keelctl apply -f ingress.yaml</pre>
+      <p>On its next 5-second reconcile tick, <code>keel-agentd</code> provisions the singleton <code>keel-ingress</code> jail (once, shared by every <code>Ingress</code> you apply from here on), places a real ACME order, publishes the DNS-01 challenge as a TXT record via the real OVH API, waits for it to propagate across public DNS, and downloads a real (staging) certificate once Let's Encrypt validates it. Watch it happen:</p>
+      <pre>keelctl get blog
+jls   # a new keel-ingress jail should appear alongside your backend's</pre>
+    </div>
+  </section>
+
+  <section id="public">
+    <div class="container">
+      <h2>5. Go public</h2>
+      <p>Two host-level things need to be true for a real browser, anywhere on the internet, to actually reach the ingress jail: <code>pf</code> needs to forward the public IP's ports 80/443 to it, and the kernel needs to be willing to route between the public interface and the internal bridge at all.</p>
+      <pre># as root, once
+sysctl net.inet.ip.forwarding=1
+echo 'gateway_enable="YES"' &gt;&gt; /etc/rc.conf   # persists across reboots</pre>
+      <p><code>keel-agentd</code> (started with <code>--public-iface</code> above) writes its own redirect rules into a named <code>pf</code> anchor on its own schedule, but your host's own top-level <code>pf.conf</code> needs to declare that anchor once, since Keel intentionally never touches a file it doesn't fully own:</p>
+      <pre># in /etc/pf.conf, near the top (translation rules) and bottom (filter rules)
+rdr-anchor "keel-ingress"
+# ... your own existing rules ...
+anchor "keel-ingress"</pre>
+      <p>Reload <code>pf</code> after editing it (<code>pfctl -f /etc/pf.conf</code>), and make sure your firewall also has an explicit pass rule for the internal jail bridge itself (<code>keel0</code> by convention): a fresh host's default-deny policy blocks jail-to-service traffic just as readily as it blocks the internet, and without it nginx's own <code>proxy_pass</code> to your backend's virtual IP times out even once the public redirect itself is working.</p>
+    </div>
+  </section>
+
+  <section id="verify">
+    <div class="container">
+      <h2>6. Visit the site</h2>
+      <pre>curl -sk https://example.com/
+openssl s_client -connect example.com:443 -servername example.com &lt;/dev/null 2&gt;/dev/null \
+  | openssl x509 -noout -issuer</pre>
+      <p>The <code>issuer</code> line should mention <code>(STAGING)</code>, confirming you're looking at a real, working staging certificate. Once you're satisfied everything works, switch to production by stopping <code>keel-agentd</code>, changing <code>--acme-directory-url</code> to <code>https://acme-v02.api.letsencrypt.org/directory</code>, pointing <code>--acme-account-key-file</code> at a fresh path (a staging account can't be reused against production; ACME accounts are directory-specific), and restarting. Expect the certificate's <code>issuer</code> to read plain <code>Let's Encrypt</code> afterward, no <code>(STAGING)</code>, and <code>curl</code> to succeed with no <code>-k</code> at all, since it's now signed by a publicly trusted CA.</p>
+    </div>
+  </section>
+
+  <section id="renewal">
+    <div class="container">
+      <h2>7. Renewal needs nothing from you</h2>
+      <p>A certificate within 30 days of expiring is renewed automatically on the node's next reconcile tick, the same DNS-01 flow as first issuance, with no manual step and no downtime: the previous certificate keeps serving until the new one is ready. This is the entire point of the feature: once steps 1 through 6 are done, there is nothing left to remember to do again.</p>
+    </div>
+  </section>
+
+  <section id="cleanup">
+    <div class="container">
+      <h2>Clean up</h2>
+      <pre>keelctl delete blog          # removes this Ingress's server block; the shared nginx jail stays up
+keelctl --control-plane-addr 127.0.0.1:7620 \
+  --tls-ca-file /etc/keel/ca.crt --tls-cert-file /etc/keel/admin.crt \
+  --tls-key-file /etc/keel/admin.key --tls-crl-file /etc/keel/crl.pem \
+  delete hugo-site</pre>
+    </div>
+  </section>
+
+  <section id="next-steps">
+    <div class="container">
+      <h2>Next steps</h2>
+      <p>This walkthrough covers a single node with one public IP, which is the only topology this milestone supports: an <code>Ingress</code> and every replica of its backend <code>Service</code> must live on the same node, and there's no wildcard, multi-domain, or path-based routing yet. See the <a href="docs/architecture.html#ingress">Architecture</a> page and the <a href="docs/jailspec.html#ingress">JailSpec reference</a> for exactly what's built today and what's deliberately deferred.</p>
+    </div>
+  </section>
+</main>
+<footer class="site-footer">
+  <div class="container">
+    <p>Keel is open source on <a href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub</a>.</p>
+  </div>
+</footer>
+</body>
+</html>

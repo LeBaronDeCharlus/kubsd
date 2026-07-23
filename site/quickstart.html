@@ -22,7 +22,13 @@
           <a href="docs/api.html">HTTP API Reference</a>
         </div>
       </div>
-      <a href="quickstart.html">Quickstart</a>
+      <div class="nav-dropdown">
+        <a href="quickstart.html">Quickstart</a>
+        <div class="nav-dropdown-menu">
+          <a href="quickstart.html">Static Website</a>
+          <a href="https-quickstart.html">Automatic HTTPS</a>
+        </div>
+      </div>
       <a href="journey.html">Journey</a>
       <a class="nav-github" href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub &#8599;</a>
     </nav>
@@ -134,6 +140,7 @@ curl http://10.0.0.5:8080/</pre>
     <div class="container">
       <h2>Next steps</h2>
       <p>This walkthrough deploys one jail on one node. A static site is also a natural fit for <code>kind: Service</code>: N replicas of the same base image, spread across a cluster, reachable through one load-balanced virtual IP, self-healing if a node goes down. See the <a href="docs/jailspec.html">JailSpec reference</a> and <a href="docs/api.html#services">HTTP API reference</a> for how to describe and reach one.</p>
+      <p>Once your site is running as a <code>Service</code>, the <a href="https-quickstart.html">automatic HTTPS quickstart</a> continues from exactly here: put a real domain in front of it and get a browser-trusted certificate that issues and renews itself with no manual intervention.</p>
       <p><code>scripts/smoke-test.sh</code> in the repository runs a jail's full lifecycle end-to-end against a real <code>rc.d</code>-managed <code>keel-agentd</code> service, including killing the daemon mid-flight to prove the automatic restart and state recovery both work, then a clean teardown. See that script and <a href="docs/architecture.html">Architecture</a> for how the pieces fit together.</p>
     </div>
   </section>

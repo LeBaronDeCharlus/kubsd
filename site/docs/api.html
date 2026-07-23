@@ -22,7 +22,13 @@
           <a href="api.html">HTTP API Reference</a>
         </div>
       </div>
-      <a href="../quickstart.html">Quickstart</a>
+      <div class="nav-dropdown">
+        <a href="../quickstart.html">Quickstart</a>
+        <div class="nav-dropdown-menu">
+          <a href="../quickstart.html">Static Website</a>
+          <a href="../https-quickstart.html">Automatic HTTPS</a>
+        </div>
+      </div>
       <a href="../journey.html">Journey</a>
       <a class="nav-github" href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub &#8599;</a>
     </nav>
@@ -117,6 +123,24 @@
         </tbody>
       </table>
       <p><code>keel-controlplane</code> forwards <code>GET</code>/<code>DELETE /nodes/&lt;id&gt;/volumes/&lt;name&gt;</code> to the named node's <code>keel-agentd</code>, byte-for-byte, the same <code>handle_forward</code> path <code>/nodes/&lt;id&gt;/jails/...</code> already uses; there is no scheduled (node-less) route for volumes, since a volume is never itself scheduled, it simply lives wherever the jail that first referenced it already landed. <code>keelctl delete-volume &lt;name&gt;</code> is the only <code>keelctl</code> verb that reaches this API; there is no <code>keelctl get-volume</code>, the same "operator surface is deliberately smaller than the full HTTP API" precedent <code>GET /services</code> already set.</p>
+    </div>
+  </section>
+
+  <section id="ingress">
+    <div class="container">
+      <h2>Ingress (automatic HTTPS)</h2>
+      <p>Unlike jails, services, and volumes, <code>Ingress</code> is served only by <code>keel-agentd</code>'s own local socket, never routed through <code>keel-controlplane</code>: an <code>Ingress</code> and the <code>Service</code> it points at must live on the same node in this milestone (see the <a href="jailspec.html#ingress">JailSpec reference</a>). There is no <code>/nodes/&lt;id&gt;/ingress/...</code> or scheduled <code>/ingress/&lt;name&gt;</code> route on the control plane.</p>
+      <table>
+        <thead><tr><th>Method &amp; path</th><th>Body</th><th>Success</th><th>Errors</th></tr></thead>
+        <tbody>
+          <tr><td><code>PUT /ingress/&lt;name&gt;</code></td><td>IngressSpec YAML; <code>metadata.name</code> must match <code>&lt;name&gt;</code></td><td>200; the singleton ingress jail is provisioned if it doesn't exist yet, and a certificate is issued on the node's next reconcile pass if one isn't already valid</td><td>400 invalid YAML, name/body mismatch, or <code>backend.service</code> doesn't name a currently-known <code>Service</code></td></tr>
+          <tr><td><code>GET /ingress</code></td><td>none</td><td>200, YAML list of every applied <code>Ingress</code> spec</td><td>None</td></tr>
+          <tr><td><code>GET /ingress/&lt;name&gt;</code></td><td>none</td><td>200, YAML for that <code>Ingress</code> spec</td><td>404 unknown name</td></tr>
+          <tr><td><code>DELETE /ingress/&lt;name&gt;</code></td><td>none</td><td>200; the host's <code>server</code> block is removed from nginx's configuration on the next reconcile pass</td><td>404 unknown name</td></tr>
+        </tbody>
+      </table>
+      <p>Certificate issuance and renewal run entirely on the node's own 5-second reconcile tick, the same crash-loop backoff pattern every other reconciliation path in this project uses: a failed DNS-01 challenge or ACME request doesn't block any other <code>Ingress</code>'s certificate, and a certificate within 30 days of expiry is renewed automatically with no operator action. The DNS provider (currently OVH only) and the ACME directory URL (Let's Encrypt staging or production) are <code>keel-agentd</code> daemon config, not part of any spec, since they're credentials rather than per-<code>Ingress</code> data; see the <a href="../https-quickstart.html">automatic HTTPS quickstart</a> for exactly which flags and files that config needs.</p>
+      <p>Cross-node <code>Ingress</code> routing (an <code>Ingress</code> on one node fronting a <code>Service</code> whose replicas are scheduled elsewhere) is out of scope for this milestone; see the <a href="architecture.html#ingress">Architecture</a> page.</p>
     </div>
   </section>
 </main>

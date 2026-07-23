@@ -22,7 +22,13 @@
           <a href="api.html">HTTP API Reference</a>
         </div>
       </div>
-      <a href="../quickstart.html">Quickstart</a>
+      <div class="nav-dropdown">
+        <a href="../quickstart.html">Quickstart</a>
+        <div class="nav-dropdown-menu">
+          <a href="../quickstart.html">Static Website</a>
+          <a href="../https-quickstart.html">Automatic HTTPS</a>
+        </div>
+      </div>
       <a href="../journey.html">Journey</a>
       <a class="nav-github" href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub &#8599;</a>
     </nav>
@@ -32,7 +38,7 @@
   <section class="page-header">
     <div class="container">
       <h1>JailSpec reference</h1>
-      <p class="lead">The YAML schemas for a single Keel jail (<code>kind: Jail</code>) and a self-healing, load-balanced replica set (<code>kind: Service</code>), both defined in <code>keel-spec</code>.</p>
+      <p class="lead">The YAML schemas for a single Keel jail (<code>kind: Jail</code>), a self-healing, load-balanced replica set (<code>kind: Service</code>), and automatic HTTPS for a real domain (<code>kind: Ingress</code>), all defined in <code>keel-spec</code>.</p>
     </div>
   </section>
 
@@ -136,6 +142,34 @@ spec:
         </tbody>
       </table>
       <p>A service's virtual IP is allocated once, deterministically, from the cluster's <code>--service-cidr</code> pool on first creation, and never changes for the life of the service (a scale-only re-apply preserves it exactly). See the <a href="api.html#services">HTTP API reference</a> for how to read a service's VIP back, and <a href="architecture.html#services">Architecture</a> for how replica placement, self-healing, and the load-balancing proxy fit together.</p>
+    </div>
+  </section>
+
+  <section id="ingress">
+    <div class="container">
+      <h2>kind: Ingress</h2>
+      <p>A <code>kind: Ingress</code> spec terminates HTTPS for one real domain and proxies it to a <code>kind: Service</code>'s virtual IP, with a certificate issued and renewed automatically via DNS-01 against Let's Encrypt. See <a href="../https-quickstart.html">the automatic HTTPS quickstart</a> for a full worked example, from an empty node to a real browser reaching your site over HTTPS.</p>
+      <pre>apiVersion: keel/v1
+kind: Ingress
+metadata:
+  name: blog
+spec:
+  host: example.com
+  backend:
+    service: hugo-site
+    port: 8080
+  tls:
+    email: admin@example.com</pre>
+      <table>
+        <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>spec.host</code></td><td>string</td><td>The domain this <code>Ingress</code> serves, validated as a syntactically well-formed DNS name (must contain a dot; each label must be 1-63 alphanumeric-or-hyphen characters, starting and ending alphanumeric). This is also the <code>server_name</code> nginx uses to pick this host's certificate via SNI, so one <code>Ingress</code> serves exactly one hostname; there is no wildcard or multi-domain support yet.</td></tr>
+          <tr><td><code>spec.backend.service</code></td><td>string</td><td>The name of an existing <code>kind: Service</code> to proxy to. Checked at apply time against the currently-known service VIP table; an unknown name is rejected with a 400, not silently accepted and left unroutable. An <code>Ingress</code> can only ever point at a <code>Service</code>, never a bare <code>Jail</code>, since a <code>Service</code> already has the stable virtual IP an <code>Ingress</code> needs (see <a href="#service">kind: Service</a> above).</td></tr>
+          <tr><td><code>spec.backend.port</code></td><td>integer</td><td>The port on the backend service's VIP to proxy to. Must be non-zero.</td></tr>
+          <tr><td><code>spec.tls.email</code></td><td>string</td><td>The contact email registered with the ACME account used to request this certificate, and every other <code>Ingress</code>'s certificate on this node (the ACME account is per-node, not per-<code>Ingress</code>). Validated as a syntactically well-formed email address.</td></tr>
+        </tbody>
+      </table>
+      <p>Applying a second <code>kind: Ingress</code> re-uses the same singleton nginx jail: nginx's configuration is regenerated as the union of every currently-applied <code>Ingress</code> spec, one <code>server</code> block per host, each with its own independently-issued and independently-renewed certificate. Deleting an <code>Ingress</code> removes its <code>server</code> block on the next reconcile pass but never tears the shared nginx jail down, the same "never destroy a shared resource speculatively" precedent <code>ensure_bridge_exists</code> already sets for bridges. See the <a href="architecture.html#ingress">Architecture</a> page for how certificate issuance, renewal, and the traffic path all fit together, and the <a href="api.html#ingress">HTTP API reference</a> for the <code>/ingress/&lt;name&gt;</code> routes.</p>
     </div>
   </section>
 </main>
