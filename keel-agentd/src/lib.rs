@@ -1,6 +1,8 @@
 pub mod backoff;
 pub mod capacity;
 pub mod http;
+pub mod ingress_record;
+pub mod ingress_store;
 pub mod podcidr;
 pub mod proxy;
 pub mod record;
@@ -16,6 +18,7 @@ pub mod tls;
 pub mod wire;
 pub mod worker;
 
+pub use ingress_record::IngressRecord;
 pub use podcidr::PodCidrSlot;
 pub use record::JailRecord;
 pub use reconciler::{ReconcileError, Reconciler};
