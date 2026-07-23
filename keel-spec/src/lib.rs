@@ -47,7 +47,7 @@ pub fn parse_and_validate_ingress(yaml: &str) -> Result<types::IngressSpec, Spec
 
 /// Reads just the `kind` field out of a YAML document, without requiring the
 /// rest of it to parse as any particular spec type — used by `keelctl` to
-/// decide whether to parse the rest as a `JailSpec` or a `ServiceSpec`.
+/// decide whether to parse the rest as a `JailSpec`, a `ServiceSpec`, or an `IngressSpec`.
 pub fn sniff_kind(yaml: &str) -> Result<String, SpecError> {
     #[derive(serde::Deserialize)]
     struct KindOnly {
