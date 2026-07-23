@@ -3,6 +3,26 @@
 Status: Approved, not yet implemented
 Date: 2026-07-22
 
+**2026-07-22 review update:** Two real gaps found while re-checking this
+design against the current codebase, both folded into the Architecture
+section below rather than left implicit:
+
+1. The Service-to-`VIP:port` table this milestone's nginx config generation
+   needs is not, today, visible outside `keel-agentd::registration`'s
+   heartbeat loop (see "Where the Service `VIP:port` table comes from"
+   below): the design as first written assumed it was already available
+   wherever the ingress reconciler would live.
+2. `keelctl`'s `run_apply` only branches on `kind: Service` vs.
+   everything-else-assumed-`Jail`; it needs a third `Ingress` branch or it
+   will try to parse an `Ingress` spec as a `Jail` and fail (see "`keelctl`
+   routing" below).
+
+One thing this review confirmed rather than changed: this project's
+"verify real infra before planning against it" discipline (the lesson
+Milestone 20's shelving paid for) was applied here too, live, before
+writing the implementation plan: see "Dev VM connectivity, confirmed"
+below.
+
 ## Context
 
 Every workload primitive Keel has today (`Jail`, `Service`) lives entirely
@@ -247,6 +267,98 @@ same backoff-and-retry treatment as everything else — a `pf` failure
 doesn't block per-`Ingress` cert/config reconciliation, since it's a
 separate concern.
 
+### Where the Service `VIP:port` table comes from
+
+Step 3 above needs each `Ingress`'s `backend.service` resolved to a
+`VIP:port` to write into `proxy_pass`. That mapping is not, today,
+reachable from wherever a new "ingress reconciler" would naturally live.
+
+Checked directly against the current code: `Command::Apply`/`Get`/
+`Delete` and the crash-safe jail-provisioning path (`provision`/
+`rollback_provision`) live in `keel-agentd::worker`/`reconciler`, driven
+by the Unix-socket HTTP API. The Milestone 16 VIP proxy's live state
+(`proxied_services: HashMap<String, ProxiedService>`, each entry holding
+the `vip` a `Service`'s replicas are reachable on) is a plain local
+variable inside `keel_agentd::registration::spawn`'s heartbeat-loop
+closure: it is populated fresh every heartbeat tick from
+`Vec<ServiceProxyEntry>` (each entry already carrying `name`, `vip`, and
+`port`; see `keel-controlplane::wire::ServiceProxyEntry`), and nothing
+outside that closure holds a reference to it. There is no `Command`
+variant or shared `Arc<Mutex<_>>` that lets the worker/reconciler (or any
+new subsystem) read "what `VIP:port` is Service X on right now."
+
+This milestone closes that gap the same way `PodCidrSlot`
+(`keel-agentd/src/podcidr.rs`) already closes an identical one for the
+pod CIDR: a small `Clone`-able, `Arc<Mutex<_>>`-backed slot,
+`ServiceVipSlot`, holding `HashMap<String, ServiceVipEntry>` (`struct
+ServiceVipEntry { vip: String, port: u16 }`). `registration::spawn`'s
+heartbeat loop calls `service_vip_slot.set_all(&entries)` right next to
+its existing `crate::proxy::reconcile_services(&entries, ...)` call, from
+the same freshly-fetched `Vec<ServiceProxyEntry>` (so both are always in
+sync, updated on the same tick). A clone of the same slot is:
+
+- held by the HTTP layer, read at `PUT /ingress/{name}` time to reject a
+  `backend.service` that isn't a currently-known name (`ServiceVipSlot::
+  names() -> HashSet<&str>`), the same way `handle_apply`'s existing
+  `pod_cidr_slot.get()` check rejects an out-of-subnet `Jail` address
+  today;
+- held by the `Reconciler`/worker (passed in alongside the pool name and
+  state dir the same way `PodCidrSlot` is threaded only to `http.rs`
+  today, but here also into the worker), read on every `Command::Tick` to
+  resolve each applied `Ingress`'s `backend.service` to a `VIP:port` when
+  recomputing nginx's config.
+
+This keeps cert issuance, jail provisioning, *and* nginx config
+generation together in the one place every other per-name reconciliation
+in this project already lives (the worker, driven by `Command::Tick`),
+rather than splitting ingress reconciliation across two subsystems: the
+only new cross-thread plumbing is the slot itself, written by
+`registration.rs` and read by the worker and the HTTP layer, mirroring an
+existing pattern instead of inventing a new `Command` round-trip. The
+practical consequence is unchanged from the first draft: an `Ingress`'s
+backend can only ever resolve once this node is registered with a
+control plane (see "Deployment topology" below), consistent with the
+Non-Goal that ingress and its backend `Service` must be co-located on
+one node.
+
+### `keelctl` routing
+
+`keelctl`'s `run_apply` (`keelctl/src/main.rs`) currently sniffs
+`kind: Service` explicitly and treats every other kind as `Jail`:
+
+```rust
+if kind == "Service" {
+    // ... parse_and_validate_service, PUT /services/{name}
+} else {
+    // ... parse_and_validate (Jail), PUT /jails/{name}
+}
+```
+
+Applying an `Ingress` spec today would fall into the `else` branch,
+`parse_and_validate` a `JailSpec` out of it, and fail on the first
+missing field. This needs a third branch: `kind == "Ingress"` calls
+`keel_spec::parse_and_validate_ingress` and `PUT`s to
+`/ingress/{name}` on `keel-agentd`'s own socket (the single-node target
+means this always goes to `Target::Socket`, the same path `Jail` already
+uses when no control plane is configured; the `--control-plane-addr`/
+`--node` targeting `jails_path` builds for `Jail`/`Service` is not needed
+for `Ingress`, since ingress is never routed through a control plane in
+this milestone).
+
+### Deployment topology
+
+Not previously stated explicitly: because `Ingress.spec.backend.service`
+must name a `kind: Service`, and only `keel-controlplane` understands
+`Service` (`keel-agentd` alone has no `/services` route at all, checked
+directly), the single VPS this milestone targets must run both
+`keel-controlplane` and a `keel-agentd` registered to it (`--control-
+plane-addr` pointed at itself), even though there is only ever one node.
+This is the same "cluster of one" shape every `Service`-based milestone
+since 15 has implicitly required; this milestone doesn't change it, but
+the design as first written didn't say so, and a from-scratch VPS install
+needs both daemons configured and registered for `Ingress` to work at
+all.
+
 ### Traffic path
 
 ```
@@ -315,6 +427,25 @@ reconciler notices expiry < 30d or missing --> AcmeClient::request_certificate
   browser reaching the site over the internet. This is tracked as a
   lightweight post-move smoke-test checklist, not a blocking task in
   this milestone's implementation plan, since the VPS doesn't exist yet.
+- **Dev VM connectivity, confirmed:** unlike Milestone 20's bhyve finding
+  (nested virtualization simply isn't available, discovered only by
+  trying it), this design's core testability assumption was checked
+  directly against the real dev VM (`root@192.168.64.2`) before writing
+  the implementation plan: `fetch` against both
+  `https://acme-v02.api.letsencrypt.org/directory` and
+  `https://eu.api.ovh.com/1.0/` succeeded, and general DNS resolution
+  works. The dev VM does have outbound internet access; real ACME/OVH
+  verification on it is viable as designed, not just assumed.
+- **Real domain and OVH account, not yet in hand:** no domain name or OVH
+  application key/secret/consumer key exists anywhere in this repo or
+  environment today. This blocks only the "real verification" testing
+  tier above, not implementation: every unit/fake test runs with no
+  external account. Before that tier's tasks run, the OVH API
+  credentials need to land in `/usr/local/etc/keel/dns-ovh.toml` on the
+  dev VM (per the Non-Goals section's "node-level daemon config, read
+  once at startup" decision) and a real domain delegated to OVH DNS
+  needs to be chosen, both of which require the user's own OVH account
+  and DNS zone.
 
 ## Open Questions / Deferred Decisions
 
