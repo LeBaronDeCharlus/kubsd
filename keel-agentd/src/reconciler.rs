@@ -295,7 +295,41 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J
         let _ = self.jails.remove_resource_limits(&jail_name);
     }
 
+    /// Synthesizes and applies an ordinary `JailSpec` (named `"ingress"`, so
+    /// `record::jail_name` turns it into the actual jail name
+    /// `"keel-ingress"`) the first time an `Ingress` spec has ever been
+    /// applied, reusing `apply`'s existing crash-safe provisioning/rollback
+    /// path unchanged. A no-op once the `"ingress"` jail record already
+    /// exists, or if no `Ingress` spec has ever been applied.
+    fn ensure_ingress_jail(&mut self) -> Result<(), ReconcileError> {
+        if self.ingress_records.is_empty() || self.records.contains_key("ingress") {
+            return Ok(());
+        }
+        let spec = keel_spec::JailSpec {
+            api_version: "keel/v1".to_string(),
+            kind: "Jail".to_string(),
+            metadata: keel_spec::Metadata { name: "ingress".to_string() },
+            spec: keel_spec::Spec {
+                image: "base/keel-ingress".to_string(),
+                command: vec!["/usr/local/sbin/nginx".to_string(), "-g".to_string(), "daemon off;".to_string()],
+                network: keel_spec::NetworkSpec {
+                    vnet: true,
+                    bridge: "keel0".to_string(),
+                    address: format!("{}/24", record::INGRESS_JAIL_BRIDGE_ADDR),
+                },
+                resources: keel_spec::ResourcesSpec { cpu: "1".to_string(), memory: "256M".to_string() },
+                restart_policy: keel_spec::RestartPolicy::Always,
+                volumes: vec![],
+                replicate_to: None,
+            },
+        };
+        self.apply(spec)
+    }
+
     pub fn reconcile(&mut self, now: Instant) -> Vec<(String, ReconcileError)> {
+        if let Err(e) = self.ensure_ingress_jail() {
+            eprintln!("keel-agentd: failed to ensure the ingress jail exists: {e}");
+        }
         let names: Vec<String> = self.records.keys().cloned().collect();
         let mut failures = Vec::new();
         for name in names {
@@ -1051,5 +1085,54 @@ mod tests {
         let record = reconciler.get_ingress("blog").unwrap();
         assert_eq!(record.cert_expires_at_unix, Some(cert_timestamp), "cert_expires_at_unix must be preserved across re-apply");
         assert_eq!(record.spec.spec.host, "blog.example.com", "host should be updated to the new value");
+    }
+
+    #[test]
+    fn reconcile_provisions_the_singleton_ingress_jail_once_an_ingress_spec_exists() {
+        let dir = test_state_dir("reconcile_provisions_the_singleton_ingress_jail");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/keel/base/keel-ingress");
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        reconciler.reconcile(Instant::now());
+        assert!(reconciler.jails.jail_exists("keel-ingress").unwrap());
+    }
+
+    #[test]
+    fn reconcile_does_not_provision_the_ingress_jail_when_no_ingress_spec_exists() {
+        let dir = test_state_dir("reconcile_does_not_provision_the_ingress_jail_when_none_exist");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.reconcile(Instant::now());
+        assert!(!reconciler.jails.jail_exists("keel-ingress").unwrap());
+    }
+
+    #[test]
+    fn reconcile_provisions_only_one_ingress_jail_even_as_more_ingress_specs_are_applied() {
+        let dir = test_state_dir("reconcile_provisions_only_one_ingress_jail");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        reconciler.reconcile(Instant::now());
+        let ordinal_after_first = reconciler.records.get("ingress").unwrap().epair_ordinal;
+        assert_eq!(reconciler.records.keys().filter(|name| name.as_str() == "ingress").count(), 1);
+
+        reconciler.apply_ingress(sample_ingress_spec("docs", "docs.example.com")).unwrap();
+        reconciler.reconcile(Instant::now());
+        assert_eq!(reconciler.records.keys().filter(|name| name.as_str() == "ingress").count(), 1);
+        assert_eq!(
+            reconciler.records.get("ingress").unwrap().epair_ordinal,
+            ordinal_after_first,
+            "the ingress jail must not be re-provisioned (and so not re-assigned a new epair ordinal) once it already exists"
+        );
+    }
+
+    #[test]
+    fn deleting_the_last_ingress_spec_does_not_retroactively_destroy_the_ingress_jail() {
+        let dir = test_state_dir("deleting_the_last_ingress_spec_does_not_destroy_the_jail");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/keel/base/keel-ingress");
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        reconciler.reconcile(Instant::now());
+        reconciler.delete_ingress("blog").unwrap();
+        reconciler.reconcile(Instant::now());
+        assert!(reconciler.jails.jail_exists("keel-ingress").unwrap());
     }
 }
