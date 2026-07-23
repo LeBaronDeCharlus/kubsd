@@ -1108,11 +1108,30 @@ mod tests {
     #[test]
     fn reconcile_provisions_only_one_ingress_jail_even_as_more_ingress_specs_are_applied() {
         let dir = test_state_dir("reconcile_provisions_only_one_ingress_jail");
+        let record_path = dir.join("ingress.yaml");
         let mut reconciler = new_reconciler(dir);
         reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
         reconciler.reconcile(Instant::now());
         let ordinal_after_first = reconciler.records.get("ingress").unwrap().epair_ordinal;
         assert_eq!(reconciler.records.keys().filter(|name| name.as_str() == "ingress").count(), 1);
+
+        // `apply()` is itself idempotent for a pre-existing record name (it
+        // reuses the existing epair_ordinal and writes a byte-identical
+        // on-disk record), so an *unguarded* `ensure_ingress_jail` that
+        // called `self.apply(spec)` on every single `reconcile()` tick,
+        // completely bypassing the "already exists" check, would still
+        // pass the two assertions above: an unchanged ordinal and exactly
+        // one "ingress" key. Capture the on-disk record's mtime here so the
+        // next `reconcile()` call below can prove the guard actually
+        // suppresses the second `apply()` call (and thus the second
+        // `store::save`), not merely that a redundant one would be
+        // harmless.
+        let mtime_after_first =
+            fs::metadata(&record_path).unwrap().modified().unwrap();
+        // Guard against filesystems with coarse mtime resolution: give the
+        // clock room to tick forward before the next write, so that IF a
+        // spurious rewrite happens, its mtime is observably different.
+        std::thread::sleep(Duration::from_millis(1100));
 
         reconciler.apply_ingress(sample_ingress_spec("docs", "docs.example.com")).unwrap();
         reconciler.reconcile(Instant::now());
@@ -1121,6 +1140,13 @@ mod tests {
             reconciler.records.get("ingress").unwrap().epair_ordinal,
             ordinal_after_first,
             "the ingress jail must not be re-provisioned (and so not re-assigned a new epair ordinal) once it already exists"
+        );
+        let mtime_after_second =
+            fs::metadata(&record_path).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_after_first, mtime_after_second,
+            "ensure_ingress_jail must not rewrite ingress.yaml on the second reconcile() call; a changed mtime means \
+             the `self.records.contains_key(\"ingress\")` guard was bypassed and apply() (and its store::save) ran again"
         );
     }
 
