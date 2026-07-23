@@ -6,6 +6,8 @@ pub use cli::CliZfsManager;
 pub use error::ZfsError;
 pub use fake::FakeZfsManager;
 
+use std::io::{Read, Write};
+
 pub trait ZfsManager {
     fn dataset_exists(&self, dataset: &str) -> Result<bool, ZfsError>;
 
@@ -21,4 +23,19 @@ pub trait ZfsManager {
     fn create_volume(&self, dataset: &str, quota: &str) -> Result<(), ZfsError>;
 
     fn destroy_dataset(&self, dataset: &str) -> Result<(), ZfsError>;
+
+    fn snapshot(&self, dataset: &str, snapshot: &str) -> Result<(), ZfsError>;
+
+    /// Destroys `dataset@snapshot`. Used to prune the previous incremental
+    /// base once a new one has been confirmed, keeping exactly one snapshot
+    /// per replicated volume at steady state.
+    fn destroy_snapshot(&self, dataset: &str, snapshot: &str) -> Result<(), ZfsError>;
+
+    /// Streams a `zfs send` (full if `base` is `None`, incremental `-i <base>`
+    /// otherwise) of `dataset@snapshot` into `out`.
+    fn send_snapshot(&self, dataset: &str, snapshot: &str, base: Option<&str>, out: &mut dyn Write) -> Result<(), ZfsError>;
+
+    /// Streams `input` into `zfs receive <dataset>`, creating or advancing
+    /// `dataset` from the received stream.
+    fn receive_snapshot(&self, dataset: &str, input: &mut dyn Read) -> Result<(), ZfsError>;
 }

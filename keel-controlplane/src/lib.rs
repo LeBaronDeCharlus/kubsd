@@ -1,15 +1,19 @@
 pub mod addresses;
 pub mod http;
+pub mod pending_fences;
 pub mod placements;
 pub mod registry;
 pub mod scheduler;
 pub mod services;
+pub mod standbys;
 pub mod subnet;
 pub mod tls;
 pub mod wire;
 pub mod worker;
 
+pub use pending_fences::PendingFences;
 pub use placements::Placements;
 pub use registry::Registry;
 pub use services::Services;
+pub use standbys::Standbys;
 pub use wire::{ErrorBody, NodeRegistration, NodeState, NodeStatus};

@@ -43,6 +43,7 @@ pub(crate) fn diff_routes(
 pub fn spawn(
     node_id: String,
     advertise_addr: String,
+    replicate_addr: String,
     control_plane_addr: String,
     heartbeat_interval: Duration,
     capacity_cpu: f64,
@@ -50,6 +51,7 @@ pub fn spawn(
     reloading_tls: Arc<tls::ReloadingTls>,
     commands: Sender<crate::worker::Command>,
     pod_cidr_slot: crate::PodCidrSlot,
+    service_vips: crate::ServiceVipSlot,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut registered = false;
@@ -58,7 +60,7 @@ pub fn spawn(
         loop {
             let client_config = reloading_tls.client_config();
             if !registered {
-                match register_once(&control_plane_addr, &node_id, &advertise_addr, capacity_cpu, capacity_memory, &client_config) {
+                match register_once(&control_plane_addr, &node_id, &advertise_addr, &replicate_addr, capacity_cpu, capacity_memory, &client_config) {
                     Ok(pod_cidr) => {
                         pod_cidr_slot.set(pod_cidr);
                         registered = true;
@@ -67,7 +69,10 @@ pub fn spawn(
                 }
             } else {
                 match heartbeat_once(&control_plane_addr, &node_id, &commands, &client_config) {
-                    Ok(entries) => crate::proxy::reconcile_services(&entries, &mut proxied_services, &commands),
+                    Ok(entries) => {
+                        service_vips.set_all(&entries);
+                        crate::proxy::reconcile_services(&entries, &mut proxied_services, &commands);
+                    }
                     Err(e) => {
                         eprintln!("keel-agentd: heartbeat failed: {e}");
                         registered = false;
@@ -89,12 +94,13 @@ fn register_once(
     control_plane_addr: &str,
     node_id: &str,
     advertise_addr: &str,
+    replicate_addr: &str,
     capacity_cpu: f64,
     capacity_memory: u64,
     client_config: &Arc<rustls::ClientConfig>,
 ) -> Result<ipnet::Ipv4Net, String> {
     let body = format!(
-        "id: {node_id}\naddr: {advertise_addr}\ncapacity_cpu: {capacity_cpu}\ncapacity_memory: {capacity_memory}\n"
+        "id: {node_id}\naddr: {advertise_addr}\nreplicate_addr: {replicate_addr}\ncapacity_cpu: {capacity_cpu}\ncapacity_memory: {capacity_memory}\n"
     );
     let response_body = send_request(control_plane_addr, "POST", "/nodes/register", &body, client_config)?;
     let response: keel_controlplane::wire::RegisterResponse = serde_yaml::from_slice(&response_body)
@@ -240,6 +246,7 @@ fn send_request(addr: &str, method: &str, path: &str, body: &str, client_config:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registration;
     use keel_controlplane::placements::Placements;
     use keel_controlplane::registry::Registry;
     use keel_controlplane::worker;
@@ -314,6 +321,8 @@ mod tests {
             Placements::new(),
             keel_controlplane::Services::new("10.0.250.0/24".parse().unwrap()),
             keel_controlplane::addresses::UsedAddresses::new(),
+            keel_controlplane::Standbys::new(),
+            keel_controlplane::PendingFences::new(),
         );
         let reloading_tls = keel_controlplane::tls::ReloadingTls::spawn(
             fixture("fixture-node.crt"),
@@ -325,6 +334,34 @@ mod tests {
         .unwrap();
         thread::spawn(move || keel_controlplane::http::run(listener, commands, reloading_tls));
         addr
+    }
+
+    // Mirrors the `spawn_test_worker` helper already used by proxy.rs's and
+    // worker.rs's own test modules (each private to its module, hence a
+    // separate copy here): a real worker/reconciler pair backed entirely by
+    // fakes, suitable for tests that only need the heartbeat loop to be able
+    // to answer `CommittedResources`/`Get` without touching real ZFS/jail/net
+    // state.
+    fn spawn_test_worker(name: &str) -> mpsc::Sender<crate::worker::Command> {
+        let zfs = keel_zfs::FakeZfsManager::new();
+        crate::worker::spawn(
+            crate::Reconciler::new(
+                keel_jail::FakeJailRuntime::new(),
+                zfs.clone(),
+                keel_net::FakeNetManager::new(),
+                keel_jail::FakeMountManager::new(),
+                "zroot".to_string(),
+                std::env::temp_dir().join(format!("keel-agentd-registration-test-{name}")),
+                Box::new(keel_ingress::FakeAcmeClient::new()),
+                Box::new(keel_ingress::FakeDnsProvider::new()),
+                Box::new(crate::nginx::FakeNginxController::new()),
+                crate::ServiceVipSlot::new(),
+            )
+            .unwrap(),
+            zfs,
+            "zroot".to_string(),
+        )
+        .1
     }
 
     fn node_client_config() -> std::sync::Arc<rustls::ClientConfig> {
@@ -436,22 +473,67 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_populates_the_service_vip_slot_from_the_proxy_table() {
+        let control_plane_addr = start_test_control_plane();
+        let commands = spawn_test_worker("heartbeat_populates_the_service_vip_slot");
+        let client_config = node_client_config();
+        let service_vips = crate::ServiceVipSlot::new();
+
+        registration::spawn(
+            "node-1".to_string(),
+            "127.0.0.1:0".to_string(),
+            "127.0.0.1:0".to_string(),
+            control_plane_addr.clone(),
+            Duration::from_millis(50),
+            1.0,
+            1_073_741_824,
+            node_reloading_tls(),
+            commands.clone(),
+            crate::PodCidrSlot::new(),
+            service_vips.clone(),
+        );
+
+        // Apply a Service on the real control plane so the next heartbeat's
+        // proxy table is non-empty, then wait a few ticks for it to land.
+        let apply_body = "apiVersion: keel/v1\nkind: Service\nmetadata:\n  name: hugo-site\nspec:\n  replicas: 1\n  port: 8080\n  template:\n    image: base/test\n    command: [\"/bin/true\"]\n    network:\n      vnet: true\n      bridge: keel0\n    resources:\n      cpu: \"1\"\n      memory: \"128M\"\n    restartPolicy: Always\n";
+        let _ = send_request(&control_plane_addr, "PUT", "/services/hugo-site", apply_body, &client_config);
+
+        let mut found = None;
+        for _ in 0..40 {
+            if let Some(vip) = service_vips.get("hugo-site") {
+                found = Some(vip);
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(found.is_some(), "expected 'hugo-site' to appear in the ServiceVipSlot within the timeout");
+    }
+
+    #[test]
     fn registers_and_then_keeps_heartbeating() {
         let control_plane_addr = start_test_control_plane();
+        let zfs = keel_zfs::FakeZfsManager::new();
         let (_worker_handle, commands) = crate::worker::spawn(
             crate::Reconciler::new(
                 keel_jail::FakeJailRuntime::new(),
-                keel_zfs::FakeZfsManager::new(),
+                zfs.clone(),
                 keel_net::FakeNetManager::new(),
                 keel_jail::FakeMountManager::new(),
                 "zroot".to_string(),
                 std::env::temp_dir().join("keel-agentd-registration-test-registers_and_then_keeps_heartbeating"),
+                Box::new(keel_ingress::FakeAcmeClient::new()),
+                Box::new(keel_ingress::FakeDnsProvider::new()),
+                Box::new(crate::nginx::FakeNginxController::new()),
+                crate::ServiceVipSlot::new(),
             )
             .unwrap(),
+            zfs,
+            "zroot".to_string(),
         );
         let _handle = spawn(
             "node-1".to_string(),
             "10.0.0.1".to_string(),
+            "10.0.0.9:7622".to_string(),
             control_plane_addr.clone(),
             Duration::from_millis(50),
             4.0,
@@ -459,6 +541,7 @@ mod tests {
             node_reloading_tls(),
             commands,
             crate::PodCidrSlot::new(),
+            crate::ServiceVipSlot::new(),
         );
 
         thread::sleep(Duration::from_millis(200));
@@ -475,14 +558,18 @@ mod tests {
         zfs.seed_dataset("zroot/keel/base/14.2-web");
         let reconciler = crate::Reconciler::new(
             keel_jail::FakeJailRuntime::new(),
-            zfs,
+            zfs.clone(),
             keel_net::FakeNetManager::new(),
             keel_jail::FakeMountManager::new(),
             "zroot".to_string(),
             std::env::temp_dir().join("keel-agentd-registration-test-heartbeats_report_the_reconcilers_committed_resources"),
+            Box::new(keel_ingress::FakeAcmeClient::new()),
+            Box::new(keel_ingress::FakeDnsProvider::new()),
+            Box::new(crate::nginx::FakeNginxController::new()),
+            crate::ServiceVipSlot::new(),
         )
         .unwrap();
-        let (_worker_handle, commands) = crate::worker::spawn(reconciler);
+        let (_worker_handle, commands) = crate::worker::spawn(reconciler, zfs, "zroot".to_string());
 
         let (apply_tx, apply_rx) = mpsc::channel();
         commands
@@ -502,6 +589,7 @@ mod tests {
                         resources: keel_spec::ResourcesSpec { cpu: "2".to_string(), memory: "512M".to_string() },
                         restart_policy: keel_spec::RestartPolicy::Always,
                         volumes: vec![],
+                        replicate_to: None,
                     },
                 },
                 apply_tx,
@@ -513,6 +601,7 @@ mod tests {
         let _handle = spawn(
             "node-1".to_string(),
             "10.0.0.1".to_string(),
+            "10.0.0.9:7622".to_string(),
             control_plane_addr_clone,
             Duration::from_millis(50),
             4.0,
@@ -520,6 +609,7 @@ mod tests {
             node_reloading_tls(),
             commands,
             crate::PodCidrSlot::new(),
+            crate::ServiceVipSlot::new(),
         );
 
         thread::sleep(Duration::from_millis(200));
@@ -538,16 +628,23 @@ mod tests {
 
         let net = keel_net::FakeNetManager::new();
         net.ensure_bridge_exists("keel0").unwrap();
+        let zfs = keel_zfs::FakeZfsManager::new();
         let (_worker_handle, commands) = crate::worker::spawn(
             crate::Reconciler::new(
                 keel_jail::FakeJailRuntime::new(),
-                keel_zfs::FakeZfsManager::new(),
+                zfs.clone(),
                 net.clone(),
                 keel_jail::FakeMountManager::new(),
                 "zroot".to_string(),
                 std::env::temp_dir().join("keel-agentd-registration-test-a_heartbeat_aliases_and_proxies_an_applied_service"),
+                Box::new(keel_ingress::FakeAcmeClient::new()),
+                Box::new(keel_ingress::FakeDnsProvider::new()),
+                Box::new(crate::nginx::FakeNginxController::new()),
+                crate::ServiceVipSlot::new(),
             )
             .unwrap(),
+            zfs,
+            "zroot".to_string(),
         );
         let pod_cidr_slot = crate::PodCidrSlot::new();
         // Port 1 on loopback: guaranteed nothing is listening there, so the
@@ -564,6 +661,7 @@ mod tests {
         let _handle = spawn(
             "node-1".to_string(),
             "127.0.0.1:1".to_string(),
+            "10.0.0.9:7622".to_string(),
             control_plane_addr.clone(),
             Duration::from_millis(50),
             4.0,
@@ -571,6 +669,7 @@ mod tests {
             node_reloading_tls(),
             commands,
             pod_cidr_slot,
+            crate::ServiceVipSlot::new(),
         );
 
         thread::sleep(Duration::from_millis(300));
@@ -610,20 +709,28 @@ mod tests {
     #[test]
     fn registration_with_a_wrong_ca_certificate_never_registers() {
         let control_plane_addr = start_test_control_plane();
+        let zfs = keel_zfs::FakeZfsManager::new();
         let (_worker_handle, commands) = crate::worker::spawn(
             crate::Reconciler::new(
                 keel_jail::FakeJailRuntime::new(),
-                keel_zfs::FakeZfsManager::new(),
+                zfs.clone(),
                 keel_net::FakeNetManager::new(),
                 keel_jail::FakeMountManager::new(),
                 "zroot".to_string(),
                 std::env::temp_dir().join("keel-agentd-registration-test-registration_with_a_wrong_ca_certificate_never_registers"),
+                Box::new(keel_ingress::FakeAcmeClient::new()),
+                Box::new(keel_ingress::FakeDnsProvider::new()),
+                Box::new(crate::nginx::FakeNginxController::new()),
+                crate::ServiceVipSlot::new(),
             )
             .unwrap(),
+            zfs,
+            "zroot".to_string(),
         );
         let _handle = spawn(
             "node-1".to_string(),
             "10.0.0.1".to_string(),
+            "10.0.0.9:7622".to_string(),
             control_plane_addr.clone(),
             Duration::from_millis(50),
             4.0,
@@ -631,6 +738,7 @@ mod tests {
             wrong_ca_reloading_tls(),
             commands,
             crate::PodCidrSlot::new(),
+            crate::ServiceVipSlot::new(),
         );
 
         thread::sleep(Duration::from_millis(200));
@@ -641,21 +749,29 @@ mod tests {
     #[test]
     fn a_successful_registration_stores_the_returned_pod_cidr_in_the_slot() {
         let control_plane_addr = start_test_control_plane();
+        let zfs = keel_zfs::FakeZfsManager::new();
         let (_worker_handle, commands) = crate::worker::spawn(
             crate::Reconciler::new(
                 keel_jail::FakeJailRuntime::new(),
-                keel_zfs::FakeZfsManager::new(),
+                zfs.clone(),
                 keel_net::FakeNetManager::new(),
                 keel_jail::FakeMountManager::new(),
                 "zroot".to_string(),
                 std::env::temp_dir().join("keel-agentd-registration-test-a_successful_registration_stores_the_returned_pod_cidr_in_the_slot"),
+                Box::new(keel_ingress::FakeAcmeClient::new()),
+                Box::new(keel_ingress::FakeDnsProvider::new()),
+                Box::new(crate::nginx::FakeNginxController::new()),
+                crate::ServiceVipSlot::new(),
             )
             .unwrap(),
+            zfs,
+            "zroot".to_string(),
         );
         let pod_cidr_slot = crate::PodCidrSlot::new();
         let _handle = spawn(
             "node-1".to_string(),
             "10.0.0.1".to_string(),
+            "10.0.0.9:7622".to_string(),
             control_plane_addr,
             Duration::from_millis(50),
             4.0,
@@ -663,6 +779,7 @@ mod tests {
             node_reloading_tls(),
             commands,
             pod_cidr_slot.clone(),
+            crate::ServiceVipSlot::new(),
         );
 
         thread::sleep(Duration::from_millis(200));
@@ -719,21 +836,29 @@ mod tests {
         .unwrap();
 
         let net = keel_net::FakeNetManager::new();
+        let zfs = keel_zfs::FakeZfsManager::new();
         let (_worker_handle, commands) = crate::worker::spawn(
             crate::Reconciler::new(
                 keel_jail::FakeJailRuntime::new(),
-                keel_zfs::FakeZfsManager::new(),
+                zfs.clone(),
                 net.clone(),
                 keel_jail::FakeMountManager::new(),
                 "zroot".to_string(),
                 std::env::temp_dir().join("keel-agentd-registration-test-route_reconciliation_adds_a_route_for_a_peer"),
+                Box::new(keel_ingress::FakeAcmeClient::new()),
+                Box::new(keel_ingress::FakeDnsProvider::new()),
+                Box::new(crate::nginx::FakeNginxController::new()),
+                crate::ServiceVipSlot::new(),
             )
             .unwrap(),
+            zfs,
+            "zroot".to_string(),
         );
         let pod_cidr_slot = crate::PodCidrSlot::new();
         let _handle = spawn(
             "node-1".to_string(),
             "10.0.0.1:7621".to_string(),
+            "10.0.0.9:7622".to_string(),
             control_plane_addr,
             Duration::from_millis(50),
             4.0,
@@ -741,6 +866,7 @@ mod tests {
             node_reloading_tls(),
             commands,
             pod_cidr_slot,
+            crate::ServiceVipSlot::new(),
         );
 
         thread::sleep(Duration::from_millis(300));
@@ -780,21 +906,29 @@ mod tests {
         .unwrap();
 
         let net = keel_net::FakeNetManager::new();
+        let zfs = keel_zfs::FakeZfsManager::new();
         let (_worker_handle, commands) = crate::worker::spawn(
             crate::Reconciler::new(
                 keel_jail::FakeJailRuntime::new(),
-                keel_zfs::FakeZfsManager::new(),
+                zfs.clone(),
                 net.clone(),
                 keel_jail::FakeMountManager::new(),
                 "zroot".to_string(),
                 std::env::temp_dir().join("keel-agentd-registration-test-route_reconciliation_withdraws_a_route_once_the_peer_is_reported_dead"),
+                Box::new(keel_ingress::FakeAcmeClient::new()),
+                Box::new(keel_ingress::FakeDnsProvider::new()),
+                Box::new(crate::nginx::FakeNginxController::new()),
+                crate::ServiceVipSlot::new(),
             )
             .unwrap(),
+            zfs,
+            "zroot".to_string(),
         );
         let pod_cidr_slot = crate::PodCidrSlot::new();
         let _handle = spawn(
             "node-1".to_string(),
             "10.0.0.1:7621".to_string(),
+            "10.0.0.9:7622".to_string(),
             control_plane_addr,
             Duration::from_millis(500),
             4.0,
@@ -802,6 +936,7 @@ mod tests {
             node_reloading_tls(),
             commands,
             pod_cidr_slot,
+            crate::ServiceVipSlot::new(),
         );
 
         thread::sleep(Duration::from_millis(700));

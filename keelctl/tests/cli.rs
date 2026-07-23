@@ -17,16 +17,21 @@ fn start_test_server(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&state_dir);
     let zfs = FakeZfsManager::new();
     zfs.seed_dataset("zroot/keel/base/14.2-web");
+    let replica_targets = keel_agentd::ReplicaTargetRegistry::load(state_dir.clone()).unwrap();
     let reconciler = Reconciler::new(
         FakeJailRuntime::new(),
-        zfs,
+        zfs.clone(),
         FakeNetManager::new(),
         FakeMountManager::new(),
         "zroot".to_string(),
         state_dir,
+        Box::new(keel_ingress::FakeAcmeClient::new()),
+        Box::new(keel_ingress::FakeDnsProvider::new()),
+        Box::new(keel_agentd::nginx::FakeNginxController::new()),
+        keel_agentd::ServiceVipSlot::new(),
     )
     .unwrap();
-    let (_worker_handle, commands) = worker::spawn(reconciler);
+    let (_worker_handle, commands) = worker::spawn(reconciler, zfs, "zroot".to_string());
 
     // A short, non-descriptive filename (not the full test name) — macOS/BSD
     // cap Unix socket paths at ~104 bytes (SUN_LEN), and the default macOS
@@ -34,7 +39,7 @@ fn start_test_server(name: &str) -> PathBuf {
     let socket_path = short_unique_socket_path();
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path).unwrap();
-    thread::spawn(move || keel_agentd::http::run(listener, commands, keel_agentd::PodCidrSlot::new()));
+    thread::spawn(move || keel_agentd::http::run(listener, commands, keel_agentd::PodCidrSlot::new(), keel_agentd::ServiceVipSlot::new(), replica_targets));
     socket_path
 }
 
@@ -73,16 +78,21 @@ fn start_test_agentd_tcp(name: &str) -> String {
     let _ = std::fs::remove_dir_all(&state_dir);
     let zfs = FakeZfsManager::new();
     zfs.seed_dataset("zroot/keel/base/14.2-web");
+    let replica_targets = keel_agentd::ReplicaTargetRegistry::load(state_dir.clone()).unwrap();
     let reconciler = Reconciler::new(
         FakeJailRuntime::new(),
-        zfs,
+        zfs.clone(),
         FakeNetManager::new(),
         FakeMountManager::new(),
         "zroot".to_string(),
         state_dir,
+        Box::new(keel_ingress::FakeAcmeClient::new()),
+        Box::new(keel_ingress::FakeDnsProvider::new()),
+        Box::new(keel_agentd::nginx::FakeNginxController::new()),
+        keel_agentd::ServiceVipSlot::new(),
     )
     .unwrap();
-    let (_worker_handle, commands) = worker::spawn(reconciler);
+    let (_worker_handle, commands) = worker::spawn(reconciler, zfs, "zroot".to_string());
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -94,7 +104,7 @@ fn start_test_agentd_tcp(name: &str) -> String {
         std::time::Duration::from_secs(3600),
     )
     .unwrap();
-    thread::spawn(move || keel_agentd::http::run_tls(listener, commands, reloading_tls, keel_agentd::PodCidrSlot::new()));
+    thread::spawn(move || keel_agentd::http::run_tls(listener, commands, reloading_tls, keel_agentd::PodCidrSlot::new(), keel_agentd::ServiceVipSlot::new(), replica_targets));
     addr
 }
 
@@ -106,6 +116,8 @@ fn start_test_control_plane_with_node(node_id: &str, node_addr: &str) -> String 
         keel_controlplane::Placements::new(),
         keel_controlplane::Services::new("10.0.250.0/24".parse().unwrap()),
         keel_controlplane::addresses::UsedAddresses::new(),
+        keel_controlplane::Standbys::new(),
+        keel_controlplane::PendingFences::new(),
     );
 
     let (reg_tx, reg_rx) = std::sync::mpsc::channel();
@@ -113,6 +125,7 @@ fn start_test_control_plane_with_node(node_id: &str, node_addr: &str) -> String 
         .send(keel_controlplane::worker::Command::Register(
             node_id.to_string(),
             node_addr.to_string(),
+            None,
             4.0,
             8 * 1024 * 1024 * 1024,
             reg_tx,
@@ -416,4 +429,12 @@ fn get_lists_multiple_applied_jails() {
     assert!(ok, "get failed: {stderr}");
     assert!(stdout.contains("web-1"));
     assert!(stdout.contains("web-2"));
+}
+
+#[test]
+fn force_repin_on_an_unplaced_name_prints_the_control_planes_404_message() {
+    let control_plane_addr = start_test_control_plane_with_node("node-1", "10.0.0.1:7621");
+    let (ok, _stdout, stderr) = run_keelctl_scheduled(&control_plane_addr, &["force-repin", "db-0"]);
+    assert!(!ok, "expected force-repin on an unplaced name to fail");
+    assert!(stderr.contains("no known placement"), "got stderr: {stderr}");
 }

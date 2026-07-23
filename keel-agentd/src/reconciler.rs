@@ -1,10 +1,12 @@
 use crate::backoff::BackoffState;
+use crate::ingress_record::IngressRecord;
+use crate::ingress_store;
 use crate::record::{self, JailRecord};
 use crate::store::{self, StoreError};
 use crate::wire::JailStatus;
 use keel_jail::{JailRuntime, MountManager};
 use keel_net::NetManager;
-use keel_spec::JailSpec;
+use keel_spec::{IngressSpec, JailSpec};
 use keel_zfs::ZfsManager;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -41,13 +43,33 @@ pub struct Reconciler<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountMana
     records: HashMap<String, JailRecord>,
     backoff: HashMap<String, BackoffState>,
     next_epair_ordinal: u32,
+    ingress_records: HashMap<String, IngressRecord>,
+    ingress_backoff: HashMap<String, BackoffState>,
+    acme: Box<dyn keel_ingress::AcmeClient + Send>,
+    dns: Box<dyn keel_ingress::DnsProvider + Send>,
+    nginx: Box<dyn crate::nginx::NginxController + Send>,
+    service_vips: crate::ServiceVipSlot,
 }
 
 impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J, Z, N, M> {
-    pub fn new(jails: J, zfs: Z, net: N, mounts: M, pool: String, state_dir: PathBuf) -> Result<Self, ReconcileError> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        jails: J,
+        zfs: Z,
+        net: N,
+        mounts: M,
+        pool: String,
+        state_dir: PathBuf,
+        acme: Box<dyn keel_ingress::AcmeClient + Send>,
+        dns: Box<dyn keel_ingress::DnsProvider + Send>,
+        nginx: Box<dyn crate::nginx::NginxController + Send>,
+        service_vips: crate::ServiceVipSlot,
+    ) -> Result<Self, ReconcileError> {
         let loaded = store::load_all(&state_dir)?;
         let next_epair_ordinal = loaded.iter().map(|r| r.epair_ordinal).max().map(|m| m + 1).unwrap_or(1);
         let records = loaded.into_iter().map(|r| (r.spec.metadata.name.clone(), r)).collect();
+        let ingress_loaded = ingress_store::load_all(&state_dir)?;
+        let ingress_records = ingress_loaded.into_iter().map(|r| (r.spec.metadata.name.clone(), r)).collect();
         Ok(Self {
             jails,
             zfs,
@@ -58,6 +80,12 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J
             records,
             backoff: HashMap::new(),
             next_epair_ordinal,
+            ingress_records,
+            ingress_backoff: HashMap::new(),
+            acme,
+            dns,
+            nginx,
+            service_vips,
         })
     }
 
@@ -162,6 +190,51 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J
         Ok(())
     }
 
+    /// Retargets an *already-running* primary's replication without a full
+    /// re-provision -- just updates `replicate_to` on the existing
+    /// `JailRecord` and persists it. Bypasses `apply()`/`validate_transition`
+    /// entirely: `replicate_to` isn't an immutability-checked field, and this
+    /// path has no spec to validate against, only a bare address to store.
+    pub fn set_replicate_to(&mut self, name: &str, replicate_to: Option<String>) -> Result<(), ReconcileError> {
+        let mut record = self.records.get(name).ok_or_else(|| ReconcileError::NotFound(name.to_string()))?.clone();
+        record.spec.spec.replicate_to = replicate_to;
+        store::save(&self.state_dir, &record)?;
+        self.records.insert(name.to_string(), record);
+        Ok(())
+    }
+
+    pub fn apply_ingress(&mut self, spec: IngressSpec) -> Result<(), ReconcileError> {
+        keel_spec::validate_name(&spec.metadata.name)?;
+        keel_spec::validate_host(&spec.spec.host)?;
+        keel_spec::validate_email(&spec.spec.tls.email)?;
+        if spec.spec.backend.port == 0 {
+            return Err(keel_spec::SpecError::InvalidPort(0).into());
+        }
+        let cert_expires_at_unix = self.ingress_records.get(&spec.metadata.name).and_then(|r| r.cert_expires_at_unix);
+        let record = IngressRecord { spec: spec.clone(), cert_expires_at_unix };
+        ingress_store::save(&self.state_dir, &record)?;
+        self.ingress_records.insert(spec.metadata.name.clone(), record);
+        Ok(())
+    }
+
+    pub fn get_ingress(&self, name: &str) -> Option<IngressRecord> {
+        self.ingress_records.get(name).cloned()
+    }
+
+    pub fn list_ingress(&self) -> Vec<IngressRecord> {
+        self.ingress_records.values().cloned().collect()
+    }
+
+    pub fn delete_ingress(&mut self, name: &str) -> Result<(), ReconcileError> {
+        if !self.ingress_records.contains_key(name) {
+            return Err(ReconcileError::NotFound(name.to_string()));
+        }
+        ingress_store::remove(&self.state_dir, name)?;
+        self.ingress_records.remove(name);
+        self.ingress_backoff.remove(name);
+        Ok(())
+    }
+
     fn configure_networking_and_limits(&mut self, name: &str, record: &JailRecord) -> Result<(), ReconcileError> {
         let jail_name = record::jail_name(name);
         let epair_base = record::epair_base_name(record.epair_ordinal);
@@ -221,17 +294,74 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J
     /// failure for a reason other than "already gone" is handled by the
     /// normal per-jail backoff on the next reconciliation pass, not
     /// specially here.
+    ///
+    /// Declared volumes are unmounted first, the same ordering `delete()`
+    /// already uses: a provision failure that happens after the
+    /// volume-mount step would otherwise leave the mount sitting on top of
+    /// the rootfs dataset, making `destroy_dataset` fail silently (busy)
+    /// and wedging every later retry's `zfs clone` on "already exists".
     fn rollback_provision(&mut self, name: &str, record: &JailRecord) {
         let jail_name = record::jail_name(name);
         let epair_base = record::epair_base_name(record.epair_ordinal);
         let jail_dataset = record::jail_dataset_path(&self.pool, name);
+        let rootfs = record::jail_rootfs_path(&self.pool, name);
         let _ = self.net.detach_jail(&epair_base);
         let _ = self.jails.destroy(&jail_name);
+        for volume in &record.spec.spec.volumes {
+            let target = rootfs.join(volume.mount_path.trim_start_matches('/'));
+            let _ = self.mounts.unmount(&target);
+        }
         let _ = self.zfs.destroy_dataset(&jail_dataset);
         let _ = self.jails.remove_resource_limits(&jail_name);
     }
 
+    /// Synthesizes and applies an ordinary `JailSpec` (named `"ingress"`, so
+    /// `record::jail_name` turns it into the actual jail name
+    /// `"keel-ingress"`) the first time an `Ingress` spec has ever been
+    /// applied, reusing `apply`'s existing crash-safe provisioning/rollback
+    /// path unchanged. A no-op once the `"ingress"` jail record already
+    /// exists, or if no `Ingress` spec has ever been applied.
+    fn ensure_ingress_jail(&mut self) -> Result<(), ReconcileError> {
+        if self.ingress_records.is_empty() || self.records.contains_key("ingress") {
+            return Ok(());
+        }
+        let spec = keel_spec::JailSpec {
+            api_version: "keel/v1".to_string(),
+            kind: "Jail".to_string(),
+            metadata: keel_spec::Metadata { name: "ingress".to_string() },
+            spec: keel_spec::Spec {
+                image: "base/keel-ingress".to_string(),
+                command: vec![
+                    "/usr/local/sbin/nginx".to_string(),
+                    "-c".to_string(),
+                    crate::nginx::NGINX_CONF_PATH.to_string(),
+                    "-g".to_string(),
+                    "daemon off;".to_string(),
+                ],
+                network: keel_spec::NetworkSpec {
+                    vnet: true,
+                    bridge: "keel0".to_string(),
+                    address: format!("{}/24", record::INGRESS_JAIL_BRIDGE_ADDR),
+                },
+                resources: keel_spec::ResourcesSpec { cpu: "1".to_string(), memory: "256M".to_string() },
+                restart_policy: keel_spec::RestartPolicy::Always,
+                volumes: vec![],
+                replicate_to: None,
+            },
+        };
+        self.apply(spec)
+    }
+
     pub fn reconcile(&mut self, now: Instant) -> Vec<(String, ReconcileError)> {
+        if let Err(e) = self.ensure_ingress_jail() {
+            eprintln!("keel-agentd: failed to ensure the ingress jail exists: {e}");
+        }
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.reconcile_certs(now_unix);
+        self.reconcile_ingress_config();
         let names: Vec<String> = self.records.keys().cloned().collect();
         let mut failures = Vec::new();
         for name in names {
@@ -240,6 +370,137 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J
             }
         }
         failures
+    }
+
+    /// Issues or renews a TLS certificate for every tracked `Ingress` whose
+    /// certificate is missing or within `RENEWAL_THRESHOLD_SECS` of expiry.
+    /// Uses `ingress_backoff` (mirroring `reconcile_one`'s own use of
+    /// `backoff` for jail provisioning retries) so that one Ingress stuck in
+    /// a failing ACME/DNS loop cannot starve every other Ingress's own
+    /// reconcile pass by being retried on every single tick.
+    ///
+    /// Unlike jail provisioning (where `record_attempt` arms the cooldown
+    /// unconditionally, even on success, because a successful `start` gives
+    /// no guarantee the process keeps running), a successful certificate
+    /// issuance here is fully durable the moment it's written to disk and
+    /// persisted -- there's no equivalent "might still fail shortly after
+    /// success" risk. So `record_attempt` is only called on a genuine
+    /// failure (ACME/DNS, the on-disk write, or persistence), not after
+    /// every attempt; a real periodic reconcile loop still won't hammer a
+    /// working ACME endpoint since the next issuance for that host is
+    /// naturally more than 30 days away.
+    ///
+    /// Takes a wall-clock `now_unix: i64` rather than folding into
+    /// `reconcile`'s own `Instant now` - a certificate's expiry is
+    /// inherently wall-clock (unlike everything else this reconciler
+    /// tracks), so tests can inject it directly instead of depending on the
+    /// real clock.
+    fn reconcile_certs(&mut self, now_unix: i64) {
+        const RENEWAL_THRESHOLD_SECS: i64 = 30 * 24 * 60 * 60;
+        let names: Vec<String> = self.ingress_records.keys().cloned().collect();
+        for name in names {
+            let can_retry = self.ingress_backoff.entry(name.clone()).or_default().can_retry(Instant::now());
+            if !can_retry {
+                continue;
+            }
+            let record = self.ingress_records[&name].clone();
+            let cert_file_missing = !self.cert_exists_in_ingress_jail(&record.spec.spec.host);
+            let needs_issuance = match record.cert_expires_at_unix {
+                None => true,
+                // A timestamp alone isn't proof the cert is actually usable:
+                // if the ingress jail's rootfs was ever recreated (e.g. lost
+                // and re-cloned from the base image after a crash, or torn
+                // down and reprovisioned), `cert_expires_at_unix` still
+                // claims a valid cert while the file itself is gone from the
+                // new rootfs. Reproduced directly during Milestone 21 VM
+                // verification: recreating the ingress jail to fix an
+                // unrelated base-image issue silently wiped the previously
+                // issued cert while the `Ingress` record's own expiry
+                // timestamp (persisted separately) still looked fine.
+                Some(expires_at) => cert_file_missing || expires_at - now_unix < RENEWAL_THRESHOLD_SECS,
+            };
+            if !needs_issuance {
+                continue;
+            }
+            match self.acme.request_certificate(&record.spec.spec.host, &record.spec.spec.tls.email, self.dns.as_ref()) {
+                Ok(cert) => {
+                    if let Err(e) = self.write_cert_to_ingress_jail(&record.spec.spec.host, &cert) {
+                        eprintln!("keel-agentd: failed to write certificate for ingress '{name}' into the ingress jail: {e}");
+                        self.ingress_backoff.get_mut(&name).unwrap().record_attempt(Instant::now());
+                        continue;
+                    }
+                    let mut updated = record;
+                    // Placeholder 90-day validity: `FakeAcmeClient` doesn't
+                    // return a real expiry. Task 16's real `AcmeClient` must
+                    // parse the actual `notAfter` out of the issued
+                    // certificate instead of hardcoding this.
+                    updated.cert_expires_at_unix = Some(now_unix + 90 * 24 * 60 * 60);
+                    if let Err(e) = ingress_store::save(&self.state_dir, &updated) {
+                        eprintln!("keel-agentd: failed to persist certificate expiry for ingress '{name}': {e}");
+                        self.ingress_backoff.get_mut(&name).unwrap().record_attempt(Instant::now());
+                        continue;
+                    }
+                    self.ingress_records.insert(name, updated);
+                }
+                Err(e) => {
+                    eprintln!("keel-agentd: certificate issuance failed for ingress '{name}': {e}");
+                    self.ingress_backoff.get_mut(&name).unwrap().record_attempt(Instant::now());
+                }
+            }
+        }
+    }
+
+    /// Regenerates nginx's config from every applied `Ingress` joined
+    /// against `service_vips`'s current `Service` VIP table, then
+    /// `write_config` -> `test_config` -> `reload` in sequence. Aborts the
+    /// sequence (no reload, and on a `test_config` failure no disruption of
+    /// whatever config is currently live) as soon as any step fails. An
+    /// `Ingress` whose backend service has no known VIP yet (the control
+    /// plane hasn't reported it, or it's simply down) is silently omitted
+    /// from this pass's rendered config rather than failing the whole
+    /// reconcile; the next tick picks it up once the VIP becomes known.
+    fn reconcile_ingress_config(&mut self) {
+        let backends: Vec<keel_ingress::IngressBackendConfig> = self
+            .ingress_records
+            .values()
+            .filter_map(|record| {
+                let (vip, port) = self.service_vips.get(&record.spec.spec.backend.service)?;
+                Some(keel_ingress::IngressBackendConfig {
+                    host: record.spec.spec.host.clone(),
+                    vip,
+                    port,
+                    cert_path: format!("/usr/local/etc/nginx/certs/{}.crt", record.spec.spec.host),
+                    key_path: format!("/usr/local/etc/nginx/certs/{}.key", record.spec.spec.host),
+                })
+            })
+            .collect();
+        let config = keel_ingress::render_nginx_config(&backends);
+        if let Err(e) = self.nginx.write_config("keel-ingress", &config) {
+            eprintln!("keel-agentd: failed to write ingress nginx config: {e}");
+            return;
+        }
+        if let Err(e) = self.nginx.test_config("keel-ingress") {
+            eprintln!("keel-agentd: ingress nginx config failed validation, leaving the previous config live: {e}");
+            return;
+        }
+        if let Err(e) = self.nginx.reload("keel-ingress") {
+            eprintln!("keel-agentd: failed to reload ingress nginx: {e}");
+        }
+    }
+
+    fn cert_exists_in_ingress_jail(&self, host: &str) -> bool {
+        let crt_path = record::jail_rootfs_path(&self.pool, "ingress").join("usr/local/etc/nginx/certs").join(format!("{host}.crt"));
+        crt_path.is_file()
+    }
+
+    fn write_cert_to_ingress_jail(&self, host: &str, cert: &keel_ingress::Cert) -> Result<(), ReconcileError> {
+        let certs_dir = record::jail_rootfs_path(&self.pool, "ingress").join("usr/local/etc/nginx/certs");
+        std::fs::create_dir_all(&certs_dir).map_err(|e| ReconcileError::Store(StoreError::Io(certs_dir.clone(), e)))?;
+        let crt_path = certs_dir.join(format!("{host}.crt"));
+        let key_path = certs_dir.join(format!("{host}.key"));
+        std::fs::write(&crt_path, &cert.cert_pem).map_err(|e| ReconcileError::Store(StoreError::Io(crt_path, e)))?;
+        std::fs::write(&key_path, &cert.key_pem).map_err(|e| ReconcileError::Store(StoreError::Io(key_path, e)))?;
+        Ok(())
     }
 
     fn reconcile_one(&mut self, name: &str, now: Instant) -> Result<(), ReconcileError> {
@@ -332,6 +593,7 @@ mod tests {
                 resources: ResourcesSpec { cpu: "2".to_string(), memory: "512M".to_string() },
                 restart_policy: RestartPolicy::Always,
                 volumes: vec![],
+                replicate_to: None,
             },
         }
     }
@@ -350,6 +612,10 @@ mod tests {
             FakeMountManager::new(),
             "zroot".to_string(),
             state_dir,
+            Box::new(keel_ingress::FakeAcmeClient::new()),
+            Box::new(keel_ingress::FakeDnsProvider::new()),
+            Box::new(crate::nginx::FakeNginxController::new()),
+            crate::ServiceVipSlot::new(),
         )
         .unwrap()
     }
@@ -647,6 +913,36 @@ mod tests {
     }
 
     #[test]
+    fn rollback_provision_unmounts_a_declared_volume() {
+        // A provision failure that happens after the volume-mount step (a
+        // real `configure_networking_and_limits`/`start_command` failure,
+        // not reproducible against these in-memory fakes) must not leave
+        // the volume's nullfs mount sitting on top of the rootfs dataset:
+        // an un-unmounted volume is exactly the "device busy" class of
+        // failure `delete()`'s own unmount-before-destroy ordering already
+        // exists to avoid, and leaving it in place would make every
+        // subsequent retry's `zfs clone` fail with "already exists"
+        // forever, wedging the reconciler's own backoff-retry loop. Since
+        // the fakes can't force that failure directly, this instead
+        // reproduces rollback_provision's required cleanup contract the
+        // same way the test below does: run a fully successful provision
+        // (which mounts the volume for real, against the fakes), then call
+        // rollback_provision directly, exactly the state it must also
+        // handle after a genuine partial failure.
+        let dir = test_state_dir("rollback_provision_unmounts_a_declared_volume");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/keel/base/14.2-web");
+        reconciler.apply(sample_spec_with_volume("web-1", "web-data", "/data", "1G")).unwrap();
+        let record = reconciler.records["web-1"].clone();
+
+        reconciler.provision("web-1", &record).unwrap();
+        reconciler.rollback_provision("web-1", &record);
+
+        let target = record::jail_rootfs_path("zroot", "web-1").join("data");
+        assert_eq!(reconciler.mounts.is_mounted(&target).unwrap(), false, "volume mount must be undone by rollback");
+    }
+
+    #[test]
     fn rollback_provision_cleans_up_after_partial_failure() {
         let dir = test_state_dir("rollback_provision_cleans_up_after_partial_failure");
         let mut reconciler = new_reconciler(dir);
@@ -848,5 +1144,406 @@ mod tests {
         let dir = test_state_dir("list_is_empty_when_no_specs_have_been_applied");
         let reconciler = new_reconciler(dir);
         assert!(reconciler.list(Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn set_replicate_to_updates_the_record_without_going_through_validate_transition() {
+        let dir = test_state_dir("set_replicate_to_updates_the_record_without_going_through_validate_transition");
+        let mut reconciler = new_reconciler(dir.clone());
+        reconciler.zfs.seed_dataset("zroot/keel/base/14.2-web");
+        reconciler.apply(sample_spec_with_volume("db-0", "db-0-data", "/var/db", "5G")).unwrap();
+
+        reconciler.set_replicate_to("db-0", Some("10.0.0.9:7622".to_string())).unwrap();
+
+        assert_eq!(reconciler.records["db-0"].spec.spec.replicate_to, Some("10.0.0.9:7622".to_string()));
+        let loaded = store::load_all(&dir).unwrap();
+        assert_eq!(loaded[0].spec.spec.replicate_to, Some("10.0.0.9:7622".to_string()));
+    }
+
+    #[test]
+    fn set_replicate_to_on_an_unknown_name_returns_not_found() {
+        let dir = test_state_dir("set_replicate_to_on_an_unknown_name_returns_not_found");
+        let mut reconciler = new_reconciler(dir);
+        assert!(matches!(reconciler.set_replicate_to("missing", Some("10.0.0.9:7622".to_string())), Err(ReconcileError::NotFound(_))));
+    }
+
+    fn sample_ingress_spec(name: &str, host: &str) -> keel_spec::IngressSpec {
+        keel_spec::IngressSpec {
+            api_version: "keel/v1".to_string(),
+            kind: "Ingress".to_string(),
+            metadata: keel_spec::Metadata { name: name.to_string() },
+            spec: keel_spec::IngressSpecBody {
+                host: host.to_string(),
+                backend: keel_spec::IngressBackend { service: "hugo-site".to_string(), port: 8080 },
+                tls: keel_spec::IngressTls { email: "admin@example.com".to_string() },
+            },
+        }
+    }
+
+    #[test]
+    fn apply_ingress_persists_and_tracks_the_record() {
+        let dir = test_state_dir("apply_ingress_persists_and_tracks_the_record");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        assert_eq!(reconciler.list_ingress().len(), 1);
+        assert_eq!(reconciler.get_ingress("blog").unwrap().spec.spec.host, "example.com");
+    }
+
+    #[test]
+    fn apply_ingress_survives_a_simulated_restart() {
+        let dir = test_state_dir("apply_ingress_survives_a_simulated_restart");
+        {
+            let mut reconciler = new_reconciler(dir.clone());
+            reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        }
+        let reloaded = new_reconciler(dir);
+        assert_eq!(reloaded.list_ingress().len(), 1);
+    }
+
+    #[test]
+    fn get_ingress_on_an_unknown_name_returns_none() {
+        let dir = test_state_dir("get_ingress_on_an_unknown_name_returns_none");
+        let reconciler = new_reconciler(dir);
+        assert_eq!(reconciler.get_ingress("missing"), None);
+    }
+
+    #[test]
+    fn delete_ingress_removes_the_record() {
+        let dir = test_state_dir("delete_ingress_removes_the_record");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        reconciler.delete_ingress("blog").unwrap();
+        assert_eq!(reconciler.list_ingress().len(), 0);
+    }
+
+    #[test]
+    fn delete_ingress_on_an_unknown_name_is_not_found() {
+        let dir = test_state_dir("delete_ingress_on_an_unknown_name_is_not_found");
+        let mut reconciler = new_reconciler(dir);
+        assert!(matches!(reconciler.delete_ingress("missing"), Err(ReconcileError::NotFound(_))));
+    }
+
+    #[test]
+    fn re_applying_an_existing_ingress_updates_its_host_and_keeps_the_same_name() {
+        let dir = test_state_dir("re_applying_an_existing_ingress_updates_its_host");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        reconciler.apply_ingress(sample_ingress_spec("blog", "blog.example.com")).unwrap();
+        assert_eq!(reconciler.list_ingress().len(), 1);
+        assert_eq!(reconciler.get_ingress("blog").unwrap().spec.spec.host, "blog.example.com");
+    }
+
+    #[test]
+    fn re_applying_an_existing_ingress_preserves_cert_expires_at_unix() {
+        let dir = test_state_dir("re_applying_an_existing_ingress_preserves_cert_expires_at_unix");
+        let mut reconciler = new_reconciler(dir);
+
+        // Apply ingress with initial host
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+
+        // Manually set cert_expires_at_unix to simulate a certificate that was issued
+        let cert_timestamp = 1_800_000_000i64;
+        reconciler.ingress_records.get_mut("blog").unwrap().cert_expires_at_unix = Some(cert_timestamp);
+
+        // Re-apply the same ingress with a different host
+        reconciler.apply_ingress(sample_ingress_spec("blog", "blog.example.com")).unwrap();
+
+        // Verify the certificate expiry is preserved despite the re-apply
+        let record = reconciler.get_ingress("blog").unwrap();
+        assert_eq!(record.cert_expires_at_unix, Some(cert_timestamp), "cert_expires_at_unix must be preserved across re-apply");
+        assert_eq!(record.spec.spec.host, "blog.example.com", "host should be updated to the new value");
+    }
+
+    #[test]
+    fn reconcile_provisions_the_singleton_ingress_jail_once_an_ingress_spec_exists() {
+        let dir = test_state_dir("reconcile_provisions_the_singleton_ingress_jail");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/keel/base/keel-ingress");
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        reconciler.reconcile(Instant::now());
+        assert!(reconciler.jails.jail_exists("keel-ingress").unwrap());
+    }
+
+    #[test]
+    fn reconcile_does_not_provision_the_ingress_jail_when_no_ingress_spec_exists() {
+        let dir = test_state_dir("reconcile_does_not_provision_the_ingress_jail_when_none_exist");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.reconcile(Instant::now());
+        assert!(!reconciler.jails.jail_exists("keel-ingress").unwrap());
+    }
+
+    #[test]
+    fn reconcile_provisions_only_one_ingress_jail_even_as_more_ingress_specs_are_applied() {
+        let dir = test_state_dir("reconcile_provisions_only_one_ingress_jail");
+        let record_path = dir.join("ingress.yaml");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        reconciler.reconcile(Instant::now());
+        let ordinal_after_first = reconciler.records.get("ingress").unwrap().epair_ordinal;
+        assert_eq!(reconciler.records.keys().filter(|name| name.as_str() == "ingress").count(), 1);
+
+        // `apply()` is itself idempotent for a pre-existing record name (it
+        // reuses the existing epair_ordinal and writes a byte-identical
+        // on-disk record), so an *unguarded* `ensure_ingress_jail` that
+        // called `self.apply(spec)` on every single `reconcile()` tick,
+        // completely bypassing the "already exists" check, would still
+        // pass the two assertions above: an unchanged ordinal and exactly
+        // one "ingress" key. Capture the on-disk record's mtime here so the
+        // next `reconcile()` call below can prove the guard actually
+        // suppresses the second `apply()` call (and thus the second
+        // `store::save`), not merely that a redundant one would be
+        // harmless.
+        let mtime_after_first =
+            fs::metadata(&record_path).unwrap().modified().unwrap();
+        // Guard against filesystems with coarse mtime resolution: give the
+        // clock room to tick forward before the next write, so that IF a
+        // spurious rewrite happens, its mtime is observably different.
+        std::thread::sleep(Duration::from_millis(1100));
+
+        reconciler.apply_ingress(sample_ingress_spec("docs", "docs.example.com")).unwrap();
+        reconciler.reconcile(Instant::now());
+        assert_eq!(reconciler.records.keys().filter(|name| name.as_str() == "ingress").count(), 1);
+        assert_eq!(
+            reconciler.records.get("ingress").unwrap().epair_ordinal,
+            ordinal_after_first,
+            "the ingress jail must not be re-provisioned (and so not re-assigned a new epair ordinal) once it already exists"
+        );
+        let mtime_after_second =
+            fs::metadata(&record_path).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_after_first, mtime_after_second,
+            "ensure_ingress_jail must not rewrite ingress.yaml on the second reconcile() call; a changed mtime means \
+             the `self.records.contains_key(\"ingress\")` guard was bypassed and apply() (and its store::save) ran again"
+        );
+    }
+
+    #[test]
+    fn deleting_the_last_ingress_spec_does_not_retroactively_destroy_the_ingress_jail() {
+        let dir = test_state_dir("deleting_the_last_ingress_spec_does_not_destroy_the_jail");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.zfs.seed_dataset("zroot/keel/base/keel-ingress");
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        reconciler.reconcile(Instant::now());
+        reconciler.delete_ingress("blog").unwrap();
+        reconciler.reconcile(Instant::now());
+        assert!(reconciler.jails.jail_exists("keel-ingress").unwrap());
+    }
+
+    // `write_cert_to_ingress_jail` performs a genuine `std::fs::write` under
+    // `record::jail_rootfs_path(&pool, "ingress")`. In production that path
+    // is rooted in a real ZFS pool (e.g. "/zroot/..."), which a non-root
+    // test process cannot create. Rather than mocking that write away (and
+    // so never actually proving the certs land on disk), derive the "pool"
+    // name for these tests from the test's own writable temp `dir`, so
+    // `jail_rootfs_path` resolves to a real, writable location nested
+    // inside it and the write genuinely happens end to end.
+    fn test_reconciler_with_acme(
+        dir: &std::path::Path,
+        acme: keel_ingress::FakeAcmeClient,
+        dns: keel_ingress::FakeDnsProvider,
+    ) -> Reconciler<FakeJailRuntime, FakeZfsManager, FakeNetManager, FakeMountManager> {
+        let pool = dir.strip_prefix("/").unwrap_or(dir).to_string_lossy().into_owned();
+        Reconciler::new(
+            FakeJailRuntime::new(),
+            FakeZfsManager::new(),
+            FakeNetManager::new(),
+            FakeMountManager::new(),
+            pool,
+            dir.to_path_buf(),
+            Box::new(acme),
+            Box::new(dns),
+            Box::new(crate::nginx::FakeNginxController::new()),
+            crate::ServiceVipSlot::new(),
+        )
+        .unwrap()
+    }
+
+    fn certs_dir_for(reconciler: &Reconciler<FakeJailRuntime, FakeZfsManager, FakeNetManager, FakeMountManager>) -> PathBuf {
+        record::jail_rootfs_path(&reconciler.pool, "ingress").join("usr/local/etc/nginx/certs")
+    }
+
+    #[test]
+    fn reconcile_certs_issues_a_certificate_for_a_new_ingress_with_no_expiry_yet() {
+        let dir = test_state_dir("reconcile_certs_issues_a_certificate_for_a_new_ingress");
+        let mut reconciler = test_reconciler_with_acme(&dir, keel_ingress::FakeAcmeClient::new(), keel_ingress::FakeDnsProvider::new());
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+
+        reconciler.reconcile_certs(1_800_000_000);
+
+        assert!(reconciler.get_ingress("blog").unwrap().cert_expires_at_unix.is_some());
+        let certs_dir = certs_dir_for(&reconciler);
+        assert!(fs::read_to_string(certs_dir.join("example.com.crt")).unwrap().contains("example.com"));
+        assert!(fs::read_to_string(certs_dir.join("example.com.key")).unwrap().contains("PRIVATE KEY"));
+    }
+
+    #[test]
+    fn reconcile_certs_does_not_reissue_a_certificate_with_more_than_30_days_left() {
+        let dir = test_state_dir("reconcile_certs_does_not_reissue_a_fresh_certificate");
+        let mut reconciler = test_reconciler_with_acme(&dir, keel_ingress::FakeAcmeClient::new(), keel_ingress::FakeDnsProvider::new());
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        let now = 1_800_000_000;
+        reconciler.reconcile_certs(now);
+        let first_expiry = reconciler.get_ingress("blog").unwrap().cert_expires_at_unix;
+
+        // Only 60 seconds later, well inside the 30-day threshold: the
+        // expiry must be untouched by this second pass.
+        reconciler.reconcile_certs(now + 60);
+        assert_eq!(reconciler.get_ingress("blog").unwrap().cert_expires_at_unix, first_expiry);
+    }
+
+    #[test]
+    fn reconcile_certs_reissues_when_the_cert_file_is_missing_even_with_a_fresh_expiry_timestamp() {
+        // Reproduces a real bug found during Milestone 21 VM verification:
+        // the ingress jail's rootfs was recreated (destroyed and
+        // reprovisioned) after a cert had already been issued into it, and
+        // `cert_expires_at_unix` (persisted separately from the jail's own
+        // filesystem) still claimed the cert was valid and unexpired, so
+        // `reconcile_certs` never re-issued a replacement even though the
+        // actual `.crt`/`.key` files were gone from the new rootfs.
+        let dir = test_state_dir("reconcile_certs_reissues_when_the_cert_file_is_missing");
+        let mut reconciler = test_reconciler_with_acme(&dir, keel_ingress::FakeAcmeClient::new(), keel_ingress::FakeDnsProvider::new());
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        let now = 1_800_000_000;
+        reconciler.reconcile_certs(now);
+        assert!(reconciler.get_ingress("blog").unwrap().cert_expires_at_unix.is_some());
+
+        // Simulate the jail's rootfs being lost/recreated: delete the cert
+        // files on disk without touching the persisted `cert_expires_at_unix`.
+        let certs_dir = certs_dir_for(&reconciler);
+        fs::remove_file(certs_dir.join("example.com.crt")).unwrap();
+        fs::remove_file(certs_dir.join("example.com.key")).unwrap();
+
+        // Only 60 seconds later, well inside the 30-day threshold - but the
+        // missing cert file must still force reissuance.
+        reconciler.reconcile_certs(now + 60);
+        assert!(fs::read_to_string(certs_dir.join("example.com.crt")).unwrap().contains("example.com"), "cert file should have been reissued");
+    }
+
+    #[test]
+    fn reconcile_certs_reissues_within_30_days_of_expiry() {
+        let dir = test_state_dir("reconcile_certs_reissues_within_30_days_of_expiry");
+        let mut reconciler = test_reconciler_with_acme(&dir, keel_ingress::FakeAcmeClient::new(), keel_ingress::FakeDnsProvider::new());
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        let now = 1_800_000_000;
+        reconciler.reconcile_certs(now);
+        let first_expiry = reconciler.get_ingress("blog").unwrap().cert_expires_at_unix.unwrap();
+
+        // Jump to 29 days before that expiry -- inside the 30-day threshold.
+        let near_expiry = first_expiry - 29 * 24 * 60 * 60;
+        reconciler.reconcile_certs(near_expiry);
+        let second_expiry = reconciler.get_ingress("blog").unwrap().cert_expires_at_unix.unwrap();
+        assert!(second_expiry > first_expiry, "renewal should push the expiry further into the future");
+    }
+
+    /// `FakeAcmeClient` has a single global `fail` flag, which would fail
+    /// identically for every Ingress sharing this one `Reconciler`'s `acme`
+    /// field. To prove that one Ingress's failing certificate issuance does
+    /// not block another's within the same `reconcile_certs` pass, this
+    /// double instead fails only for one specific domain.
+    struct FlakyAcmeClient {
+        fail_for_domain: String,
+    }
+
+    impl keel_ingress::AcmeClient for FlakyAcmeClient {
+        fn request_certificate(
+            &self,
+            domain: &str,
+            _contact_email: &str,
+            _dns: &dyn keel_ingress::DnsProvider,
+        ) -> Result<keel_ingress::Cert, keel_ingress::AcmeError> {
+            if domain == self.fail_for_domain {
+                return Err(keel_ingress::AcmeError::Request(format!("simulated ACME failure for '{domain}'")));
+            }
+            Ok(keel_ingress::Cert {
+                cert_pem: format!("-----BEGIN CERTIFICATE-----\nFAKE CERT FOR {domain}\n-----END CERTIFICATE-----\n"),
+                key_pem: "-----BEGIN PRIVATE KEY-----\nFAKE KEY\n-----END PRIVATE KEY-----\n".to_string(),
+            })
+        }
+    }
+
+    fn test_reconciler_with_acme_and_nginx(
+        dir: &std::path::Path,
+        acme: keel_ingress::FakeAcmeClient,
+        dns: keel_ingress::FakeDnsProvider,
+    ) -> (Reconciler<FakeJailRuntime, FakeZfsManager, FakeNetManager, FakeMountManager>, std::sync::Arc<crate::nginx::FakeNginxController>) {
+        let mut reconciler = test_reconciler_with_acme(dir, acme, dns);
+        let nginx = std::sync::Arc::new(crate::nginx::FakeNginxController::new());
+        reconciler.nginx = Box::new(std::sync::Arc::clone(&nginx));
+        reconciler.service_vips = crate::ServiceVipSlot::new();
+        (reconciler, nginx)
+    }
+
+    #[test]
+    fn reconcile_ingress_config_writes_and_reloads_nginx_once_a_backend_vip_is_known() {
+        let dir = test_state_dir("reconcile_ingress_config_writes_and_reloads_nginx_once_a_backend_vip_is_known");
+        let (mut reconciler, nginx) = test_reconciler_with_acme_and_nginx(&dir, keel_ingress::FakeAcmeClient::new(), keel_ingress::FakeDnsProvider::new());
+        reconciler.service_vips.set_all(&[keel_controlplane::wire::ServiceProxyEntry {
+            name: "hugo-site".to_string(),
+            vip: "10.0.0.9".to_string(),
+            port: 8080,
+            replicas: vec![],
+        }]);
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        reconciler.reconcile_ingress_config();
+        let config = nginx.last_written_config("keel-ingress").unwrap();
+        assert!(config.contains("server_name example.com;"));
+        assert!(config.contains("proxy_pass http://10.0.0.9:8080;"));
+        assert_eq!(nginx.reload_count("keel-ingress"), 1);
+    }
+
+    #[test]
+    fn reconcile_ingress_config_skips_a_backend_whose_vip_is_not_yet_known() {
+        let dir = test_state_dir("reconcile_ingress_config_skips_a_backend_whose_vip_is_not_yet_known");
+        let (mut reconciler, nginx) = test_reconciler_with_acme_and_nginx(&dir, keel_ingress::FakeAcmeClient::new(), keel_ingress::FakeDnsProvider::new());
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        reconciler.reconcile_ingress_config();
+        let config = nginx.last_written_config("keel-ingress").unwrap();
+        assert!(!config.contains("example.com"));
+    }
+
+    #[test]
+    fn reconcile_ingress_config_does_not_reload_when_validation_fails() {
+        let dir = test_state_dir("reconcile_ingress_config_does_not_reload_when_validation_fails");
+        let (mut reconciler, nginx) = test_reconciler_with_acme_and_nginx(&dir, keel_ingress::FakeAcmeClient::new(), keel_ingress::FakeDnsProvider::new());
+        reconciler.service_vips.set_all(&[keel_controlplane::wire::ServiceProxyEntry {
+            name: "hugo-site".to_string(),
+            vip: "10.0.0.9".to_string(),
+            port: 8080,
+            replicas: vec![],
+        }]);
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        nginx.set_fail_test(true);
+        reconciler.reconcile_ingress_config();
+        assert_eq!(nginx.reload_count("keel-ingress"), 0);
+    }
+
+    #[test]
+    fn reconcile_certs_backs_off_on_failure_without_blocking_other_ingresses() {
+        let dir = test_state_dir("reconcile_certs_backs_off_on_failure_without_blocking_others");
+        let pool = dir.strip_prefix("/").unwrap_or(&dir).to_string_lossy().into_owned();
+        let acme = FlakyAcmeClient { fail_for_domain: "broken.example.com".to_string() };
+        let mut reconciler = Reconciler::new(
+            FakeJailRuntime::new(),
+            FakeZfsManager::new(),
+            FakeNetManager::new(),
+            FakeMountManager::new(),
+            pool,
+            dir,
+            Box::new(acme),
+            Box::new(keel_ingress::FakeDnsProvider::new()),
+            Box::new(crate::nginx::FakeNginxController::new()),
+            crate::ServiceVipSlot::new(),
+        )
+        .unwrap();
+        reconciler.apply_ingress(sample_ingress_spec("broken", "broken.example.com")).unwrap();
+        reconciler.apply_ingress(sample_ingress_spec("healthy", "healthy.example.com")).unwrap();
+
+        reconciler.reconcile_certs(1_800_000_000);
+
+        assert_eq!(reconciler.get_ingress("broken").unwrap().cert_expires_at_unix, None);
+        assert!(
+            reconciler.get_ingress("healthy").unwrap().cert_expires_at_unix.is_some(),
+            "one Ingress's failing ACME client must not block certificate issuance for another Ingress"
+        );
     }
 }

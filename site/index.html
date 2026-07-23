@@ -22,7 +22,13 @@
           <a href="docs/api.html">HTTP API Reference</a>
         </div>
       </div>
-      <a href="quickstart.html">Quickstart</a>
+      <div class="nav-dropdown">
+        <a href="quickstart.html">Quickstart</a>
+        <div class="nav-dropdown-menu">
+          <a href="quickstart.html">Static Website</a>
+          <a href="https-quickstart.html">Automatic HTTPS</a>
+        </div>
+      </div>
       <a href="journey.html">Journey</a>
       <a class="nav-github" href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub &#8599;</a>
     </nav>
@@ -45,13 +51,14 @@
   <section class="status">
     <div class="container">
       <div class="status-banner">
-        <strong>Sub-projects 1-6</strong> are complete: single-node jail reconciliation,
+        <strong>Sub-projects 1-7</strong> are complete: single-node jail reconciliation,
         the multi-node control plane, resource-aware scheduling, mutual-TLS
         hardening with certificate revocation/rotation, cross-node overlay
-        networking, and service discovery with a per-node virtual-IP proxy
-        for load balancing across a service's replicas. <strong>Sub-project 7</strong>
-        (persistent storage) has its first milestone done: a jail can declare
-        named ZFS-backed volumes that survive its own deletion.
+        networking, service discovery with a per-node virtual-IP proxy
+        for load balancing across a service's replicas, and persistent
+        storage: a jail can declare named ZFS-backed volumes that survive
+        its own deletion, and a <code>kind: Service</code> can declare them
+        too, with each stateful replica pinned to its own node for life.
         <a href="journey.html">See the full journey &rarr;</a>
       </div>
     </div>

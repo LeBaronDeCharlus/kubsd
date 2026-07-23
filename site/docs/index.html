@@ -22,7 +22,13 @@
           <a href="api.html">HTTP API Reference</a>
         </div>
       </div>
-      <a href="../quickstart.html">Quickstart</a>
+      <div class="nav-dropdown">
+        <a href="../quickstart.html">Quickstart</a>
+        <div class="nav-dropdown-menu">
+          <a href="../quickstart.html">Static Website</a>
+          <a href="../https-quickstart.html">Automatic HTTPS</a>
+        </div>
+      </div>
       <a href="../journey.html">Journey</a>
       <a class="nav-github" href="https://github.com/lebarondecharlus/keel" target="_blank" rel="noopener">GitHub &#8599;</a>
     </nav>
@@ -32,7 +38,7 @@
   <section class="page-header">
     <div class="container">
       <h1>Documentation</h1>
-      <p class="lead">Reference material for the JailSpec YAML format, the keelctl CLI, and the keel-agentd / keel-controlplane HTTP APIs, plus an overview of how the crates fit together.</p>
+      <p class="lead">Reference material for the JailSpec/ServiceSpec/IngressSpec YAML formats, the keelctl CLI, and the keel-agentd / keel-controlplane HTTP APIs, plus an overview of how the crates fit together.</p>
     </div>
   </section>
 
@@ -54,6 +60,10 @@
         <a class="link-card" href="api.html">
           <h3>HTTP API reference</h3>
           <p>keel-agentd's Unix-socket API and keel-controlplane's TCP API: routes, request/response bodies, and error cases.</p>
+        </a>
+        <a class="link-card" href="../https-quickstart.html">
+          <h3>Automatic HTTPS quickstart</h3>
+          <p>A full worked example: a real domain, a real DNS-01 challenge against OVH, and a real Let's Encrypt certificate that issues and renews itself in front of a running Service.</p>
         </a>
       </div>
     </div>

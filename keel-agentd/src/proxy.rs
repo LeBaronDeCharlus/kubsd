@@ -169,12 +169,16 @@ mod tests {
             FakeMountManager::new(),
             "zroot".to_string(),
             std::env::temp_dir().join(format!("keel-agentd-proxy-test-{name}")),
+            Box::new(keel_ingress::FakeAcmeClient::new()),
+            Box::new(keel_ingress::FakeDnsProvider::new()),
+            Box::new(crate::nginx::FakeNginxController::new()),
+            crate::ServiceVipSlot::new(),
         )
         .unwrap()
     }
 
     fn spawn_test_worker(name: &str) -> mpsc::Sender<worker::Command> {
-        worker::spawn(test_reconciler(name)).1
+        worker::spawn(test_reconciler(name), FakeZfsManager::new(), "zroot".to_string()).1
     }
 
     // Binds a plain TCP listener standing in for a replica, echoing

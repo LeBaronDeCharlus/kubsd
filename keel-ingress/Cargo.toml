@@ -1,0 +1,13 @@
+[package]
+name = "keel-ingress"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = "1"
+ureq = { version = "3", features = ["rustls"] }
+sha1 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "time"] }
+instant-acme = { version = "0.8", features = ["rcgen"] }

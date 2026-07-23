@@ -16,3 +16,4 @@ keel-jail = { path = "../keel-jail" }
 keel-zfs = { path = "../keel-zfs" }
 keel-net = { path = "../keel-net" }
 keel-controlplane = { path = "../keel-controlplane" }
+keel-ingress = { path = "../keel-ingress" }

@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 pub struct NodeRegistration {
     pub id: String,
     pub addr: String,
+    #[serde(default)]
+    pub replicate_addr: Option<String>,
     pub capacity_cpu: f64,
     pub capacity_memory: u64,
 }
@@ -83,12 +85,20 @@ mod tests {
         let registration = NodeRegistration {
             id: "node-1".to_string(),
             addr: "192.168.64.4".to_string(),
+            replicate_addr: Some("192.168.64.4:7622".to_string()),
             capacity_cpu: 4.0,
             capacity_memory: 8 * 1024 * 1024 * 1024,
         };
         let yaml = serde_yaml::to_string(&registration).unwrap();
         let parsed: NodeRegistration = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed, registration);
+    }
+
+    #[test]
+    fn node_registration_without_a_replicate_addr_field_defaults_to_none() {
+        let parsed: NodeRegistration =
+            serde_yaml::from_str("id: node-1\naddr: 192.168.64.4\ncapacity_cpu: 4\ncapacity_memory: 8589934592\n").unwrap();
+        assert_eq!(parsed.replicate_addr, None);
     }
 
     #[test]

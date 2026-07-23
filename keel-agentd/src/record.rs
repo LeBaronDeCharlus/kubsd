@@ -12,6 +12,11 @@ pub fn jail_name(spec_name: &str) -> String {
     format!("keel-{spec_name}")
 }
 
+/// The singleton `keel-ingress` jail's internal bridge address. Shared with
+/// Task 14's `pf` rule so both read this one constant instead of repeating
+/// the literal in two files.
+pub const INGRESS_JAIL_BRIDGE_ADDR: &str = "10.0.0.2";
+
 pub fn base_dataset_path(pool: &str, image: &str) -> String {
     format!("{pool}/keel/{image}")
 }
@@ -57,6 +62,7 @@ mod tests {
                 resources: ResourcesSpec { cpu: "2".to_string(), memory: "512M".to_string() },
                 restart_policy: RestartPolicy::Always,
                 volumes: vec![],
+                replicate_to: None,
             },
         }
     }

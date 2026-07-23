@@ -46,6 +46,41 @@ pub fn validate_transition(old: &crate::types::JailSpec, new: &crate::types::Jai
     Ok(())
 }
 
+pub fn validate_host(host: &str) -> Result<(), SpecError> {
+    let labels: Vec<&str> = host.split('.').collect();
+    let valid = labels.len() >= 2
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && label.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+                && label.chars().last().is_some_and(|c| c.is_ascii_alphanumeric())
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(SpecError::InvalidHost(host.to_string()))
+    }
+}
+
+pub fn validate_email(email: &str) -> Result<(), SpecError> {
+    let valid = match email.split_once('@') {
+        Some((local, domain)) => {
+            !local.is_empty()
+                && !domain.is_empty()
+                && !local.contains(char::is_whitespace)
+                && !domain.contains(char::is_whitespace)
+                && domain.contains('.')
+        }
+        None => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(SpecError::InvalidEmail(email.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +176,7 @@ mod tests {
                 resources: ResourcesSpec { cpu: "2".to_string(), memory: "512M".to_string() },
                 restart_policy: RestartPolicy::Always,
                 volumes: vec![],
+                replicate_to: None,
             },
         }
     }
@@ -190,5 +226,32 @@ mod tests {
         old.spec.volumes = vec![volume("web-data", "/data", "1G")];
         let new = old.clone();
         assert!(validate_transition(&old, &new).is_ok());
+    }
+
+    #[test]
+    fn accepts_well_formed_hosts() {
+        assert!(validate_host("example.com").is_ok());
+        assert!(validate_host("blog.example.com").is_ok());
+    }
+
+    #[test]
+    fn rejects_malformed_hosts() {
+        assert!(validate_host("localhost").is_err()); // no dot
+        assert!(validate_host("not a host!").is_err());
+        assert!(validate_host(".example.com").is_err()); // empty label
+        assert!(validate_host("-example.com").is_err()); // leading hyphen label
+    }
+
+    #[test]
+    fn accepts_well_formed_emails() {
+        assert!(validate_email("admin@example.com").is_ok());
+    }
+
+    #[test]
+    fn rejects_malformed_emails() {
+        assert!(validate_email("not-an-email").is_err());
+        assert!(validate_email("admin@").is_err());
+        assert!(validate_email("@example.com").is_err());
+        assert!(validate_email("admin@no-dot").is_err());
     }
 }

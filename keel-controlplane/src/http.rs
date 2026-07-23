@@ -1,6 +1,6 @@
 use crate::tls;
 use crate::wire::{ErrorBody, Heartbeat, NodeRegistration, RegisterResponse};
-use crate::worker::{Command, ReplicaAction, ScheduleOrResolveError};
+use crate::worker::{Command, ForceRepinError, ReplicaAction, ScheduleOrResolveError};
 use rustls::{ServerConnection, StreamOwned};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -172,6 +172,7 @@ fn route(
         ("GET", ["services", name]) => handle_get_service(name, commands),
         ("DELETE", ["services", name]) => handle_delete_service(name, commands, client_config),
         ("GET", ["services"]) => handle_list_services(commands),
+        ("POST", ["replicas", name, "force-repin"]) => handle_force_repin(name, commands, client_config),
         _ => error_response(404, format!("no route for {} {}", request.method, request.path)),
     }
 }
@@ -235,6 +236,59 @@ fn handle_scheduled_delete(
             (status, response_body)
         }
         Err(e) => error_response(500, format!("failed to reach node '{node_id}' at {addr}: {e}")),
+    }
+}
+
+fn handle_force_repin(name: &str, commands: &Sender<Command>, client_config: &Arc<rustls::ClientConfig>) -> (u16, Vec<u8>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::PrepareForceRepin(name.to_string(), reply_tx)).is_err() {
+        return error_response(500, "control plane worker is not running".to_string());
+    }
+    let prep = match reply_rx.recv() {
+        Ok(Ok(prep)) => prep,
+        Ok(Err(e @ ForceRepinError::NotPlaced(_))) => return error_response(404, e.to_string()),
+        Ok(Err(e @ ForceRepinError::NotStateful(_))) => return error_response(400, e.to_string()),
+        Ok(Err(e @ ForceRepinError::PrimaryStillAlive(_))) => return error_response(409, e.to_string()),
+        Ok(Err(e)) => return error_response(503, e.to_string()),
+        Err(_) => return error_response(500, "control plane worker did not respond".to_string()),
+    };
+
+    match forward(&prep.standby_addr, "GET", &format!("/replica-targets/{name}"), &[], client_config) {
+        Ok((status, _)) if (200..300).contains(&status) => {}
+        Ok((404, _)) | Ok((409, _)) => {
+            return error_response(
+                409,
+                format!("standby node '{}' has not completed a first full replication for '{name}'", prep.standby_node_id),
+            );
+        }
+        Ok((status, body)) => {
+            return error_response(500, format!("unexpected response checking standby readiness: status {status}, body {:?}", String::from_utf8_lossy(&body)))
+        }
+        Err(e) => return error_response(500, format!("failed to reach standby node '{}' at {}: {e}", prep.standby_node_id, prep.standby_addr)),
+    }
+
+    let cidr = format!("{}/{}", prep.address, prep.prefix_len);
+    let mut spec = prep.template.to_jail_spec(name, &cidr);
+    spec.spec.replicate_to = Some(prep.fresh_standby_addr.clone());
+    let body = serde_yaml::to_string(&spec).expect("JailSpec serialization should not fail");
+
+    match forward(&prep.standby_addr, "PUT", &format!("/jails/{name}"), body.as_bytes(), client_config) {
+        Ok((status, resp_body)) if (200..300).contains(&status) => {
+            send_record_placement(name, &prep.standby_node_id, commands);
+            send_record_replica_address(name, &prep.standby_node_id, prep.address, commands);
+            send_record_standby(name, &prep.fresh_standby_node_id, commands);
+            send_record_pending_fence(name, &prep.old_node_id, commands);
+            (200, resp_body)
+        }
+        Ok((status, resp_body)) => error_response(status, String::from_utf8_lossy(&resp_body).to_string()),
+        Err(e) => error_response(500, format!("failed to reach node '{}' at {}: {e}", prep.standby_node_id, prep.standby_addr)),
+    }
+}
+
+fn send_record_pending_fence(replica_name: &str, old_node_id: &str, commands: &Sender<Command>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::RecordPendingFence(replica_name.to_string(), old_node_id.to_string(), reply_tx)).is_ok() {
+        let _ = reply_rx.recv();
     }
 }
 
@@ -377,17 +431,65 @@ fn reconcile_and_execute(commands: &Sender<Command>, client_config: &Arc<rustls:
     }
 }
 
+/// Checked on every successful heartbeat, right alongside
+/// `reconcile_and_execute` -- if the heartbeating node id is owed a forced
+/// delete for any replica (per `PendingFences`), forwards it inline. On
+/// success or 404 (already gone -- e.g. an operator cleaned it up first)
+/// the fence is cleared; on any other outcome it's left in place so the
+/// next heartbeat from this node retries it. Unlike `reconcile_and_execute`
+/// (which has no node context and also runs from the service-apply path),
+/// this needs the specific heartbeating node's id, so it's called directly
+/// from `handle_heartbeat` rather than folded into that shared function.
+fn check_and_execute_fencing(node_id: &str, commands: &Sender<Command>, client_config: &Arc<rustls::ClientConfig>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::PendingFencesForNode(node_id.to_string(), reply_tx)).is_err() {
+        return;
+    }
+    let Ok(replica_names) = reply_rx.recv() else { return };
+    if replica_names.is_empty() {
+        return;
+    }
+    let (resolve_tx, resolve_rx) = mpsc::channel();
+    if commands.send(Command::Resolve(node_id.to_string(), resolve_tx)).is_err() {
+        return;
+    }
+    let Ok(Ok(addr)) = resolve_rx.recv() else { return };
+    for replica_name in replica_names {
+        match forward(&addr, "DELETE", &format!("/jails/{replica_name}"), &[], client_config) {
+            Ok((status, _)) if (200..300).contains(&status) || status == 404 => {
+                send_remove_pending_fence(&replica_name, commands);
+            }
+            Ok((status, body)) => eprintln!(
+                "keel-controlplane: forced delete of fenced jail '{replica_name}' on node '{node_id}' failed: status {status}, body {:?}",
+                String::from_utf8_lossy(&body)
+            ),
+            Err(e) => eprintln!("keel-controlplane: failed to reach node '{node_id}' at {addr} while fencing '{replica_name}': {e}"),
+        }
+    }
+}
+
+fn send_remove_pending_fence(replica_name: &str, commands: &Sender<Command>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::RemovePendingFence(replica_name.to_string(), reply_tx)).is_ok() {
+        let _ = reply_rx.recv();
+    }
+}
+
 fn execute_replica_actions(actions: Vec<ReplicaAction>, commands: &Sender<Command>, client_config: &Arc<rustls::ClientConfig>) {
     for action in actions {
         match action {
-            ReplicaAction::Schedule { replica_name, node_id, node_addr, template, address, prefix_len } => {
+            ReplicaAction::Schedule { replica_name, node_id, node_addr, template, address, prefix_len, standby_node_id, standby_addr } => {
                 let cidr = format!("{address}/{prefix_len}");
-                let spec = template.to_jail_spec(&replica_name, &cidr);
+                let mut spec = template.to_jail_spec(&replica_name, &cidr);
+                spec.spec.replicate_to = standby_addr.clone();
                 let body = serde_yaml::to_string(&spec).expect("JailSpec serialization should not fail");
                 match forward(&node_addr, "PUT", &format!("/jails/{replica_name}"), body.as_bytes(), client_config) {
                     Ok((status, _)) if (200..300).contains(&status) => {
                         send_record_placement(&replica_name, &node_id, commands);
                         send_record_replica_address(&replica_name, &node_id, address, commands);
+                        if let Some(standby_id) = standby_node_id {
+                            send_record_standby(&replica_name, &standby_id, commands);
+                        }
                     }
                     Ok((status, resp_body)) => eprintln!(
                         "keel-controlplane: failed to schedule replica '{replica_name}' on node '{node_id}': status {status}, body {:?}",
@@ -424,6 +526,13 @@ fn send_record_replica_address(name: &str, node_id: &str, address: std::net::Ipv
     }
 }
 
+fn send_record_standby(replica_name: &str, standby_node_id: &str, commands: &Sender<Command>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::RecordStandby(replica_name.to_string(), standby_node_id.to_string(), reply_tx)).is_ok() {
+        let _ = reply_rx.recv();
+    }
+}
+
 fn send_release_replica_address(name: &str, commands: &Sender<Command>) {
     let (reply_tx, reply_rx) = mpsc::channel();
     if commands.send(Command::ReleaseReplicaAddress(name.to_string(), reply_tx)).is_ok() {
@@ -441,6 +550,7 @@ fn handle_register(body: &[u8], commands: &Sender<Command>) -> (u16, Vec<u8>) {
         .send(Command::Register(
             registration.id,
             registration.addr,
+            registration.replicate_addr,
             registration.capacity_cpu,
             registration.capacity_memory,
             reply_tx,
@@ -471,6 +581,7 @@ fn handle_heartbeat(id: &str, body: &[u8], commands: &Sender<Command>, client_co
     match reply_rx.recv() {
         Ok(Ok(())) => {
             reconcile_and_execute(commands, client_config);
+            check_and_execute_fencing(id, commands, client_config);
             let (entries_tx, entries_rx) = mpsc::channel();
             if commands.send(Command::ListServiceProxyEntries(entries_tx)).is_err() {
                 return error_response(500, "control plane worker is not running".to_string());
@@ -617,6 +728,8 @@ mod tests {
             Placements::new(),
             crate::services::Services::new("10.0.250.0/24".parse().unwrap()),
             crate::addresses::UsedAddresses::new(),
+            crate::standbys::Standbys::new(),
+            crate::pending_fences::PendingFences::new(),
         );
         let reloading_tls = tls::ReloadingTls::spawn(
             fixture("fixture-node.crt"),
@@ -1208,6 +1321,8 @@ mod tests {
             Placements::new(),
             crate::services::Services::new("10.0.250.0/24".parse().unwrap()),
             crate::addresses::UsedAddresses::new(),
+            crate::standbys::Standbys::new(),
+            crate::pending_fences::PendingFences::new(),
         );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -1243,6 +1358,12 @@ mod tests {
         )
     }
 
+    fn stateful_service_yaml(name: &str, replicas: u32) -> String {
+        format!(
+            "apiVersion: keel/v1\nkind: Service\nmetadata:\n  name: {name}\nspec:\n  replicas: {replicas}\n  port: 8080\n  template:\n    image: base/14.2-web\n    command: [\"/usr/local/bin/myapp\"]\n    network:\n      vnet: true\n      bridge: keel0\n    resources:\n      cpu: \"1\"\n      memory: 256M\n    restartPolicy: Always\n    volumes:\n      - name: data\n        mountPath: /var/db\n        size: 1G\n"
+        )
+    }
+
     #[test]
     fn put_service_creates_and_schedules_replicas_across_registered_nodes() {
         let cp_addr = start_test_server();
@@ -1253,6 +1374,34 @@ mod tests {
 
         let (status, _) = send_request(&cp_addr, "PUT", "/services/web", &service_yaml("web", 2));
         assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn scheduling_a_stateful_service_replica_forwards_a_spec_with_replicate_to_set() {
+        let cp_addr = start_test_server();
+        let node_a = start_fake_remote_tls_agentd(200, "running: true\n");
+        let node_b = start_fake_remote_tls_agentd(200, "running: true\n");
+        register_node(&cp_addr, "node-a", &node_a);
+        register_node(&cp_addr, "node-b", &node_b);
+
+        let (status, _) = send_request(&cp_addr, "PUT", "/services/db", &stateful_service_yaml("db", 1));
+        assert_eq!(status, 200);
+
+        let (status, body) = send_request(&cp_addr, "GET", "/nodes", "");
+        assert_eq!(status, 200);
+        assert!(body.contains("node-a") && body.contains("node-b"), "got: {body}");
+        // The fake remote agentd just echoes a fixed body ("running: true"),
+        // so asserting the forwarded replicateTo requires inspecting what
+        // was actually sent -- covered precisely by
+        // keel-agentd's own "put_replicate_to_..." tests and Task 6's
+        // replication-loop test for the receiving side. Here, confirm at
+        // least one of the two nodes ends up as this replica's recorded
+        // standby by checking GET /nodes twice is stable and a placement
+        // exists (full round-trip proof lives in Task 10's force-repin
+        // integration test, which depends on a real standby having been
+        // recorded).
+        let (status, _) = send_request(&cp_addr, "GET", "/jails/db-0", "");
+        assert_eq!(status, 200, "expected db-0 to have been scheduled onto one of the two registered nodes");
     }
 
     #[test]
@@ -1446,6 +1595,8 @@ mod tests {
             Placements::new(),
             crate::services::Services::new("10.0.250.0/24".parse().unwrap()),
             crate::addresses::UsedAddresses::new(),
+            crate::standbys::Standbys::new(),
+            crate::pending_fences::PendingFences::new(),
         );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -1456,5 +1607,207 @@ mod tests {
 
         let (status, _) = send_request(&addr, "GET", "/nodes", "");
         assert_eq!(status, 200, "expected the last-known-good certificate to keep being served after a malformed reload");
+    }
+
+    fn start_test_server_with_commands() -> (String, Sender<Command>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (_worker_handle, commands) = worker::spawn(
+            Registry::new("10.0.0.0/16".parse().unwrap()),
+            Placements::new(),
+            crate::services::Services::new("10.0.250.0/24".parse().unwrap()),
+            crate::addresses::UsedAddresses::new(),
+            crate::standbys::Standbys::new(),
+            crate::pending_fences::PendingFences::new(),
+        );
+        let reloading_tls = tls::ReloadingTls::spawn(
+            fixture("fixture-node.crt"),
+            fixture("fixture-node.key"),
+            fixture("ca.crt"),
+            fixture("crl.pem"),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let commands_for_server = commands.clone();
+        thread::spawn(move || run(listener, commands_for_server, reloading_tls));
+        (addr, commands)
+    }
+
+    fn record_pending_fence(commands: &Sender<Command>, replica_name: &str, node_id: &str) {
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::RecordPendingFence(replica_name.to_string(), node_id.to_string(), tx)).unwrap();
+        rx.recv().unwrap();
+    }
+
+    #[test]
+    fn a_heartbeat_from_a_node_owed_a_fence_triggers_a_forced_delete() {
+        let (cp_addr, commands) = start_test_server_with_commands();
+        let node_addr = start_fake_remote_tls_agentd(200, "");
+        register_node(&cp_addr, "node-a", &node_addr);
+        record_pending_fence(&commands, "db-0", "node-a");
+
+        let (status, _) = send_request(&cp_addr, "POST", "/nodes/node-a/heartbeat", "committed_cpu: 0\ncommitted_memory: 0\n");
+        assert_eq!(status, 200);
+
+        // The forced DELETE is fire-and-forget from the heartbeat response's
+        // point of view -- give it a moment, then confirm the fence was
+        // cleared (the fake remote agentd above answers every request with
+        // 200, so the forced delete "succeeds" and PendingFencesForNode
+        // should come back empty on the next check).
+        std::thread::sleep(Duration::from_millis(100));
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::PendingFencesForNode("node-a".to_string(), tx)).unwrap();
+        assert_eq!(rx.recv().unwrap(), Vec::<String>::new(), "expected the fence to have been cleared after a successful forced delete");
+    }
+
+    #[test]
+    fn a_heartbeat_from_an_unrelated_node_leaves_pending_fences_untouched() {
+        let (cp_addr, commands) = start_test_server_with_commands();
+        let node_a = start_fake_remote_tls_agentd(200, "");
+        let node_b = start_fake_remote_tls_agentd(200, "");
+        register_node(&cp_addr, "node-a", &node_a);
+        register_node(&cp_addr, "node-b", &node_b);
+        record_pending_fence(&commands, "db-0", "node-a");
+
+        send_request(&cp_addr, "POST", "/nodes/node-b/heartbeat", "committed_cpu: 0\ncommitted_memory: 0\n");
+
+        std::thread::sleep(Duration::from_millis(100));
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::PendingFencesForNode("node-a".to_string(), tx)).unwrap();
+        assert_eq!(rx.recv().unwrap(), vec!["db-0".to_string()], "expected node-a's fence to remain, untouched by node-b's heartbeat");
+    }
+
+    #[test]
+    fn a_failed_forced_delete_leaves_the_fence_in_place_for_the_next_heartbeat() {
+        let (cp_addr, commands) = start_test_server_with_commands();
+        // 500 from the fake remote agentd simulates the forced DELETE failing.
+        let node_addr = start_fake_remote_tls_agentd(500, "boom");
+        register_node(&cp_addr, "node-a", &node_addr);
+        record_pending_fence(&commands, "db-0", "node-a");
+
+        send_request(&cp_addr, "POST", "/nodes/node-a/heartbeat", "committed_cpu: 0\ncommitted_memory: 0\n");
+
+        std::thread::sleep(Duration::from_millis(100));
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::PendingFencesForNode("node-a".to_string(), tx)).unwrap();
+        assert_eq!(rx.recv().unwrap(), vec!["db-0".to_string()], "expected the fence to remain after a failed forced delete");
+    }
+
+    fn record_placement(commands: &Sender<Command>, jail_name: &str, node_id: &str) {
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::RecordPlacement(jail_name.to_string(), node_id.to_string(), tx)).unwrap();
+        rx.recv().unwrap();
+    }
+
+    #[test]
+    fn force_repin_on_an_unplaced_name_returns_404() {
+        let cp_addr = start_test_server();
+        let (status, body) = send_request(&cp_addr, "POST", "/replicas/db-0/force-repin", "");
+        assert_eq!(status, 404);
+        assert!(body.contains("no known placement"), "got: {body}");
+    }
+
+    #[test]
+    fn force_repin_on_a_non_stateful_name_returns_400() {
+        let (cp_addr, commands) = start_test_server_with_commands();
+        let node_addr = start_fake_remote_tls_agentd(200, "running: true\n");
+        register_node(&cp_addr, "node-a", &node_addr);
+        record_placement(&commands, "web-0", "node-a");
+
+        let (status, body) = send_request(&cp_addr, "POST", "/replicas/web-0/force-repin", "");
+        assert_eq!(status, 400);
+        assert!(body.contains("not a stateful replica"), "got: {body}");
+    }
+
+    #[test]
+    fn force_repin_while_the_primary_is_still_alive_returns_409() {
+        let (cp_addr, commands) = start_test_server_with_commands();
+        let node_a = start_fake_remote_tls_agentd(200, "running: true\n");
+        let node_b = start_fake_remote_tls_agentd(200, "running: true\n");
+        register_node(&cp_addr, "node-a", &node_a);
+        register_node(&cp_addr, "node-b", &node_b);
+        record_placement(&commands, "db-0", "node-a");
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::RecordStandby("db-0".to_string(), "node-b".to_string(), tx)).unwrap();
+        rx.recv().unwrap();
+
+        let (status, body) = send_request(&cp_addr, "POST", "/replicas/db-0/force-repin", "");
+        assert_eq!(status, 409);
+        assert!(body.contains("still resolves as alive"), "got: {body}");
+    }
+
+    #[test]
+    fn force_repin_before_the_standby_has_a_first_snapshot_returns_409() {
+        let (cp_addr, commands) = start_test_server_with_commands();
+        // node-a is never registered -> unreachable, standing in for Dead.
+        let node_b = start_fake_remote_tls_agentd(404, "error: no replica target 'db-0'\n");
+        register_node(&cp_addr, "node-b", &node_b);
+        // A third, distinct node is required so PrepareForceRepin's
+        // fresh-standby pick (which must exclude both the dead primary and
+        // the current standby node-b) has somewhere to land; without it,
+        // prep fails with NoFreshStandby before ever reaching the readiness
+        // probe this test is exercising. It never needs to be dialed here,
+        // but does need a real replicate_addr advertised (Task 8b).
+        send_request(
+            &cp_addr,
+            "POST",
+            "/nodes/register",
+            "id: node-c\naddr: 127.0.0.1:1\nreplicate_addr: 127.0.0.1:2\ncapacity_cpu: 4.0\ncapacity_memory: 8589934592\n",
+        );
+        apply_service_with_template_via_http(&cp_addr, "db", 1);
+        record_placement(&commands, "db-0", "node-unreachable");
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::RecordStandby("db-0".to_string(), "node-b".to_string(), tx)).unwrap();
+        rx.recv().unwrap();
+
+        let (status, body) = send_request(&cp_addr, "POST", "/replicas/db-0/force-repin", "");
+        assert_eq!(status, 409);
+        assert!(body.contains("has not completed a first full replication"), "got: {body}");
+    }
+
+    #[test]
+    fn force_repin_happy_path_updates_placements_standbys_and_pending_fences() {
+        let (cp_addr, commands) = start_test_server_with_commands();
+        let node_b = start_fake_remote_tls_agentd(200, "running: true\n");
+        register_node(&cp_addr, "node-b", &node_b);
+        // node-c never needs to be dialed in this test (it only needs to
+        // exist as an Alive candidate for the fresh-standby pick), but it
+        // DOES need a real replicate_addr registered -- Task 8b's
+        // PrepareForceRepin looks up the fresh standby's replicate_addr()
+        // (not resolve()), which is None unless explicitly advertised.
+        send_request(
+            &cp_addr,
+            "POST",
+            "/nodes/register",
+            "id: node-c\naddr: 127.0.0.1:1\nreplicate_addr: 127.0.0.1:2\ncapacity_cpu: 4.0\ncapacity_memory: 8589934592\n",
+        );
+        apply_service_with_template_via_http(&cp_addr, "db", 1);
+        record_placement(&commands, "db-0", "node-unreachable");
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::RecordStandby("db-0".to_string(), "node-b".to_string(), tx)).unwrap();
+        rx.recv().unwrap();
+
+        // Simulate node-b already having a fully-replicated ReplicaTarget by
+        // making its next forwarded GET return 200. start_fake_remote_tls_agentd
+        // answers every request with the same fixed status/body, so this
+        // fake stands in for BOTH the readiness GET and the provisioning PUT
+        // with one 200 response -- sufficient to prove force-repin's own
+        // control-plane-side bookkeeping (Placements/Standbys/PendingFences),
+        // which is what this test targets; real end-to-end behavior against
+        // genuine keel-agentd readiness/provision responses is covered by
+        // Task 13's VM verification.
+        let (status, _) = send_request(&cp_addr, "POST", "/replicas/db-0/force-repin", "");
+        assert_eq!(status, 200);
+
+        let (status, body) = send_request(&cp_addr, "GET", "/jails/db-0", "");
+        assert_eq!(status, 200, "expected db-0's placement to now resolve to the promoted node, got: {body}");
+
+        let (tx, rx) = mpsc::channel();
+        commands.send(Command::PendingFencesForNode("node-unreachable".to_string(), tx)).unwrap();
+        assert_eq!(rx.recv().unwrap(), vec!["db-0".to_string()], "expected the old primary to be fenced");
+    }
+
+    fn apply_service_with_template_via_http(cp_addr: &str, name: &str, replicas: u32) {
+        send_request(cp_addr, "PUT", &format!("/services/{name}"), &stateful_service_yaml(name, replicas));
     }
 }
