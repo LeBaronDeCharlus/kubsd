@@ -1,10 +1,12 @@
 use crate::backoff::BackoffState;
+use crate::ingress_record::IngressRecord;
+use crate::ingress_store;
 use crate::record::{self, JailRecord};
 use crate::store::{self, StoreError};
 use crate::wire::JailStatus;
 use keel_jail::{JailRuntime, MountManager};
 use keel_net::NetManager;
-use keel_spec::JailSpec;
+use keel_spec::{IngressSpec, JailSpec};
 use keel_zfs::ZfsManager;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -41,6 +43,8 @@ pub struct Reconciler<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountMana
     records: HashMap<String, JailRecord>,
     backoff: HashMap<String, BackoffState>,
     next_epair_ordinal: u32,
+    ingress_records: HashMap<String, IngressRecord>,
+    ingress_backoff: HashMap<String, BackoffState>,
 }
 
 impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J, Z, N, M> {
@@ -48,6 +52,8 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J
         let loaded = store::load_all(&state_dir)?;
         let next_epair_ordinal = loaded.iter().map(|r| r.epair_ordinal).max().map(|m| m + 1).unwrap_or(1);
         let records = loaded.into_iter().map(|r| (r.spec.metadata.name.clone(), r)).collect();
+        let ingress_loaded = ingress_store::load_all(&state_dir)?;
+        let ingress_records = ingress_loaded.into_iter().map(|r| (r.spec.metadata.name.clone(), r)).collect();
         Ok(Self {
             jails,
             zfs,
@@ -58,6 +64,8 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J
             records,
             backoff: HashMap::new(),
             next_epair_ordinal,
+            ingress_records,
+            ingress_backoff: HashMap::new(),
         })
     }
 
@@ -172,6 +180,38 @@ impl<J: JailRuntime, Z: ZfsManager, N: NetManager, M: MountManager> Reconciler<J
         record.spec.spec.replicate_to = replicate_to;
         store::save(&self.state_dir, &record)?;
         self.records.insert(name.to_string(), record);
+        Ok(())
+    }
+
+    pub fn apply_ingress(&mut self, spec: IngressSpec) -> Result<(), ReconcileError> {
+        keel_spec::validate_name(&spec.metadata.name)?;
+        keel_spec::validate_host(&spec.spec.host)?;
+        keel_spec::validate_email(&spec.spec.tls.email)?;
+        if spec.spec.backend.port == 0 {
+            return Err(keel_spec::SpecError::InvalidPort(0).into());
+        }
+        let cert_expires_at_unix = self.ingress_records.get(&spec.metadata.name).and_then(|r| r.cert_expires_at_unix);
+        let record = IngressRecord { spec: spec.clone(), cert_expires_at_unix };
+        ingress_store::save(&self.state_dir, &record)?;
+        self.ingress_records.insert(spec.metadata.name.clone(), record);
+        Ok(())
+    }
+
+    pub fn get_ingress(&self, name: &str) -> Option<IngressRecord> {
+        self.ingress_records.get(name).cloned()
+    }
+
+    pub fn list_ingress(&self) -> Vec<IngressRecord> {
+        self.ingress_records.values().cloned().collect()
+    }
+
+    pub fn delete_ingress(&mut self, name: &str) -> Result<(), ReconcileError> {
+        if !self.ingress_records.contains_key(name) {
+            return Err(ReconcileError::NotFound(name.to_string()));
+        }
+        ingress_store::remove(&self.state_dir, name)?;
+        self.ingress_records.remove(name);
+        self.ingress_backoff.remove(name);
         Ok(())
     }
 
@@ -924,5 +964,71 @@ mod tests {
         let dir = test_state_dir("set_replicate_to_on_an_unknown_name_returns_not_found");
         let mut reconciler = new_reconciler(dir);
         assert!(matches!(reconciler.set_replicate_to("missing", Some("10.0.0.9:7622".to_string())), Err(ReconcileError::NotFound(_))));
+    }
+
+    fn sample_ingress_spec(name: &str, host: &str) -> keel_spec::IngressSpec {
+        keel_spec::IngressSpec {
+            api_version: "keel/v1".to_string(),
+            kind: "Ingress".to_string(),
+            metadata: keel_spec::Metadata { name: name.to_string() },
+            spec: keel_spec::IngressSpecBody {
+                host: host.to_string(),
+                backend: keel_spec::IngressBackend { service: "hugo-site".to_string(), port: 8080 },
+                tls: keel_spec::IngressTls { email: "admin@example.com".to_string() },
+            },
+        }
+    }
+
+    #[test]
+    fn apply_ingress_persists_and_tracks_the_record() {
+        let dir = test_state_dir("apply_ingress_persists_and_tracks_the_record");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        assert_eq!(reconciler.list_ingress().len(), 1);
+        assert_eq!(reconciler.get_ingress("blog").unwrap().spec.spec.host, "example.com");
+    }
+
+    #[test]
+    fn apply_ingress_survives_a_simulated_restart() {
+        let dir = test_state_dir("apply_ingress_survives_a_simulated_restart");
+        {
+            let mut reconciler = new_reconciler(dir.clone());
+            reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        }
+        let reloaded = new_reconciler(dir);
+        assert_eq!(reloaded.list_ingress().len(), 1);
+    }
+
+    #[test]
+    fn get_ingress_on_an_unknown_name_returns_none() {
+        let dir = test_state_dir("get_ingress_on_an_unknown_name_returns_none");
+        let reconciler = new_reconciler(dir);
+        assert_eq!(reconciler.get_ingress("missing"), None);
+    }
+
+    #[test]
+    fn delete_ingress_removes_the_record() {
+        let dir = test_state_dir("delete_ingress_removes_the_record");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        reconciler.delete_ingress("blog").unwrap();
+        assert_eq!(reconciler.list_ingress().len(), 0);
+    }
+
+    #[test]
+    fn delete_ingress_on_an_unknown_name_is_not_found() {
+        let dir = test_state_dir("delete_ingress_on_an_unknown_name_is_not_found");
+        let mut reconciler = new_reconciler(dir);
+        assert!(matches!(reconciler.delete_ingress("missing"), Err(ReconcileError::NotFound(_))));
+    }
+
+    #[test]
+    fn re_applying_an_existing_ingress_updates_its_host_and_keeps_the_same_name() {
+        let dir = test_state_dir("re_applying_an_existing_ingress_updates_its_host");
+        let mut reconciler = new_reconciler(dir);
+        reconciler.apply_ingress(sample_ingress_spec("blog", "example.com")).unwrap();
+        reconciler.apply_ingress(sample_ingress_spec("blog", "blog.example.com")).unwrap();
+        assert_eq!(reconciler.list_ingress().len(), 1);
+        assert_eq!(reconciler.get_ingress("blog").unwrap().spec.spec.host, "blog.example.com");
     }
 }
