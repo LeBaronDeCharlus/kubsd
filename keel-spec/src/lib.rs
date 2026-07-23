@@ -6,10 +6,11 @@ pub mod validate;
 pub use error::SpecError;
 pub use resources::{cores_to_pcpu_percent, parse_cpu_cores, parse_memory_bytes};
 pub use types::{
-    JailSpec, JailTemplate, Metadata, NetworkSpec, RestartPolicy, ResourcesSpec, ServiceSpec,
-    ServiceSpecBody, Spec, TemplateNetworkSpec, VolumeMount,
+    IngressBackend, IngressSpec, IngressSpecBody, IngressTls, JailSpec, JailTemplate, Metadata,
+    NetworkSpec, RestartPolicy, ResourcesSpec, ServiceSpec, ServiceSpecBody, Spec,
+    TemplateNetworkSpec, VolumeMount,
 };
-pub use validate::{validate_address, validate_name, validate_transition, validate_volumes};
+pub use validate::{validate_address, validate_email, validate_host, validate_name, validate_transition, validate_volumes};
 
 pub fn parse_and_validate(yaml: &str) -> Result<JailSpec, SpecError> {
     let spec: JailSpec = serde_yaml::from_str(yaml).map_err(|e| SpecError::Yaml(e.to_string()))?;
@@ -28,6 +29,17 @@ pub fn parse_and_validate_service(yaml: &str) -> Result<ServiceSpec, SpecError> 
     resources::parse_memory_bytes(&spec.spec.template.resources.memory)?;
     validate::validate_volumes(&spec.spec.template.volumes)?;
     if spec.spec.port == 0 {
+        return Err(SpecError::InvalidPort(0));
+    }
+    Ok(spec)
+}
+
+pub fn parse_and_validate_ingress(yaml: &str) -> Result<types::IngressSpec, SpecError> {
+    let spec: types::IngressSpec = serde_yaml::from_str(yaml).map_err(|e| SpecError::Yaml(e.to_string()))?;
+    validate::validate_name(&spec.metadata.name)?;
+    validate::validate_host(&spec.spec.host)?;
+    validate::validate_email(&spec.spec.tls.email)?;
+    if spec.spec.backend.port == 0 {
         return Err(SpecError::InvalidPort(0));
     }
     Ok(spec)
@@ -123,5 +135,64 @@ spec:
             "    restartPolicy: Always\n    volumes:\n      - name: Invalid_Name\n        mountPath: /data\n        size: 1G\n",
         );
         assert!(matches!(parse_and_validate_service(&yaml), Err(SpecError::InvalidName(_))));
+    }
+
+    const VALID_INGRESS_YAML: &str = r#"
+apiVersion: keel/v1
+kind: Ingress
+metadata:
+  name: blog
+spec:
+  host: example.com
+  backend:
+    service: hugo-site
+    port: 8080
+  tls:
+    email: admin@example.com
+"#;
+
+    #[test]
+    fn parse_and_validate_ingress_accepts_a_well_formed_ingress() {
+        let spec = parse_and_validate_ingress(VALID_INGRESS_YAML).unwrap();
+        assert_eq!(spec.metadata.name, "blog");
+        assert_eq!(spec.spec.host, "example.com");
+        assert_eq!(spec.spec.backend.service, "hugo-site");
+        assert_eq!(spec.spec.backend.port, 8080);
+        assert_eq!(spec.spec.tls.email, "admin@example.com");
+    }
+
+    #[test]
+    fn parse_and_validate_ingress_rejects_an_invalid_name() {
+        let yaml = VALID_INGRESS_YAML.replace("name: blog", "name: Invalid_Name");
+        assert!(matches!(parse_and_validate_ingress(&yaml), Err(SpecError::InvalidName(_))));
+    }
+
+    #[test]
+    fn parse_and_validate_ingress_rejects_a_malformed_host() {
+        let yaml = VALID_INGRESS_YAML.replace("host: example.com", "host: not a host!");
+        assert!(matches!(parse_and_validate_ingress(&yaml), Err(SpecError::InvalidHost(_))));
+    }
+
+    #[test]
+    fn parse_and_validate_ingress_rejects_a_host_with_no_dot() {
+        let yaml = VALID_INGRESS_YAML.replace("host: example.com", "host: localhost");
+        assert!(matches!(parse_and_validate_ingress(&yaml), Err(SpecError::InvalidHost(_))));
+    }
+
+    #[test]
+    fn parse_and_validate_ingress_rejects_port_zero() {
+        let yaml = VALID_INGRESS_YAML.replace("port: 8080", "port: 0");
+        assert!(matches!(parse_and_validate_ingress(&yaml), Err(SpecError::InvalidPort(0))));
+    }
+
+    #[test]
+    fn parse_and_validate_ingress_rejects_a_malformed_email() {
+        let yaml = VALID_INGRESS_YAML.replace("email: admin@example.com", "email: not-an-email");
+        assert!(matches!(parse_and_validate_ingress(&yaml), Err(SpecError::InvalidEmail(_))));
+    }
+
+    #[test]
+    fn sniff_kind_reads_ingress() {
+        assert_eq!(sniff_kind(VALID_INGRESS_YAML).unwrap(), "Ingress");
     }
 }

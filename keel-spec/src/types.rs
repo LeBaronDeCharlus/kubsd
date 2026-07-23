@@ -368,3 +368,30 @@ spec:
         assert_eq!(jail.spec.replicate_to, None);
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IngressSpec {
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    pub kind: String,
+    pub metadata: Metadata,
+    pub spec: IngressSpecBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IngressSpecBody {
+    pub host: String,
+    pub backend: IngressBackend,
+    pub tls: IngressTls,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IngressBackend {
+    pub service: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IngressTls {
+    pub email: String,
+}
