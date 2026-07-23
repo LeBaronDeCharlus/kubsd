@@ -169,6 +169,8 @@ mod tests {
             FakeMountManager::new(),
             "zroot".to_string(),
             std::env::temp_dir().join(format!("keel-agentd-proxy-test-{name}")),
+            Box::new(keel_ingress::FakeAcmeClient::new()),
+            Box::new(keel_ingress::FakeDnsProvider::new()),
         )
         .unwrap()
     }

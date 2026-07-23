@@ -93,6 +93,10 @@ fn main() {
         keel_jail::CliMountManager::new(),
         config.pool.clone(),
         config.state_dir.clone(),
+        // Temporary placeholders: the real ACME/DNS implementations don't
+        // exist until Tasks 15/16 -- Task 17 replaces these.
+        Box::new(keel_ingress::FakeAcmeClient::new()),
+        Box::new(keel_ingress::FakeDnsProvider::new()),
     )
     .expect("failed to initialize reconciler from on-disk state");
 

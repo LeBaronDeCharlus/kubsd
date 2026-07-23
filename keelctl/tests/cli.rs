@@ -25,6 +25,8 @@ fn start_test_server(name: &str) -> PathBuf {
         FakeMountManager::new(),
         "zroot".to_string(),
         state_dir,
+        Box::new(keel_ingress::FakeAcmeClient::new()),
+        Box::new(keel_ingress::FakeDnsProvider::new()),
     )
     .unwrap();
     let (_worker_handle, commands) = worker::spawn(reconciler, zfs, "zroot".to_string());
@@ -82,6 +84,8 @@ fn start_test_agentd_tcp(name: &str) -> String {
         FakeMountManager::new(),
         "zroot".to_string(),
         state_dir,
+        Box::new(keel_ingress::FakeAcmeClient::new()),
+        Box::new(keel_ingress::FakeDnsProvider::new()),
     )
     .unwrap();
     let (_worker_handle, commands) = worker::spawn(reconciler, zfs, "zroot".to_string());
