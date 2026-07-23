@@ -73,6 +73,52 @@ impl NginxController for std::sync::Arc<FakeNginxController> {
     }
 }
 
+pub struct JexecNginxController {
+    pool: String,
+}
+
+impl JexecNginxController {
+    pub fn new(pool: String) -> Self {
+        Self { pool }
+    }
+
+    fn run_jexec(&self, jail_name: &str, args: &[&str]) -> Result<std::process::Output, std::io::Error> {
+        std::process::Command::new("jexec").arg(jail_name).args(args).output()
+    }
+}
+
+impl NginxController for JexecNginxController {
+    fn write_config(&self, jail_name: &str, config: &str) -> Result<(), NginxError> {
+        let spec_name = jail_name.strip_prefix("keel-").unwrap_or(jail_name);
+        let rootfs = crate::record::jail_rootfs_path(&self.pool, spec_name);
+        let config_dir = rootfs.join("usr/local/etc/nginx");
+        std::fs::create_dir_all(&config_dir).map_err(|e| NginxError::Write(e.to_string()))?;
+        let final_path = config_dir.join("nginx.conf");
+        let tmp_path = config_dir.join("nginx.conf.tmp");
+        std::fs::write(&tmp_path, config).map_err(|e| NginxError::Write(e.to_string()))?;
+        std::fs::rename(&tmp_path, &final_path).map_err(|e| NginxError::Write(e.to_string()))?;
+        Ok(())
+    }
+
+    fn test_config(&self, jail_name: &str) -> Result<(), NginxError> {
+        let output = self.run_jexec(jail_name, &["/usr/local/sbin/nginx", "-t"]).map_err(|e| NginxError::ValidationFailed(e.to_string()))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(NginxError::ValidationFailed(String::from_utf8_lossy(&output.stderr).to_string()))
+        }
+    }
+
+    fn reload(&self, jail_name: &str) -> Result<(), NginxError> {
+        let output = self.run_jexec(jail_name, &["/usr/local/sbin/nginx", "-s", "reload"]).map_err(|e| NginxError::ReloadFailed(e.to_string()))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(NginxError::ReloadFailed(String::from_utf8_lossy(&output.stderr).to_string()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
