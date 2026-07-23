@@ -2,7 +2,7 @@ use crate::reconciler::{ReconcileError, Reconciler};
 use crate::wire::JailStatus;
 use keel_jail::{JailRuntime, MountManager};
 use keel_net::NetManager;
-use keel_spec::JailSpec;
+use keel_spec::{IngressSpec, JailSpec};
 use keel_zfs::ZfsManager;
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
@@ -26,6 +26,9 @@ pub enum Command {
     /// `Command::Apply` in this process (i.e. right after a restart). Sent
     /// once at startup by `main.rs`, right after `worker::spawn` returns.
     ResumeReplicationLoops(Sender<()>),
+    ApplyIngress(IngressSpec, Sender<Result<(), ReconcileError>>),
+    GetIngress(Option<String>, Sender<Vec<crate::wire::IngressStatus>>),
+    DeleteIngress(String, Sender<Result<(), ReconcileError>>),
 }
 
 pub fn spawn<J, Z, N, M>(mut reconciler: Reconciler<J, Z, N, M>, zfs: Z, pool: String) -> (JoinHandle<()>, Sender<Command>)
@@ -125,6 +128,27 @@ fn handle_command<J: JailRuntime, Z: ZfsManager + Clone + Send + 'static, N: Net
                 }
             }
             let _ = reply.send(());
+        }
+        Command::ApplyIngress(spec, reply) => {
+            let result = reconciler.apply_ingress(spec);
+            let _ = reconciler.reconcile(Instant::now());
+            let _ = reply.send(result);
+        }
+        Command::GetIngress(name, reply) => {
+            let statuses = match name {
+                Some(n) => reconciler
+                    .get_ingress(&n)
+                    .map(|record| crate::wire::IngressStatus { record })
+                    .into_iter()
+                    .collect(),
+                None => reconciler.list_ingress().into_iter().map(|record| crate::wire::IngressStatus { record }).collect(),
+            };
+            let _ = reply.send(statuses);
+        }
+        Command::DeleteIngress(name, reply) => {
+            let result = reconciler.delete_ingress(&name);
+            let _ = reconciler.reconcile(Instant::now());
+            let _ = reply.send(result);
         }
     }
 }
@@ -322,6 +346,78 @@ mod tests {
         let (del_tx, del_rx) = mpsc::channel();
         commands.send(Command::DeleteVolume("web-data".to_string(), del_tx)).unwrap();
         assert!(matches!(del_rx.recv().unwrap(), Err(ReconcileError::Zfs(keel_zfs::ZfsError::NotFound(_)))));
+    }
+
+    fn sample_ingress_spec(name: &str) -> IngressSpec {
+        IngressSpec {
+            api_version: "keel/v1".to_string(),
+            kind: "Ingress".to_string(),
+            metadata: Metadata { name: name.to_string() },
+            spec: keel_spec::IngressSpecBody {
+                host: "example.com".to_string(),
+                backend: keel_spec::IngressBackend { service: "hugo-site".to_string(), port: 8080 },
+                tls: keel_spec::IngressTls { email: "admin@example.com".to_string() },
+            },
+        }
+    }
+
+    #[test]
+    fn apply_ingress_command_persists_and_lists_it() {
+        let commands = spawn_test_worker("apply_ingress_command_persists_and_lists_it");
+
+        let (reply_tx, reply_rx) = mpsc::channel();
+        commands.send(Command::ApplyIngress(sample_ingress_spec("blog"), reply_tx)).unwrap();
+        assert!(reply_rx.recv().unwrap().is_ok());
+
+        let (get_tx, get_rx) = mpsc::channel();
+        commands.send(Command::GetIngress(Some("blog".to_string()), get_tx)).unwrap();
+        let statuses = get_rx.recv().unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].record.spec.spec.host, "example.com");
+    }
+
+    #[test]
+    fn get_ingress_command_with_no_name_lists_everything() {
+        let commands = spawn_test_worker("get_ingress_command_with_no_name_lists_everything");
+        let (apply_tx, apply_rx) = mpsc::channel();
+        commands.send(Command::ApplyIngress(sample_ingress_spec("blog"), apply_tx)).unwrap();
+        apply_rx.recv().unwrap().unwrap();
+
+        let (get_tx, get_rx) = mpsc::channel();
+        commands.send(Command::GetIngress(None, get_tx)).unwrap();
+        assert_eq!(get_rx.recv().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn get_ingress_command_on_unknown_name_returns_empty() {
+        let commands = spawn_test_worker("get_ingress_command_on_unknown_name_returns_empty");
+        let (get_tx, get_rx) = mpsc::channel();
+        commands.send(Command::GetIngress(Some("missing".to_string()), get_tx)).unwrap();
+        assert!(get_rx.recv().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_ingress_command_removes_the_record() {
+        let commands = spawn_test_worker("delete_ingress_command_removes_the_record");
+        let (apply_tx, apply_rx) = mpsc::channel();
+        commands.send(Command::ApplyIngress(sample_ingress_spec("blog"), apply_tx)).unwrap();
+        apply_rx.recv().unwrap().unwrap();
+
+        let (delete_tx, delete_rx) = mpsc::channel();
+        commands.send(Command::DeleteIngress("blog".to_string(), delete_tx)).unwrap();
+        assert!(delete_rx.recv().unwrap().is_ok());
+
+        let (get_tx, get_rx) = mpsc::channel();
+        commands.send(Command::GetIngress(None, get_tx)).unwrap();
+        assert!(get_rx.recv().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_ingress_command_on_unknown_name_returns_not_found() {
+        let commands = spawn_test_worker("delete_ingress_command_on_unknown_name_returns_not_found");
+        let (delete_tx, delete_rx) = mpsc::channel();
+        commands.send(Command::DeleteIngress("missing".to_string(), delete_tx)).unwrap();
+        assert!(matches!(delete_rx.recv().unwrap(), Err(ReconcileError::NotFound(_))));
     }
 
     fn stateful_replicated_spec(name: &str, replicate_to: &str) -> JailSpec {

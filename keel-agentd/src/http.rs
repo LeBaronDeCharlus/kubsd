@@ -1,7 +1,7 @@
 use crate::reconciler::ReconcileError;
 use crate::wire::ErrorBody;
 use crate::worker::Command;
-use crate::PodCidrSlot;
+use crate::{PodCidrSlot, ServiceVipSlot};
 use ipnet::IpNet;
 use keel_spec::JailSpec;
 use rustls::{ServerConnection, StreamOwned};
@@ -16,14 +16,21 @@ const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
 type TlsStream = StreamOwned<ServerConnection, TcpStream>;
 
-pub fn run(listener: UnixListener, commands: Sender<Command>, pod_cidr_slot: PodCidrSlot, replica_targets: crate::ReplicaTargetRegistry) {
+pub fn run(
+    listener: UnixListener,
+    commands: Sender<Command>,
+    pod_cidr_slot: PodCidrSlot,
+    service_vips: ServiceVipSlot,
+    replica_targets: crate::ReplicaTargetRegistry,
+) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let commands = commands.clone();
         let pod_cidr_slot = pod_cidr_slot.clone();
+        let service_vips = service_vips.clone();
         let replica_targets = replica_targets.clone();
         thread::spawn(move || {
-            let _ = handle_connection(stream, &commands, &pod_cidr_slot, &replica_targets);
+            let _ = handle_connection(stream, &commands, &pod_cidr_slot, &service_vips, &replica_targets);
         });
     }
 }
@@ -33,6 +40,7 @@ pub fn run_tls(
     commands: Sender<Command>,
     reloading_tls: Arc<crate::tls::ReloadingTls>,
     pod_cidr_slot: PodCidrSlot,
+    service_vips: ServiceVipSlot,
     replica_targets: crate::ReplicaTargetRegistry,
 ) {
     for stream in listener.incoming() {
@@ -40,11 +48,12 @@ pub fn run_tls(
         let commands = commands.clone();
         let tls_config = reloading_tls.server_config();
         let pod_cidr_slot = pod_cidr_slot.clone();
+        let service_vips = service_vips.clone();
         let replica_targets = replica_targets.clone();
         thread::spawn(move || {
             let Ok(conn) = ServerConnection::new(tls_config) else { return };
             let mut tls_stream = TlsStream::new(conn, stream);
-            if handle_connection_tls(&mut tls_stream, &commands, &pod_cidr_slot, &replica_targets).is_err() {
+            if handle_connection_tls(&mut tls_stream, &commands, &pod_cidr_slot, &service_vips, &replica_targets).is_err() {
                 eprintln!("keel-agentd: TLS handshake or request handling failed for a connection");
             }
         });
@@ -61,13 +70,14 @@ fn handle_connection(
     mut stream: UnixStream,
     commands: &Sender<Command>,
     pod_cidr_slot: &PodCidrSlot,
+    service_vips: &ServiceVipSlot,
     replica_targets: &crate::ReplicaTargetRegistry,
 ) -> io::Result<()> {
     let request = match read_request(&mut stream)? {
         Some(r) => r,
         None => return Ok(()),
     };
-    let (status, body) = route(&request, commands, pod_cidr_slot, replica_targets);
+    let (status, body) = route(&request, commands, pod_cidr_slot, service_vips, replica_targets);
     write_response(&mut stream, status, &body)
 }
 
@@ -75,13 +85,14 @@ fn handle_connection_tls(
     stream: &mut TlsStream,
     commands: &Sender<Command>,
     pod_cidr_slot: &PodCidrSlot,
+    service_vips: &ServiceVipSlot,
     replica_targets: &crate::ReplicaTargetRegistry,
 ) -> io::Result<()> {
     let request = match read_request_tls(stream)? {
         Some(r) => r,
         None => return Ok(()),
     };
-    let (status, body) = route(&request, commands, pod_cidr_slot, replica_targets);
+    let (status, body) = route(&request, commands, pod_cidr_slot, service_vips, replica_targets);
     write_response_tls(stream, status, &body)
 }
 
@@ -221,6 +232,7 @@ fn route(
     request: &ParsedRequest,
     commands: &Sender<Command>,
     pod_cidr_slot: &PodCidrSlot,
+    service_vips: &ServiceVipSlot,
     replica_targets: &crate::ReplicaTargetRegistry,
 ) -> (u16, Vec<u8>) {
     let segments: Vec<&str> =
@@ -234,6 +246,10 @@ fn route(
         ("GET", ["volumes", name]) => handle_get_volume(name, commands),
         ("DELETE", ["volumes", name]) => handle_delete_volume(name, commands),
         ("GET", ["replica-targets", name]) => handle_get_replica_target(name, replica_targets),
+        ("PUT", ["ingress", name]) => handle_apply_ingress(name, &request.body, commands, service_vips),
+        ("GET", ["ingress"]) => handle_get_ingress(None, commands),
+        ("GET", ["ingress", name]) => handle_get_ingress(Some(name.to_string()), commands),
+        ("DELETE", ["ingress", name]) => handle_delete_ingress(name, commands),
         _ => error_response(404, format!("no route for {} {}", request.method, request.path)),
     }
 }
@@ -282,6 +298,70 @@ fn handle_apply(
 
     let (reply_tx, reply_rx) = mpsc::channel();
     if commands.send(Command::Apply(spec, reply_tx)).is_err() {
+        return error_response(500, "reconciler worker is not running".to_string());
+    }
+    match reply_rx.recv() {
+        Ok(Ok(())) => (200, Vec::new()),
+        Ok(Err(e)) => error_response(status_for_error(&e), e.to_string()),
+        Err(_) => error_response(500, "reconciler worker did not respond".to_string()),
+    }
+}
+
+fn handle_apply_ingress(
+    path_name: &str,
+    body: &[u8],
+    commands: &Sender<Command>,
+    service_vips: &ServiceVipSlot,
+) -> (u16, Vec<u8>) {
+    let spec: keel_spec::IngressSpec = match serde_yaml::from_slice(body) {
+        Ok(s) => s,
+        Err(e) => return error_response(400, format!("invalid YAML: {e}")),
+    };
+    if spec.metadata.name != path_name {
+        return error_response(
+            400,
+            format!("path name '{path_name}' does not match spec.metadata.name '{}'", spec.metadata.name),
+        );
+    }
+    if !service_vips.names().contains(&spec.spec.backend.service) {
+        return error_response(
+            400,
+            format!("backend.service '{}' does not name a currently-known Service", spec.spec.backend.service),
+        );
+    }
+
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::ApplyIngress(spec, reply_tx)).is_err() {
+        return error_response(500, "reconciler worker is not running".to_string());
+    }
+    match reply_rx.recv() {
+        Ok(Ok(())) => (200, Vec::new()),
+        Ok(Err(e)) => error_response(status_for_error(&e), e.to_string()),
+        Err(_) => error_response(500, "reconciler worker did not respond".to_string()),
+    }
+}
+
+fn handle_get_ingress(name: Option<String>, commands: &Sender<Command>) -> (u16, Vec<u8>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::GetIngress(name.clone(), reply_tx)).is_err() {
+        return error_response(500, "reconciler worker is not running".to_string());
+    }
+    let statuses = match reply_rx.recv() {
+        Ok(s) => s,
+        Err(_) => return error_response(500, "reconciler worker did not respond".to_string()),
+    };
+    match name {
+        Some(n) => match statuses.into_iter().next() {
+            Some(status) => yaml_response(200, &status),
+            None => error_response(404, format!("ingress '{n}' not found")),
+        },
+        None => yaml_response(200, &statuses),
+    }
+}
+
+fn handle_delete_ingress(name: &str, commands: &Sender<Command>) -> (u16, Vec<u8>) {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    if commands.send(Command::DeleteIngress(name.to_string(), reply_tx)).is_err() {
         return error_response(500, "reconciler worker is not running".to_string());
     }
     match reply_rx.recv() {
@@ -431,7 +511,7 @@ mod tests {
         let socket_path = short_unique_socket_path();
         let _ = std::fs::remove_file(&socket_path);
         let listener = UnixListener::bind(&socket_path).unwrap();
-        thread::spawn(move || run(listener, commands, PodCidrSlot::new(), replica_targets));
+        thread::spawn(move || run(listener, commands, PodCidrSlot::new(), crate::ServiceVipSlot::new(), replica_targets));
         socket_path
     }
 
@@ -453,7 +533,7 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
         let listener = UnixListener::bind(&socket_path).unwrap();
         let slot_clone = pod_cidr_slot.clone();
-        thread::spawn(move || run(listener, commands, slot_clone, replica_targets));
+        thread::spawn(move || run(listener, commands, slot_clone, crate::ServiceVipSlot::new(), replica_targets));
         (socket_path, pod_cidr_slot)
     }
 
@@ -468,8 +548,45 @@ mod tests {
         let socket_path = short_unique_socket_path();
         let _ = std::fs::remove_file(&socket_path);
         let listener = UnixListener::bind(&socket_path).unwrap();
-        thread::spawn(move || run(listener, commands, PodCidrSlot::new(), targets));
+        thread::spawn(move || run(listener, commands, PodCidrSlot::new(), crate::ServiceVipSlot::new(), targets));
         socket_path
+    }
+
+    fn start_test_server_with_service_vips(name: &str, entries: &[(&str, &str, u16)]) -> (PathBuf, crate::ServiceVipSlot) {
+        let state_dir = std::env::temp_dir().join(format!("keel-agentd-http-test-state-{name}"));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        let zfs = FakeZfsManager::new();
+        zfs.seed_dataset("zroot/keel/base/14.2-web");
+        let replica_targets = crate::ReplicaTargetRegistry::load(state_dir.clone()).unwrap();
+        let reconciler = Reconciler::new(
+            FakeJailRuntime::new(),
+            zfs.clone(),
+            FakeNetManager::new(),
+            FakeMountManager::new(),
+            "zroot".to_string(),
+            state_dir,
+        )
+        .unwrap();
+        let (_worker_handle, commands) = worker::spawn(reconciler, zfs, "zroot".to_string());
+
+        let service_vips = crate::ServiceVipSlot::new();
+        let proxy_entries: Vec<_> = entries
+            .iter()
+            .map(|(n, vip, port)| keel_controlplane::wire::ServiceProxyEntry {
+                name: n.to_string(),
+                vip: vip.to_string(),
+                port: *port,
+                replicas: vec![],
+            })
+            .collect();
+        service_vips.set_all(&proxy_entries);
+
+        let socket_path = short_unique_socket_path();
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let thread_service_vips = service_vips.clone();
+        thread::spawn(move || run(listener, commands, PodCidrSlot::new(), thread_service_vips, replica_targets));
+        (socket_path, service_vips)
     }
 
     fn send_request(socket_path: &PathBuf, method: &str, path: &str, body: &str) -> (u16, String) {
@@ -682,6 +799,58 @@ mod tests {
     }
 
     #[test]
+    fn put_ingress_then_get_it_back() {
+        let (socket, service_vips) =
+            start_test_server_with_service_vips("put_ingress_then_get_it_back", &[("hugo-site", "10.0.0.9", 8080)]);
+        let body = "apiVersion: keel/v1\nkind: Ingress\nmetadata:\n  name: blog\nspec:\n  host: example.com\n  backend:\n    service: hugo-site\n    port: 8080\n  tls:\n    email: admin@example.com\n";
+        let (status, _) = send_request(&socket, "PUT", "/ingress/blog", body);
+        assert_eq!(status, 200);
+        let (status, response_body) = send_request(&socket, "GET", "/ingress/blog", "");
+        assert_eq!(status, 200);
+        assert!(response_body.contains("host: example.com"), "got: {response_body}");
+        let _ = service_vips;
+    }
+
+    #[test]
+    fn put_ingress_rejects_an_unknown_backend_service() {
+        let (socket, _service_vips) =
+            start_test_server_with_service_vips("put_ingress_rejects_an_unknown_backend_service", &[]);
+        let body = "apiVersion: keel/v1\nkind: Ingress\nmetadata:\n  name: blog\nspec:\n  host: example.com\n  backend:\n    service: does-not-exist\n    port: 8080\n  tls:\n    email: admin@example.com\n";
+        let (status, response_body) = send_request(&socket, "PUT", "/ingress/blog", body);
+        assert_eq!(status, 400);
+        assert!(response_body.contains("does-not-exist"), "got: {response_body}");
+    }
+
+    #[test]
+    fn delete_ingress_then_get_is_404() {
+        let (socket, _service_vips) =
+            start_test_server_with_service_vips("delete_ingress_then_get_is_404", &[("hugo-site", "10.0.0.9", 8080)]);
+        let body = "apiVersion: keel/v1\nkind: Ingress\nmetadata:\n  name: blog\nspec:\n  host: example.com\n  backend:\n    service: hugo-site\n    port: 8080\n  tls:\n    email: admin@example.com\n";
+        let _ = send_request(&socket, "PUT", "/ingress/blog", body);
+        let (status, _) = send_request(&socket, "DELETE", "/ingress/blog", "");
+        assert_eq!(status, 200);
+        let (status, _) = send_request(&socket, "GET", "/ingress/blog", "");
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn get_ingress_lists_all_applied_ingresses() {
+        let (socket, _service_vips) = start_test_server_with_service_vips(
+            "get_ingress_lists_all_applied_ingresses",
+            &[("hugo-site", "10.0.0.9", 8080), ("umami", "10.0.0.10", 3000)],
+        );
+        let blog_body = "apiVersion: keel/v1\nkind: Ingress\nmetadata:\n  name: blog\nspec:\n  host: example.com\n  backend:\n    service: hugo-site\n    port: 8080\n  tls:\n    email: admin@example.com\n";
+        let stats_body = "apiVersion: keel/v1\nkind: Ingress\nmetadata:\n  name: stats\nspec:\n  host: stats.example.com\n  backend:\n    service: umami\n    port: 3000\n  tls:\n    email: admin@example.com\n";
+        send_request(&socket, "PUT", "/ingress/blog", blog_body);
+        send_request(&socket, "PUT", "/ingress/stats", stats_body);
+
+        let (status, body) = send_request(&socket, "GET", "/ingress", "");
+        assert_eq!(status, 200);
+        assert!(body.contains("example.com"), "got: {body}");
+        assert!(body.contains("stats.example.com"), "got: {body}");
+    }
+
+    #[test]
     fn get_replica_target_on_an_unknown_name_returns_404() {
         let dir = std::env::temp_dir().join("keel-agentd-http-test-replica-targets-unknown");
         let _ = std::fs::remove_dir_all(&dir);
@@ -748,7 +917,7 @@ mod tests {
             Duration::from_secs(3600),
         )
         .unwrap();
-        thread::spawn(move || run_tls(listener, commands, reloading_tls, PodCidrSlot::new(), replica_targets));
+        thread::spawn(move || run_tls(listener, commands, reloading_tls, PodCidrSlot::new(), crate::ServiceVipSlot::new(), replica_targets));
         addr
     }
 
@@ -931,7 +1100,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        thread::spawn(move || run_tls(listener, commands, reloading, PodCidrSlot::new(), replica_targets));
+        thread::spawn(move || run_tls(listener, commands, reloading, PodCidrSlot::new(), crate::ServiceVipSlot::new(), replica_targets));
 
         let (status, _) = send_request_tcp(&addr, "GET", "/jails", "");
         assert_eq!(status, 200, "expected the initial fixture-node certificate to be served");
@@ -977,7 +1146,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        thread::spawn(move || run_tls(listener, commands, reloading, PodCidrSlot::new(), replica_targets));
+        thread::spawn(move || run_tls(listener, commands, reloading, PodCidrSlot::new(), crate::ServiceVipSlot::new(), replica_targets));
 
         std::fs::write(&cert_path, "not a certificate").unwrap();
         thread::sleep(Duration::from_millis(200));

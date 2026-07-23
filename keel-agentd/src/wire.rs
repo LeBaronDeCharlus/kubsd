@@ -1,3 +1,4 @@
+use crate::ingress_record::IngressRecord;
 use crate::record::JailRecord;
 use serde::{Deserialize, Serialize};
 
@@ -6,6 +7,11 @@ pub struct JailStatus {
     pub record: JailRecord,
     pub running: bool,
     pub backoff: BackoffStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IngressStatus {
+    pub record: IngressRecord,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -38,7 +44,34 @@ pub struct ReplicateToBody {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use keel_spec::{JailSpec, Metadata, NetworkSpec, RestartPolicy, ResourcesSpec, Spec};
+    use keel_spec::{
+        IngressBackend, IngressSpec, IngressSpecBody, IngressTls, JailSpec, Metadata, NetworkSpec, RestartPolicy,
+        ResourcesSpec, Spec,
+    };
+
+    fn sample_ingress_record() -> IngressRecord {
+        IngressRecord {
+            spec: IngressSpec {
+                api_version: "keel/v1".to_string(),
+                kind: "Ingress".to_string(),
+                metadata: Metadata { name: "blog".to_string() },
+                spec: IngressSpecBody {
+                    host: "example.com".to_string(),
+                    backend: IngressBackend { service: "hugo-site".to_string(), port: 8080 },
+                    tls: IngressTls { email: "admin@example.com".to_string() },
+                },
+            },
+            cert_expires_at_unix: None,
+        }
+    }
+
+    #[test]
+    fn ingress_status_round_trips_through_yaml() {
+        let status = IngressStatus { record: sample_ingress_record() };
+        let yaml = serde_yaml::to_string(&status).unwrap();
+        let parsed: IngressStatus = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed, status);
+    }
 
     fn sample_record() -> JailRecord {
         JailRecord {
