@@ -24,6 +24,9 @@ struct Config {
     tls_key_file: Option<PathBuf>,
     tls_crl_file: Option<PathBuf>,
     public_iface: Option<String>,
+    dns_ovh_config: Option<PathBuf>,
+    acme_directory_url: Option<String>,
+    acme_account_key_file: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -41,8 +44,24 @@ impl Default for Config {
             tls_key_file: None,
             tls_crl_file: None,
             public_iface: None,
+            dns_ovh_config: None,
+            acme_directory_url: None,
+            acme_account_key_file: None,
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+struct OvhConfig {
+    app_key: String,
+    app_secret: String,
+    consumer_key: String,
+    zone: String,
+}
+
+fn load_ovh_config(path: &std::path::Path) -> OvhConfig {
+    let content = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("failed to read OVH config at {}: {e}", path.display()));
+    toml::from_str(&content).unwrap_or_else(|e| panic!("failed to parse OVH config at {}: {e}", path.display()))
 }
 
 fn parse_args() -> Config {
@@ -67,6 +86,9 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Config {
             "--tls-key-file" => config.tls_key_file = Some(PathBuf::from(value)),
             "--tls-crl-file" => config.tls_crl_file = Some(PathBuf::from(value)),
             "--public-iface" => config.public_iface = Some(value),
+            "--dns-ovh-config" => config.dns_ovh_config = Some(PathBuf::from(value)),
+            "--acme-directory-url" => config.acme_directory_url = Some(value),
+            "--acme-account-key-file" => config.acme_account_key_file = Some(PathBuf::from(value)),
             other => panic!("unknown flag: {other}"),
         }
     }
@@ -96,6 +118,18 @@ fn main() {
     // `http::run`/`run_tls` populate/read, not an independent one, or the
     // reconciler's ingress-config regeneration would never see a real VIP.
     let service_vips = keel_agentd::ServiceVipSlot::new();
+    let (acme, dns): (Box<dyn keel_ingress::AcmeClient + Send>, Box<dyn keel_ingress::DnsProvider + Send>) =
+        match (&config.dns_ovh_config, &config.acme_directory_url, &config.acme_account_key_file) {
+            (Some(ovh_config_path), Some(directory_url), Some(account_key_file)) => {
+                let ovh_config = load_ovh_config(ovh_config_path);
+                let dns = keel_ingress::OvhDnsProvider::new(ovh_config.app_key, ovh_config.app_secret, ovh_config.consumer_key, ovh_config.zone);
+                let acme = keel_ingress::InstantAcmeClient::new(directory_url.clone(), account_key_file.clone())
+                    .expect("failed to initialize the real ACME client");
+                (Box::new(acme), Box::new(dns))
+            }
+            (None, None, None) => (Box::new(keel_ingress::FakeAcmeClient::new()), Box::new(keel_ingress::FakeDnsProvider::new())),
+            _ => panic!("--dns-ovh-config, --acme-directory-url, and --acme-account-key-file must all be set together, or none of them"),
+        };
     let reconciler = Reconciler::new(
         ProcessJailRuntime::new(),
         zfs.clone(),
@@ -103,13 +137,9 @@ fn main() {
         keel_jail::CliMountManager::new(),
         config.pool.clone(),
         config.state_dir.clone(),
-        // Temporary placeholders: the real ACME/DNS implementations don't
-        // exist until Tasks 15/16 -- Task 17 replaces these.
-        Box::new(keel_ingress::FakeAcmeClient::new()),
-        Box::new(keel_ingress::FakeDnsProvider::new()),
-        // Temporary placeholder: the real jexec(8)-based nginx controller
-        // doesn't exist yet -- a later task replaces this.
-        Box::new(keel_agentd::nginx::FakeNginxController::new()),
+        acme,
+        dns,
+        Box::new(keel_agentd::nginx::JexecNginxController::new(config.pool.clone())),
         service_vips.clone(),
     )
     .expect("failed to initialize reconciler from on-disk state");
@@ -238,6 +268,22 @@ fn main() {
 }
 
 #[cfg(test)]
+mod ovh_config_tests {
+    use super::*;
+
+    #[test]
+    fn load_ovh_config_parses_a_well_formed_file() {
+        let dir = std::env::temp_dir().join("keel-agentd-ovh-config-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dns-ovh.toml");
+        std::fs::write(&path, "app_key = \"ak\"\napp_secret = \"as\"\nconsumer_key = \"ck\"\nzone = \"example.com\"\n").unwrap();
+        let config = load_ovh_config(&path);
+        assert_eq!(config.app_key, "ak");
+        assert_eq!(config.zone, "example.com");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -257,12 +303,27 @@ mod tests {
         assert_eq!(config.tls_key_file, None);
         assert_eq!(config.tls_crl_file, None);
         assert_eq!(config.public_iface, None);
+        assert_eq!(config.dns_ovh_config, None);
+        assert_eq!(config.acme_directory_url, None);
+        assert_eq!(config.acme_account_key_file, None);
     }
 
     #[test]
     fn parses_public_iface_flag() {
         let config = parse_args_from(args(&["--public-iface", "em0"]));
         assert_eq!(config.public_iface, Some("em0".to_string()));
+    }
+
+    #[test]
+    fn parses_acme_and_dns_flags() {
+        let config = parse_args_from(args(&[
+            "--dns-ovh-config", "/usr/local/etc/keel/dns-ovh.toml",
+            "--acme-directory-url", "https://acme.example.com/directory",
+            "--acme-account-key-file", "/var/db/keel/acme-account.key",
+        ]));
+        assert_eq!(config.dns_ovh_config, Some(PathBuf::from("/usr/local/etc/keel/dns-ovh.toml")));
+        assert_eq!(config.acme_directory_url, Some("https://acme.example.com/directory".to_string()));
+        assert_eq!(config.acme_account_key_file, Some(PathBuf::from("/var/db/keel/acme-account.key")));
     }
 
     #[test]

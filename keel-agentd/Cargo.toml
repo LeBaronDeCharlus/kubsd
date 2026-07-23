@@ -17,3 +17,4 @@ httparse = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
 ipnet = "2"
+toml = "0.8"
