@@ -152,6 +152,14 @@ fn run_apply(target: &Target, args: &[String]) -> Result<String, String> {
         let spec = keel_spec::parse_and_validate_service(&yaml).map_err(|e| format!("invalid spec: {e}"))?;
         let path = jails_path(target, &format!("/services/{}", spec.metadata.name));
         success_body(dispatch(target, "PUT", &path, &yaml)).map(|_| String::new())
+    } else if kind == "Ingress" {
+        // Bare `/ingress/{name}`, not `jails_path(target, ...)` -- per this
+        // milestone's Non-Goals, `Ingress` is never routed through a
+        // control plane, so the `--node`-aware path-prefixing `jails_path`
+        // exists for doesn't apply here.
+        let spec = keel_spec::parse_and_validate_ingress(&yaml).map_err(|e| format!("invalid spec: {e}"))?;
+        let path = format!("/ingress/{}", spec.metadata.name);
+        success_body(dispatch(target, "PUT", &path, &yaml)).map(|_| String::new())
     } else {
         let spec = keel_spec::parse_and_validate(&yaml).map_err(|e| format!("invalid spec: {e}"))?;
         let path = jails_path(target, &format!("/jails/{}", spec.metadata.name));
@@ -186,10 +194,14 @@ fn run_force_repin(target: &Target, args: &[String]) -> Result<String, String> {
 /// Tries `/jails/<name>` first; on a `404`, retries against
 /// `/services/<name>` (jail names and service names share one flat
 /// namespace, so a 404 on one path is a cheap, unambiguous signal to try
-/// the other). If *both* return 404, the original jail-path error is
-/// surfaced -- it's the more familiar message, and the only one available
-/// at all against a plain single-node `keel-agentd`, which has no
-/// `/services` route whatsoever.
+/// the other); if that's *also* a `404`, retries once more against a bare
+/// `/ingress/<name>` (not `jails_path(target, ...)` -- like `run_apply`'s
+/// `Ingress` branch, this last attempt is never control-plane-routed, so
+/// it skips the `--node`-aware prefixing). If *all three* return 404, the
+/// original jail-path error is surfaced -- it's the most familiar message,
+/// and the only one available at all against a plain single-node
+/// `keel-agentd` predating `Service`/`Ingress` support, which has neither a
+/// `/services` nor an `/ingress` route.
 fn get_or_delete_with_service_fallback(target: &Target, method: &str, name: &str) -> Result<String, String> {
     let jail_path = jails_path(target, &format!("/jails/{name}"));
     let (status, body) = dispatch(target, method, &jail_path, "")?;
@@ -198,10 +210,15 @@ fn get_or_delete_with_service_fallback(target: &Target, method: &str, name: &str
     }
     let service_path = jails_path(target, &format!("/services/{name}"));
     let (service_status, service_body) = dispatch(target, method, &service_path, "")?;
-    if service_status == 404 {
+    if service_status != 404 {
+        return success_body(Ok((service_status, service_body)));
+    }
+    let ingress_path = format!("/ingress/{name}");
+    let (ingress_status, ingress_body) = dispatch(target, method, &ingress_path, "")?;
+    if ingress_status == 404 {
         success_body(Ok((status, body)))
     } else {
-        success_body(Ok((service_status, service_body)))
+        success_body(Ok((ingress_status, ingress_body)))
     }
 }
 
@@ -292,6 +309,119 @@ fn parse_response(response: &[u8]) -> Result<(u16, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spins up a real (fake-backed) `keel-agentd` on a Unix socket and
+    /// returns its path, mirroring `keelctl/tests/cli.rs`'s
+    /// `start_test_server` -- but callable in-process, since the tests here
+    /// exercise `run_apply`/`Target` directly rather than shelling out to
+    /// the compiled `keelctl` binary. `known_services` seeds the agent's
+    /// `ServiceVipSlot` (name, vip, port) so an `Ingress`'s `backend.service`
+    /// can be made to resolve when a test needs the apply to actually
+    /// succeed, rather than merely to be routed correctly.
+    fn start_test_agent(name: &str, known_services: &[(&str, &str, u16)]) -> PathBuf {
+        let state_dir = std::env::temp_dir().join(format!("keelctl-main-test-state-{name}"));
+        let _ = std::fs::remove_dir_all(&state_dir);
+        let zfs = keel_zfs::FakeZfsManager::new();
+        zfs.seed_dataset("zroot/keel/base/14.2-web");
+        let replica_targets = keel_agentd::ReplicaTargetRegistry::load(state_dir.clone()).unwrap();
+        let reconciler = keel_agentd::Reconciler::new(
+            keel_jail::FakeJailRuntime::new(),
+            zfs.clone(),
+            keel_net::FakeNetManager::new(),
+            keel_jail::FakeMountManager::new(),
+            "zroot".to_string(),
+            state_dir,
+            Box::new(keel_ingress::FakeAcmeClient::new()),
+            Box::new(keel_ingress::FakeDnsProvider::new()),
+            Box::new(keel_agentd::nginx::FakeNginxController::new()),
+            keel_agentd::ServiceVipSlot::new(),
+        )
+        .unwrap();
+        let (_worker_handle, commands) = keel_agentd::worker::spawn(reconciler, zfs, "zroot".to_string());
+
+        let service_vips = keel_agentd::ServiceVipSlot::new();
+        let proxy_entries: Vec<_> = known_services
+            .iter()
+            .map(|(n, vip, port)| keel_controlplane::wire::ServiceProxyEntry {
+                name: n.to_string(),
+                vip: vip.to_string(),
+                port: *port,
+                replicas: vec![],
+            })
+            .collect();
+        service_vips.set_all(&proxy_entries);
+
+        // A short, non-descriptive filename (not the full test name) --
+        // macOS/BSD cap Unix socket paths at ~104 bytes (SUN_LEN), the same
+        // constraint `keelctl/tests/cli.rs`'s helper works around.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let socket_path = std::env::temp_dir().join(format!("kam-{}-{}.sock", std::process::id(), id));
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        std::thread::spawn(move || {
+            keel_agentd::http::run(listener, commands, keel_agentd::PodCidrSlot::new(), service_vips, replica_targets)
+        });
+        socket_path
+    }
+
+    #[test]
+    fn run_apply_routes_an_ingress_spec_to_the_ingress_endpoint_not_the_jails_endpoint() {
+        let socket = start_test_agent("run_apply_routes_an_ingress_spec", &[]);
+        let target = Target::Socket(socket);
+        let path = std::env::temp_dir().join("keelctl-test-ingress-run-apply.yaml");
+        std::fs::write(
+            &path,
+            "apiVersion: keel/v1\nkind: Ingress\nmetadata:\n  name: blog\nspec:\n  host: example.com\n  backend:\n    service: hugo-site\n    port: 8080\n  tls:\n    email: admin@example.com\n",
+        )
+        .unwrap();
+
+        // No 'hugo-site' Service is known to this agent, so a spec that was
+        // genuinely routed to /ingress/blog must fail with the ingress
+        // handler's "does not name a currently-known Service" 400 -- NOT
+        // with a JailSpec YAML-parse error, which is what falling into the
+        // Jail else-branch would produce instead.
+        let result = run_apply(&target, &["-f".to_string(), path.to_string_lossy().to_string()]);
+        let err = result.expect_err("expected the ingress backend-service validation to reject this spec");
+        assert!(err.contains("hugo-site"), "expected the Service-not-found message, got: {err}");
+    }
+
+    #[test]
+    fn get_and_delete_fall_back_to_the_ingress_route_when_a_name_is_neither_a_jail_nor_a_service() {
+        // 'hugo-site' is a known Service here (unlike the routing test
+        // above), so the Ingress apply itself succeeds -- this test proves
+        // the *other* two verbs (`get`/`delete`) reach the same
+        // `/ingress/blog` route that `run_apply` does, via
+        // `get_or_delete_with_service_fallback`'s third fallback leg, and
+        // that a real end-to-end apply -> get -> delete -> get cycle works.
+        let socket = start_test_agent(
+            "get_and_delete_fall_back_to_ingress",
+            &[("hugo-site", "10.0.0.9", 8080)],
+        );
+        let target = Target::Socket(socket);
+        let path = std::env::temp_dir().join("keelctl-test-ingress-get-delete.yaml");
+        std::fs::write(
+            &path,
+            "apiVersion: keel/v1\nkind: Ingress\nmetadata:\n  name: blog\nspec:\n  host: example.com\n  backend:\n    service: hugo-site\n    port: 8080\n  tls:\n    email: admin@example.com\n",
+        )
+        .unwrap();
+        run_apply(&target, &["-f".to_string(), path.to_string_lossy().to_string()])
+            .expect("apply of a valid Ingress spec against a known Service should succeed");
+
+        // 'blog' is neither a jail nor a service name, so this only
+        // succeeds if the third fallback leg (bare /ingress/blog) is
+        // reached and returns the applied Ingress.
+        let get_result = run_get(&target, &["blog".to_string()]).expect("get should fall back to /ingress/blog");
+        assert!(get_result.contains("host: example.com"), "got: {get_result}");
+
+        run_delete(&target, &["blog".to_string()]).expect("delete should fall back to /ingress/blog");
+
+        // After delete, all three routes 404; the surfaced error must be
+        // the original jail-not-found message (the documented behavior when
+        // all fallback legs are exhausted).
+        let err_after_delete = run_get(&target, &["blog".to_string()]).unwrap_err();
+        assert!(err_after_delete.contains("not found"), "got: {err_after_delete}");
+    }
 
     #[test]
     fn no_control_plane_flags_yields_socket_target() {
