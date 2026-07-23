@@ -46,6 +46,10 @@ impl OvhDnsProvider {
             .header("X-Ovh-Consumer", &self.consumer_key)
             .header("X-Ovh-Timestamp", timestamp.to_string())
             .header("X-Ovh-Signature", &signature)
+            // Note: this always sends body (even if empty) and Content-Type: application/json
+            // for all request types, as ureq 3.3.0 doesn't expose a generic .request(method, url)
+            // builder. If real OVH API calls (GET/DELETE with no body) fail with ~400, check
+            // here first: strict servers may reject empty body + Content-Type: application/json.
             .header("Content-Type", "application/json")
             .body(body.to_string())
             .map_err(|e| DnsError::Request(e.to_string()))?;
