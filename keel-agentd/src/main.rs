@@ -1,3 +1,4 @@
+use keel_agentd::pf::PfController;
 use keel_agentd::worker::{self, Command};
 use keel_agentd::Reconciler;
 use keel_jail::ProcessJailRuntime;
@@ -22,6 +23,7 @@ struct Config {
     tls_cert_file: Option<PathBuf>,
     tls_key_file: Option<PathBuf>,
     tls_crl_file: Option<PathBuf>,
+    public_iface: Option<String>,
 }
 
 impl Default for Config {
@@ -38,6 +40,7 @@ impl Default for Config {
             tls_cert_file: None,
             tls_key_file: None,
             tls_crl_file: None,
+            public_iface: None,
         }
     }
 }
@@ -63,6 +66,7 @@ fn parse_args_from(args: impl Iterator<Item = String>) -> Config {
             "--tls-cert-file" => config.tls_cert_file = Some(PathBuf::from(value)),
             "--tls-key-file" => config.tls_key_file = Some(PathBuf::from(value)),
             "--tls-crl-file" => config.tls_crl_file = Some(PathBuf::from(value)),
+            "--public-iface" => config.public_iface = Some(value),
             other => panic!("unknown flag: {other}"),
         }
     }
@@ -201,6 +205,28 @@ fn main() {
         }
     });
 
+    // Applied once at startup with its own retry loop, entirely separate
+    // from `Reconciler::reconcile`'s per-Ingress loop: pf redirect rules are
+    // a host-level, once-per-node concern, not something to re-derive per
+    // Ingress. A failure here must not block per-Ingress cert/config
+    // reconciliation, so it retries independently and only logs on error.
+    if let Some(public_iface) = config.public_iface.clone() {
+        thread::spawn(move || {
+            let pf = keel_agentd::pf::PfctlController::new();
+            let mut backoff = keel_agentd::backoff::BackoffState::new();
+            loop {
+                let now = std::time::Instant::now();
+                if backoff.can_retry(now) {
+                    backoff.record_attempt(now);
+                    if let Err(e) = pf.ensure_redirect_rules(&public_iface, keel_agentd::record::INGRESS_JAIL_BRIDGE_ADDR) {
+                        eprintln!("keel-agentd: failed to apply pf ingress redirect rules: {e}");
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+    }
+
     if config.socket.exists() {
         std::fs::remove_file(&config.socket).expect("failed to remove stale socket file");
     }
@@ -230,6 +256,13 @@ mod tests {
         assert_eq!(config.tls_cert_file, None);
         assert_eq!(config.tls_key_file, None);
         assert_eq!(config.tls_crl_file, None);
+        assert_eq!(config.public_iface, None);
+    }
+
+    #[test]
+    fn parses_public_iface_flag() {
+        let config = parse_args_from(args(&["--public-iface", "em0"]));
+        assert_eq!(config.public_iface, Some("em0".to_string()));
     }
 
     #[test]
