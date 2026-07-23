@@ -1,7 +1,98 @@
 # Milestone 21: Ingress and Automatic HTTPS (Sub-Project 9, First Milestone)
 
-Status: Approved, not yet implemented
+Status: Approved, implemented, real-VM verification passed (staging and production)
 Date: 2026-07-22
+
+**2026-07-23 verification update:** Implemented per this design and verified
+end-to-end on a real single-node FreeBSD 15.0 VPS (a real production target,
+not the arm64 dev VM used for earlier milestones), using the real domain
+`lebaron.sh` on real OVH DNS and a real OVH API application/consumer key.
+Verified for real: a full ACME order against Let's Encrypt's **staging**
+directory, a real DNS-01 challenge served via the real OVH REST API, a real
+staging certificate issued and served by nginx; the renewal path (forced by
+setting a near-expiry timestamp and restarting); and a full pass against
+Let's Encrypt's **production** directory issuing a real, publicly-trusted
+certificate (`issuer=C=US, O=Let's Encrypt, CN=YE2`), reachable over the
+real public internet from a genuinely external client, through the host's
+`pf` redirect, nginx TLS termination, and the existing Milestone 16 VIP
+proxy to a backend `Service`. `cargo test --workspace` passes (187/188; the
+one failure is a pre-existing, unrelated timing-sensitive test in
+Milestone 19's replication code, confirmed via `FakeJailRuntime`-only
+execution to be untouched by anything in this milestone).
+
+This pass surfaced six real, previously-undiscovered bugs and gaps, all
+fixed and re-verified against the real hardware before this milestone was
+called done:
+
+- **`keel-jail`: no `devfs` in any jail.** `ProcessJailRuntime::create`
+  never mounted `devfs`, so every jail's own `/dev` was an empty directory.
+  Every prior real-VM test across 20 milestones only ever ran
+  statically-linked `/rescue/*` binaries or shell builtins, none of which
+  touch `/dev` from inside the jail, so this went undetected since
+  Milestone 2: first surfaced by this milestone's real Python interpreter
+  test backend needing `/dev/null` for its own dynamic linker. Fixed with
+  `mount.devfs`/`devfs_ruleset=4` at create time (FreeBSD's standard
+  `devfsrules_jail` set: not the unrestricted ruleset 0, which would
+  expose the host's raw disk devices to the jail) and an explicit `devfs`
+  unmount in `destroy` (`jail -r` does not do this on its own).
+- **`keel-net`: a second subnet on one bridge evicted the first one's
+  gateway.** `attach_jail`'s gateway address was set with a plain
+  `ifconfig <bridge> inet <addr>` (no `alias`), which *replaces* the
+  bridge's primary address rather than adding a second one alongside it.
+  Every milestone before 21 only ever put one node's own pod-CIDR subnet on
+  a bridge; this milestone is the first to add a second, unrelated,
+  fixed subnet (the singleton ingress jail's `10.0.0.0/24`) to the same
+  bridge as the node's ordinary jails, and attaching it silently evicted
+  the other subnet's gateway, breaking every already-running `Service`
+  replica on the node. Fixed by using `alias` for the gateway address too.
+- **`keel-net`: a FreeBSD-15-specific `route(8)` wording change.**
+  `remove_route`'s idempotency check only matched `"not in table"`, but
+  FreeBSD 15.0 reports a missing route as `"route has not been found"`.
+  Fixed to tolerate both.
+- **`keel-agentd`: nginx's config path assumption didn't hold on FreeBSD
+  15.** The ingress jail's nginx invocation relied on nginx's own
+  compiled-in default config path, but FreeBSD 15's `freenginx` package
+  defaults to `/usr/local/etc/freenginx/nginx.conf`, not the historical
+  `/usr/local/etc/nginx/nginx.conf`. Fixed by always passing `-c` to every
+  nginx invocation (jail start command, `-t`, `-s reload`), decoupling
+  this project's behavior from any given nginx package build's default.
+- **`keel-agentd`: a cert-expiry timestamp alone isn't proof the cert file
+  exists.** `reconcile_certs` trusted `cert_expires_at_unix` alone; if the
+  ingress jail's rootfs is ever recreated after a cert was already issued
+  into it (reproduced directly by destroying and reprovisioning it),
+  the timestamp still claims a valid cert while the file is gone from the
+  new rootfs. Fixed by also checking the cert file's presence on disk.
+- **Host prerequisites this design didn't spell out**, needed on any real
+  single-node deployment: `pf` needs an explicit `pass` rule for the
+  internal jail bridge (a fresh box's default-deny policy blocks jail-to-VIP
+  traffic entirely, not just the public 80/443 path), the `rdr-anchor`/
+  `anchor "keel-ingress"` declarations this design's `pf` section already
+  says are needed must actually be added to the host's own `pf.conf`, and
+  `net.inet.ip.forwarding`/`gateway_enable="YES"` must be on for the host to
+  route between the public interface and the internal bridge at all:
+  without it, `pf`'s `rdr` rewrites the destination correctly but the
+  kernel never forwards the packet, so redirected connections reach the
+  jail's SYN but never get a reply.
+
+Two known, non-blocking follow-ups from this same session, not fixed as
+part of this milestone (documented rather than silently discovered and
+dropped):
+
+- Manually deleting a `Service`'s replica jail directly via a node's local
+  socket (bypassing `keel-controlplane`) desyncs the control-plane's own
+  scheduler bookkeeping from reality: it believes the replica is still
+  placed and won't reschedule it. Not a bug introduced by this milestone,
+  but a real gap in the existing scheduler's self-healing surfaced by this
+  session's debugging process; normal operation (apply/delete only ever
+  through the `Service` CRD) never hits it.
+- `keel-agentd`'s own unit tests hardcode the pool name `"zroot"` (matching
+  every fixture across the whole test suite) and write real files via
+  plain `std::fs::write` for ingress certs: on a machine that also hosts a
+  real `zroot` pool (like this verification VPS), running
+  `cargo test --workspace` leaves stray cert files in the real ingress
+  jail's rootfs. Harmless (never referenced by any real `Ingress`), but
+  worth knowing before running the full suite directly on a production
+  box.
 
 **2026-07-22 review update:** Two real gaps found while re-checking this
 design against the current codebase, both folded into the Architecture
